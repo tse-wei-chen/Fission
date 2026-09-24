@@ -10,6 +10,11 @@ static void Require(bool condition, string message)
     }
 }
 
+const string MulModelBase64 =
+    "CAMSBmNoZW50YTpwChUKAVgKAVcSAVkaBW11bF8xIgNNdWwSCG11bCB0ZXN0" +
+    "KiMIAwgCEAEiGAAAgD8AAABAAABAQAAAgEAAAKBAAADAQEIBV1oTCgFYEg4K" +
+    "DAgBEggKAggDCgIIAmITCgFZEg4KDAgBEggKAggDCgIIAkIECgAQBw==";
+
 var parent = SequenceId.New();
 var branchA = SequenceId.New();
 var branchB = SequenceId.New();
@@ -177,9 +182,84 @@ Require(duplicateOwnershipRejected, "DecoderOrtState must reject duplicate OrtVa
 // Caller still owns the OrtValue because construction never succeeded.
 duplicateOrtValue.Dispose();
 
+// Caller-preallocated output proof. ORT writes directly into caller-owned
+// OrtValues; disposing RunOptions and the InferenceSession must not dispose those
+// output values. They can then be transferred into DecoderOrtState safely.
+var modelBytes = Convert.FromBase64String(MulModelBase64);
+var keyRunInputBuffer = new[] { 1f, 2f, 3f, 4f, 5f, 6f };
+var valueRunInputBuffer = new[] { 2f, 3f, 4f, 5f, 6f, 7f };
+var keyRunOutputBuffer = new float[6];
+var valueRunOutputBuffer = new float[6];
+var keyRunOutput = OrtValue.CreateTensorValueFromMemory(
+    keyRunOutputBuffer,
+    new long[] { 3, 2 });
+var valueRunOutput = OrtValue.CreateTensorValueFromMemory(
+    valueRunOutputBuffer,
+    new long[] { 3, 2 });
+
+using (var session = new InferenceSession(modelBytes))
+using (var runOptions = new RunOptions())
+using (var keyRunInput = OrtValue.CreateTensorValueFromMemory(
+    keyRunInputBuffer,
+    new long[] { 3, 2 }))
+using (var valueRunInput = OrtValue.CreateTensorValueFromMemory(
+    valueRunInputBuffer,
+    new long[] { 3, 2 }))
+{
+    CallerOwnedOrtRun.Execute(
+        session,
+        runOptions,
+        new[] { "X" },
+        new[] { keyRunInput },
+        new[] { "Y" },
+        new[] { keyRunOutput });
+
+    CallerOwnedOrtRun.Execute(
+        session,
+        runOptions,
+        new[] { "X" },
+        new[] { valueRunInput },
+        new[] { "Y" },
+        new[] { valueRunOutput });
+}
+
+Require(
+    keyRunOutputBuffer.SequenceEqual(new[] { 1f, 4f, 9f, 16f, 25f, 36f }),
+    "Caller-owned key output buffer must receive the real mul_1 inference result.");
+Require(
+    valueRunOutputBuffer.SequenceEqual(new[] { 2f, 6f, 12f, 20f, 30f, 42f }),
+    "Caller-owned value output buffer must receive the real mul_1 inference result.");
+Require(
+    keyRunOutput.GetTensorDataAsSpan<float>()[5] == 36f &&
+    valueRunOutput.GetTensorDataAsSpan<float>()[5] == 42f,
+    "Preallocated output OrtValues must remain alive after RunOptions/session disposal.");
+
+var preallocatedState = new DecoderOrtState(
+    position: 6,
+    new[] { new DecoderOrtLayerState(keyRunOutput, valueRunOutput) });
+var preallocatedParent = SequenceId.New();
+var preallocatedBranch = SequenceId.New();
+using (var preallocatedStore = new DecoderStateStore<DecoderOrtState>())
+{
+    preallocatedStore.AddSequence(preallocatedParent, preallocatedState);
+    preallocatedStore.ForkSequence(preallocatedParent, new[] { preallocatedBranch });
+    Require(
+        preallocatedStore.GetSequence(preallocatedBranch)
+            .GetLayer(0)
+            .Value
+            .GetTensorDataAsSpan<float>()[5] == 42f,
+        "Forked decoder state must retain caller-preallocated ORT outputs.");
+
+    Require(preallocatedStore.ReleaseSequence(preallocatedParent), "Preallocated parent release must succeed.");
+    Require(!preallocatedState.IsDisposed, "Fork owner must keep preallocated outputs alive.");
+    Require(preallocatedStore.ReleaseSequence(preallocatedBranch), "Preallocated branch release must succeed.");
+    Require(preallocatedState.IsDisposed, "Final owner must dispose caller-preallocated outputs after ownership transfer.");
+}
+
 Console.WriteLine(
     $"Fission ONNX decoder state specs passed: sharedDisposes={shared.DisposeCount}, " +
-    $"divergedDisposes={diverged.DisposeCount}, ortLayers={ortState.LayerCount}, ortDisposed={ortState.IsDisposed}.");
+    $"divergedDisposes={diverged.DisposeCount}, ortLayers={ortState.LayerCount}, " +
+    $"ortDisposed={ortState.IsDisposed}, preallocatedDisposed={preallocatedState.IsDisposed}.");
 
 sealed class TrackingState : IDisposable
 {
