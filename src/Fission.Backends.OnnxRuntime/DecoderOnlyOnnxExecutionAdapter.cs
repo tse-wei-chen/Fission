@@ -178,6 +178,12 @@ public sealed class DecoderOnlyOnnxExecutionAdapter :
                     $"runtime requested {item.Position}, backend state is {prior.Position}.");
             }
 
+            if (prior.NextTokenId is null)
+            {
+                throw new InvalidOperationException(
+                    $"Decode state for sequence {item.SequenceId} is missing its next-token frontier.");
+            }
+
             priorStates[index] = prior;
         }
 
@@ -318,6 +324,13 @@ public sealed class DecoderOnlyOnnxExecutionAdapter :
             throw new InvalidOperationException(
                 $"Decoder binding returned state position {step.State.Position}; " +
                 $"expected {expectedPosition}.");
+        }
+
+        if (step.State.NextTokenId != step.TokenId)
+        {
+            throw new InvalidOperationException(
+                $"Decoder binding returned token {step.TokenId}, but physical state frontier is " +
+                $"{step.State.NextTokenId?.ToString() ?? "missing"}.");
         }
 
         if (priorState is not null && ReferenceEquals(step.State, priorState))
