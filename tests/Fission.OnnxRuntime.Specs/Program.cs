@@ -20,6 +20,107 @@ const string MulModelBase64 =
 var modelBytes = Convert.FromBase64String(MulModelBase64);
 var modelId = new ModelId("ort-mul-spec");
 var device = new DeviceId("cpu:ort");
+var mulContract = new OnnxSessionContract(
+    Inputs: new[]
+    {
+        new OnnxTensorContract("multiplicand", "X", Rank: 2, ElementType: TensorElementType.Float)
+    },
+    Outputs: new[]
+    {
+        new OnnxTensorContract("product", "Y", Rank: 2, ElementType: TensorElementType.Float)
+    });
+
+// A live graph mismatch must fail before adapter initialization, otherwise the
+// adapter could allocate model state against the wrong export signature.
+var rejectedAdapter = new MulSpecAdapter();
+var rejectedBackend = new OnnxRuntimeBackend(
+    new OnnxRuntimeBackendOptions(
+        modelId,
+        device,
+        OnnxRuntimeModelSource.FromBytes(modelBytes),
+        IntraOpNumThreads: 1,
+        InterOpNumThreads: 1,
+        SessionContract: new OnnxSessionContract(
+            Inputs: new[] { new OnnxTensorContract("multiplicand", "missing_input") },
+            Outputs: new[] { new OnnxTensorContract("product", "Y") })),
+    rejectedAdapter);
+
+var contractRejected = false;
+try
+{
+    await rejectedBackend.InitializeAsync();
+}
+catch (InvalidOperationException exception)
+    when (exception.Message.Contains("missing_input", StringComparison.Ordinal))
+{
+    contractRejected = true;
+}
+finally
+{
+    await rejectedBackend.DisposeAsync();
+}
+
+Require(contractRejected, "A mismatched ONNX session contract must fail backend initialization.");
+Require(!rejectedAdapter.EverInitialized, "Session contract validation must happen before adapter initialization.");
+
+// Decoder-only manifests stay export-specific while expanding to a stable
+// logical contract used by the model adapter.
+var decoderManifest = new DecoderOnlyOnnxContract(
+    NumHiddenLayers: 2,
+    InputIds: "input_ids",
+    Logits: "logits",
+    AttentionMask: "attention_mask",
+    PositionIds: "position_ids",
+    PastKeyNames: "past_key_values.%d.key",
+    PastValueNames: "past_key_values.%d.value",
+    PresentKeyNames: "present.{0}.key",
+    PresentValueNames: "present.{0}.value");
+var decoderSessionContract = decoderManifest.ToSessionContract();
+
+Require(decoderManifest.UsesPastKeyValues, "Decoder manifest must detect configured KV cache tensors.");
+Require(
+    decoderSessionContract.Inputs.Select(static input => input.TensorName).SequenceEqual(new[]
+    {
+        "input_ids",
+        "attention_mask",
+        "position_ids",
+        "past_key_values.0.key",
+        "past_key_values.0.value",
+        "past_key_values.1.key",
+        "past_key_values.1.value"
+    }),
+    "Decoder manifest must expand layer-indexed past KV input names deterministically.");
+Require(
+    decoderSessionContract.Outputs.Select(static output => output.TensorName).SequenceEqual(new[]
+    {
+        "logits",
+        "present.0.key",
+        "present.0.value",
+        "present.1.key",
+        "present.1.value"
+    }),
+    "Decoder manifest must expand layer-indexed present KV output names deterministically.");
+Require(
+    DecoderOnlyOnnxContract.ExpandLayerName("cache.%d.key", 7) == "cache.7.key" &&
+    DecoderOnlyOnnxContract.ExpandLayerName("cache.{0}.value", 7) == "cache.7.value",
+    "Decoder layer name patterns must support both %d and {0} conventions.");
+
+var incompleteCacheRejected = false;
+try
+{
+    _ = new DecoderOnlyOnnxContract(
+        NumHiddenLayers: 2,
+        InputIds: "input_ids",
+        Logits: "logits",
+        PastKeyNames: "past.%d.key")
+        .ToSessionContract();
+}
+catch (InvalidOperationException)
+{
+    incompleteCacheRejected = true;
+}
+Require(incompleteCacheRejected, "Partial past/present cache manifests must be rejected.");
+
 var adapter = new MulSpecAdapter();
 var backend = new OnnxRuntimeBackend(
     new OnnxRuntimeBackendOptions(
@@ -27,7 +128,8 @@ var backend = new OnnxRuntimeBackend(
         device,
         OnnxRuntimeModelSource.FromBytes(modelBytes),
         IntraOpNumThreads: 1,
-        InterOpNumThreads: 1),
+        InterOpNumThreads: 1,
+        SessionContract: mulContract),
     adapter);
 
 await using var executor = await ContinuousBatchExecutor.CreateAsync(
@@ -61,7 +163,8 @@ Require(adapter.ReleaseCount == 1, "Backend release hook must run exactly once."
 
 Console.WriteLine(
     $"Fission ONNX Runtime specs passed: backend={backend.Name}, prefill={prefill.TokenId}, " +
-    $"decode={decode.TokenId}, runs={adapter.RunCount}, releases={adapter.ReleaseCount}.");
+    $"decode={decode.TokenId}, runs={adapter.RunCount}, releases={adapter.ReleaseCount}, " +
+    $"decoderInputs={decoderSessionContract.Inputs.Count}, decoderOutputs={decoderSessionContract.Outputs.Count}.");
 
 sealed class MulSpecAdapter : IOnnxRuntimeExecutionAdapter
 {
@@ -69,6 +172,7 @@ sealed class MulSpecAdapter : IOnnxRuntimeExecutionAdapter
 
     public string Name => "mul-spec";
     public bool Initialized { get; private set; }
+    public bool EverInitialized { get; private set; }
     public int ActiveSequenceCount => _activeSequences.Count;
     public int RunCount { get; private set; }
     public int ReleaseCount { get; private set; }
@@ -88,6 +192,7 @@ sealed class MulSpecAdapter : IOnnxRuntimeExecutionAdapter
         }
 
         Initialized = true;
+        EverInitialized = true;
         return ValueTask.CompletedTask;
     }
 
