@@ -1,4 +1,5 @@
 using Fission.Abstractions;
+using Fission.Abstractions.Execution;
 using Fission.Abstractions.Scheduling;
 using Fission.Engine;
 using Fission.Runtime.Backends;
@@ -138,7 +139,153 @@ Require(streamed[1].SequenceEqual(completions[1].GeneratedTokens), "Stream D tok
 Require(runtime.SequenceCount == 0, "Async worker must release all terminal runtime sequences.");
 Require(kvPool.AllocatedPages == 0, "Async worker completion must return all KV pages to the pool.");
 
+var trackingBackend = new TrackingStateBackend(new DeviceId("cpu:tracking"));
+var trackingKvPool = new KvPagePool(capacity: 8, tokensPerPage: 4);
+await using var trackingDevice = await ContinuousBatchExecutor.CreateAsync(
+    trackingBackend,
+    capacity: 16,
+    maxBatchSize: 4);
+using var trackingRuntime = new ExecutionPlanExecutor(
+    trackingDevice,
+    kvPagePool: trackingKvPool);
+using var trackingEngine = new InferenceEngine(
+    trackingRuntime,
+    new SchedulingKernel(),
+    new InferenceEngineOptions(
+        MaxBatchTokens: 4,
+        MaxBatchSequences: 1,
+        Scheduling: new SchedulingPolicyOptions(
+            DecodeTokenReserve: 1,
+            MaxPrefillChunkTokens: 4,
+            DeadlineUrgencyWindow: TimeSpan.FromMilliseconds(50))));
+
+var normalStateful = trackingEngine.Submit(
+    new ModelId("tracking-model"),
+    new[] { 1, 2, 3, 4 },
+    maxNewTokens: 2,
+    enqueuedAt: baseTime.AddSeconds(2));
+await trackingEngine.RunUntilCompleteAsync();
+Require(trackingBackend.ActiveSequenceCount == 0, "Normal completion must release backend-owned sequence state.");
+Require(trackingBackend.ReleaseCount == 1, "Normal completion must release backend state exactly once.");
+Require(trackingBackend.ReleasedSequences.Contains(normalStateful), "Normal sequence id must reach backend release hook.");
+Require(trackingRuntime.SequenceCount == 0 && trackingKvPool.AllocatedPages == 0, "Normal stateful completion must release runtime and KV ownership.");
+
+var cancelledStateful = trackingEngine.Submit(
+    new ModelId("tracking-model"),
+    new[] { 10, 11, 12, 13 },
+    maxNewTokens: 100,
+    enqueuedAt: baseTime.AddSeconds(3));
+var prefillCycle = await trackingEngine.RunCycleAsync(baseTime.AddSeconds(3).AddMilliseconds(1));
+Require(prefillCycle.Batch.Items.Count == 1 && prefillCycle.Batch.Items[0].Kind == ScheduledWorkKind.Prefill, "Cancellation spec must materialize backend state with one prefill cycle.");
+Require(trackingBackend.ActiveSequenceCount == 1, "Prefill must create backend-owned per-sequence state.");
+Require(trackingRuntime.SequenceCount == 1 && trackingKvPool.AllocatedPages == 1, "Prefill must create runtime and KV ownership before cancellation.");
+
+var cancelledSnapshot = await trackingEngine.CancelAsync(cancelledStateful);
+Require(cancelledSnapshot.FinishReason == InferenceFinishReason.Cancelled, "Cancellation must preserve cancelled finish reason.");
+Require(trackingBackend.ActiveSequenceCount == 0, "Cancellation must release backend-owned sequence state.");
+Require(trackingBackend.ReleaseCount == 2, "Cancellation must invoke backend release exactly once in addition to normal completion.");
+Require(trackingBackend.ReleasedSequences.Contains(cancelledStateful), "Cancelled sequence id must reach backend release hook.");
+Require(trackingRuntime.SequenceCount == 0 && trackingKvPool.AllocatedPages == 0, "Cancellation must release runtime and KV ownership after backend release.");
+
 Console.WriteLine(
     $"Fission engine specs passed: cycles={cycles.Count}, prefill=[{string.Join(',', prefillGrants)}], " +
     $"manual={snapshotA.GeneratedTokens.Count + snapshotB.GeneratedTokens.Count}, " +
-    $"streamed={streamed[0].Length + streamed[1].Length}, kv={kvPool.AllocatedPages}/{kvPool.Capacity}.");
+    $"streamed={streamed[0].Length + streamed[1].Length}, backendReleases={trackingBackend.ReleaseCount}, " +
+    $"kv={kvPool.AllocatedPages}/{kvPool.Capacity}.");
+
+sealed class TrackingStateBackend : IInferenceBackend
+{
+    private readonly HashSet<SequenceId> _active = new();
+    private readonly HashSet<SequenceId> _released = new();
+    private bool _initialized;
+
+    public TrackingStateBackend(DeviceId device)
+    {
+        Device = device;
+    }
+
+    public string Name => "tracking-state";
+    public DeviceId Device { get; }
+    public int ActiveSequenceCount => _active.Count;
+    public int ReleaseCount { get; private set; }
+    public IReadOnlySet<SequenceId> ReleasedSequences => _released;
+
+    public ValueTask InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _initialized = true;
+        return ValueTask.CompletedTask;
+    }
+
+    public ValueTask<IReadOnlyList<BackendStepResult>> PrefillAsync(
+        PrefillBatch batch,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var results = new BackendStepResult[batch.Items.Count];
+        for (var index = 0; index < batch.Items.Count; index++)
+        {
+            var item = batch.Items[index];
+            _active.Add(item.SequenceId);
+            results[index] = new BackendStepResult(item.SequenceId, 10_000 + item.Tokens.Length);
+        }
+
+        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(results);
+    }
+
+    public ValueTask<IReadOnlyList<BackendStepResult>> DecodeAsync(
+        DecodeBatch batch,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var results = new BackendStepResult[batch.Items.Count];
+        for (var index = 0; index < batch.Items.Count; index++)
+        {
+            var item = batch.Items[index];
+            if (!_active.Contains(item.SequenceId))
+            {
+                throw new InvalidOperationException($"Decode reached backend without state for {item.SequenceId}.");
+            }
+
+            results[index] = new BackendStepResult(item.SequenceId, 20_000 + item.Position);
+        }
+
+        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(results);
+    }
+
+    public ValueTask ReleaseSequenceAsync(
+        SequenceId sequenceId,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (!_active.Remove(sequenceId))
+        {
+            throw new InvalidOperationException($"Backend release called without active state for {sequenceId}.");
+        }
+
+        _released.Add(sequenceId);
+        ReleaseCount++;
+        return ValueTask.CompletedTask;
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _active.Clear();
+        _initialized = false;
+        return ValueTask.CompletedTask;
+    }
+
+    private void EnsureInitialized()
+    {
+        if (!_initialized)
+        {
+            throw new InvalidOperationException("Tracking backend has not been initialized.");
+        }
+    }
+}

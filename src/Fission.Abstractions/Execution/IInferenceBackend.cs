@@ -22,6 +22,11 @@ public readonly record struct BackendStepResult(
 /// Device-facing execution boundary. Implementations must preserve input ordering
 /// in their returned result list so the runtime can complete individual tickets
 /// without sequence-id lookups on the hot path.
+///
+/// Stateful backends may retain per-sequence logits, decoder state, or physical KV
+/// between PrefillAsync and DecodeAsync. ReleaseSequenceAsync is the lifecycle hook
+/// used to relinquish that backend-owned state when the runtime sequence terminates.
+/// The default implementation is a no-op for stateless backends.
 /// </summary>
 public interface IInferenceBackend : IAsyncDisposable
 {
@@ -37,4 +42,12 @@ public interface IInferenceBackend : IAsyncDisposable
     ValueTask<IReadOnlyList<BackendStepResult>> DecodeAsync(
         DecodeBatch batch,
         CancellationToken cancellationToken = default);
+
+    ValueTask ReleaseSequenceAsync(
+        SequenceId sequenceId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.CompletedTask;
+    }
 }
