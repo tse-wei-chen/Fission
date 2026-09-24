@@ -80,7 +80,9 @@ public sealed class ExecutionPlanExecutor : IDisposable
     public bool TryGetSequence(SequenceId sequenceId, out SequenceProcess? sequence) =>
         _sequences.TryGetValue(sequenceId, out sequence);
 
-    public bool ReleaseSequence(SequenceId sequenceId)
+    public async ValueTask<bool> ReleaseSequenceAsync(
+        SequenceId sequenceId,
+        CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
@@ -94,6 +96,12 @@ public sealed class ExecutionPlanExecutor : IDisposable
             throw new InvalidOperationException(
                 $"Cannot release sequence {sequenceId} while it is {sequence.Status}.");
         }
+
+        // Backend-owned state (real KV/logits/decoder buffers) must be released
+        // on the same device actor that serializes prefill/decode before metadata
+        // ownership is removed from the runtime.
+        await _device.ReleaseSequenceAsync(sequenceId, cancellationToken)
+            .ConfigureAwait(false);
 
         if (!_sequences.TryRemove(sequenceId, out var removed))
         {
