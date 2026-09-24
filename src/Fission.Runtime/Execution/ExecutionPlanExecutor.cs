@@ -80,6 +80,30 @@ public sealed class ExecutionPlanExecutor : IDisposable
     public bool TryGetSequence(SequenceId sequenceId, out SequenceProcess? sequence) =>
         _sequences.TryGetValue(sequenceId, out sequence);
 
+    public bool ReleaseSequence(SequenceId sequenceId)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+        if (!_sequences.TryGetValue(sequenceId, out var sequence))
+        {
+            return false;
+        }
+
+        if (sequence.Status is not SequenceStatus.Finished and not SequenceStatus.Cancelled)
+        {
+            throw new InvalidOperationException(
+                $"Cannot release sequence {sequenceId} while it is {sequence.Status}.");
+        }
+
+        if (!_sequences.TryRemove(sequenceId, out var removed))
+        {
+            return false;
+        }
+
+        removed.Dispose();
+        return true;
+    }
+
     public async ValueTask<ExecutionPlanResult> ExecuteAsync(
         CompiledExecutionPlan plan,
         ExecutionBindings bindings,

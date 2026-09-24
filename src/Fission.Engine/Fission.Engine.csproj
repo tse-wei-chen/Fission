@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="../Fission.Abstractions/Fission.Abstractions.csproj" />
+    <ProjectReference Include="../Fission.Runtime/Fission.Runtime.csproj" />
+    <ProjectReference Include="../Fission.Scheduler/Fission.Scheduler.fsproj" />
+  </ItemGroup>
+</Project>
