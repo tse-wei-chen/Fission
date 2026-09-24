@@ -5,16 +5,23 @@ namespace Fission.Runtime.Kv;
 public sealed class KvPageTable : IDisposable
 {
     private readonly object _gate = new();
+    private readonly KvPagePool _pool;
     private List<KvPageLease> _pages;
     private bool _disposed;
 
     public KvPageTable()
-        : this([])
+        : this(new KvPagePool(int.MaxValue), [])
     {
     }
 
-    private KvPageTable(IEnumerable<KvPageLease> acquiredPages)
+    internal KvPageTable(KvPagePool pool)
+        : this(pool, [])
     {
+    }
+
+    private KvPageTable(KvPagePool pool, IEnumerable<KvPageLease> acquiredPages)
+    {
+        _pool = pool;
         _pages = [.. acquiredPages];
     }
 
@@ -42,12 +49,12 @@ public sealed class KvPageTable : IDisposable
         }
     }
 
-    public void Append(long pageId)
+    internal void Append()
     {
         lock (_gate)
         {
             ThrowIfDisposed();
-            _pages.Add(new KvPageLease(pageId));
+            _pages.Add(_pool.Rent());
         }
     }
 
@@ -56,7 +63,7 @@ public sealed class KvPageTable : IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            return new KvPageTable(_pages.Select(static page => page.Acquire()));
+            return new KvPageTable(_pool, _pages.Select(static page => page.Acquire()));
         }
     }
 
@@ -66,12 +73,12 @@ public sealed class KvPageTable : IDisposable
         {
             ThrowIfDisposed();
             var acquiredPages = _pages.Select(static page => page.Acquire()).ToArray();
-            return new KvSnapshot(sequenceId, version, position, acquiredPages);
+            return new KvSnapshot(sequenceId, version, position, _pool, acquiredPages);
         }
     }
 
     public static KvPageTable Restore(KvSnapshot snapshot) =>
-        new(snapshot.AcquirePages());
+        new(snapshot.Pool, snapshot.AcquirePages());
 
     public void Dispose()
     {
