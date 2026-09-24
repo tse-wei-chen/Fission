@@ -52,20 +52,24 @@ public sealed class ExecutionPlanExecutor : IDisposable
 {
     private readonly ContinuousBatchExecutor _device;
     private readonly IExecutionTraceSink? _trace;
+    private readonly KvPagePool _kvPagePool;
     private readonly ConcurrentDictionary<SequenceId, SequenceProcess> _sequences = new();
     private readonly ConcurrentDictionary<KvSnapshotId, KvSnapshot> _snapshots = new();
     private int _disposed;
 
     public ExecutionPlanExecutor(
         ContinuousBatchExecutor device,
-        IExecutionTraceSink? trace = null)
+        IExecutionTraceSink? trace = null,
+        KvPagePool? kvPagePool = null)
     {
         _device = device;
         _trace = trace;
+        _kvPagePool = kvPagePool ?? new KvPagePool(int.MaxValue);
     }
 
     public int SequenceCount => _sequences.Count;
     public int SnapshotCount => _snapshots.Count;
+    public KvPagePool KvPages => _kvPagePool;
 
     public bool TryGetSequence(SequenceId sequenceId, out SequenceProcess? sequence) =>
         _sequences.TryGetValue(sequenceId, out sequence);
@@ -218,7 +222,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
 
         var sequence = _sequences.GetOrAdd(
             step.SequenceId,
-            id => SequenceProcess.Create(id, step.ModelId, _device.Device));
+            id => SequenceProcess.Create(id, step.ModelId, _device.Device, _kvPagePool));
 
         if (sequence.Model != step.ModelId)
         {
