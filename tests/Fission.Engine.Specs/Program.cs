@@ -14,6 +14,17 @@ static void Require(bool condition, string message)
     }
 }
 
+static async Task<int[]> CollectAsync(InferenceStream stream)
+{
+    var tokens = new List<int>();
+    await foreach (var token in stream.ReadTokensAsync())
+    {
+        tokens.Add(token);
+    }
+
+    return tokens.ToArray();
+}
+
 var device = new DeviceId("cpu:0");
 var model = new ModelId("engine-spec-model");
 var kvPool = new KvPagePool(capacity: 16, tokensPerPage: 4);
@@ -89,6 +100,41 @@ var prefillGrants = cycles
     .Select(static item => item.TokenGrant)
     .ToArray();
 
+await using var worker = new InferenceWorker(
+    engine,
+    new InferenceWorkerOptions(AdmissionCapacity: 4));
+
+var submitC = worker.SubmitAsync(
+    model,
+    new[] { 101, 102, 103, 104, 105, 106, 107, 108, 109 },
+    maxNewTokens: 4,
+    priority: 5,
+    enqueuedAt: baseTime.AddSeconds(1)).AsTask();
+
+var submitD = worker.SubmitAsync(
+    model,
+    new[] { 201, 202, 203, 204, 205 },
+    maxNewTokens: 3,
+    priority: 1,
+    enqueuedAt: baseTime.AddSeconds(1).AddMilliseconds(1)).AsTask();
+
+var streams = await Task.WhenAll(submitC, submitD);
+Require(streams[0].SequenceId != streams[1].SequenceId, "Concurrent submissions must receive distinct sequence ids.");
+
+var collectC = CollectAsync(streams[0]);
+var collectD = CollectAsync(streams[1]);
+var streamed = await Task.WhenAll(collectC, collectD);
+var completions = await Task.WhenAll(streams[0].Completion, streams[1].Completion);
+
+Require(streamed[0].Length == 4, "Worker stream C must publish exactly max_new_tokens=4 decode tokens.");
+Require(streamed[1].Length == 3, "Worker stream D must publish exactly max_new_tokens=3 decode tokens.");
+Require(completions[0].IsCompleted && completions[1].IsCompleted, "Worker completion tasks must finish with terminal snapshots.");
+Require(streamed[0].SequenceEqual(completions[0].GeneratedTokens), "Stream C token order must match engine request history.");
+Require(streamed[1].SequenceEqual(completions[1].GeneratedTokens), "Stream D token order must match engine request history.");
+Require(runtime.SequenceCount == 0, "Async worker must release all terminal runtime sequences.");
+Require(kvPool.AllocatedPages == 0, "Async worker completion must return all KV pages to the pool.");
+
 Console.WriteLine(
     $"Fission engine specs passed: cycles={cycles.Count}, prefill=[{string.Join(',', prefillGrants)}], " +
-    $"generatedA={snapshotA.GeneratedTokens.Count}, generatedB={snapshotB.GeneratedTokens.Count}, kv={kvPool.AllocatedPages}/{kvPool.Capacity}.");
+    $"manual={snapshotA.GeneratedTokens.Count + snapshotB.GeneratedTokens.Count}, " +
+    $"streamed={streamed[0].Length + streamed[1].Length}, kv={kvPool.AllocatedPages}/{kvPool.Capacity}.");
