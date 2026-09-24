@@ -9,10 +9,12 @@ module ScheduleCompiler =
         let items =
             decision.Selected
             |> List.map (fun selected ->
-                let kind =
+                let kind, completesPrefill =
                     match selected.Sequence.Phase with
-                    | Prefilling -> ScheduledWorkKind.Prefill
-                    | Decoding -> ScheduledWorkKind.Decode
+                    | Prefilling ->
+                        ScheduledWorkKind.Prefill,
+                        selected.TokenGrant >= selected.Sequence.TokenDemand
+                    | Decoding -> ScheduledWorkKind.Decode, false
                     | phase -> invalidOp $"Cannot compile non-runnable phase {phase}."
 
                 ScheduledWorkItem(
@@ -20,7 +22,8 @@ module ScheduleCompiler =
                     kind,
                     selected.TokenGrant,
                     selected.KvPageGrant,
-                    selected.Sequence.Priority))
+                    selected.Sequence.Priority,
+                    completesPrefill))
             |> List.toArray
 
         ScheduledBatch(

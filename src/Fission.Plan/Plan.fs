@@ -16,6 +16,7 @@ type InferenceContract =
 
 type InferOp =
     | Prefill of sequence: SequenceId * model: ModelId * tokenCount: int
+    | PrefillChunk of sequence: SequenceId * model: ModelId * tokenCount: int * completesPrefill: bool
     | Decode of sequence: SequenceId * maxTokens: int
     | ForkKv of sequence: SequenceId * branches: int
     | SnapshotKv of sequence: SequenceId

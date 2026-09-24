@@ -17,7 +17,8 @@ type ReadySequence =
       Deadline: DateTimeOffset option
       EnqueuedAt: DateTimeOffset
       TokenDemand: int
-      KvPageDemand: int
+      Position: int
+      TokensPerKvPage: int
       Priority: int }
 
 type ResourceBudget =
@@ -27,12 +28,15 @@ type ResourceBudget =
 
 type SchedulingPolicy =
     { DecodeTokenReserve: int
+      MaxPrefillChunkTokens: int
       DeadlineUrgencyWindow: TimeSpan }
 
 type AdmissionRejectionReason =
     | InvalidTokenDemand
-    | InvalidKvPageDemand
+    | InvalidPosition
+    | InvalidKvPageSize
     | InvalidDecodeQuantum
+    | InvalidKvPageDemand
     | TokenDemandExceedsBatchCapacity
     | KvDemandExceedsCapacity
 

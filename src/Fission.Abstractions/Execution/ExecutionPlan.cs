@@ -5,7 +5,8 @@ public abstract record ExecutionStep(SequenceId SequenceId);
 public sealed record PrefillExecutionStep(
     SequenceId SequenceId,
     ModelId ModelId,
-    int TokenCount) : ExecutionStep(SequenceId);
+    int TokenCount,
+    bool CompletesPrefill) : ExecutionStep(SequenceId);
 
 public sealed record DecodeExecutionStep(
     SequenceId SequenceId,

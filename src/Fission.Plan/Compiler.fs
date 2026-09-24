@@ -7,7 +7,9 @@ module ExecutionPlanCompiler =
     let private compileOp (op: InferOp) : ExecutionStep =
         match op with
         | Prefill (sequence, model, tokenCount) ->
-            PrefillExecutionStep(sequence, model, tokenCount) :> ExecutionStep
+            PrefillExecutionStep(sequence, model, tokenCount, true) :> ExecutionStep
+        | PrefillChunk (sequence, model, tokenCount, completesPrefill) ->
+            PrefillExecutionStep(sequence, model, tokenCount, completesPrefill) :> ExecutionStep
         | Decode (sequence, maxTokens) ->
             DecodeExecutionStep(sequence, maxTokens) :> ExecutionStep
         | ForkKv (sequence, branches) ->

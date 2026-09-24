@@ -47,6 +47,7 @@ public sealed class SequenceProcess : IDisposable
     public long Version { get; private set; }
     public int Position { get; private set; }
     public KvPageTable Kv { get; private set; }
+    public int KvTokensPerPage => Kv.TokensPerPage;
 
     internal static SequenceProcess Create(
         SequenceId id,
@@ -104,27 +105,29 @@ public sealed class SequenceProcess : IDisposable
         }
     }
 
-    internal void RecordPrefill(int tokenCount)
+    internal int RecordPrefill(int tokenCount)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tokenCount);
 
         lock (_gate)
         {
             ThrowIfDisposed();
-            Kv.Append();
-            Position += tokenCount;
+            var allocatedPages = Kv.AppendForTokenRange(Position, tokenCount);
+            Position = checked(Position + tokenCount);
             Version++;
+            return allocatedPages;
         }
     }
 
-    internal void RecordDecode()
+    internal int RecordDecode()
     {
         lock (_gate)
         {
             ThrowIfDisposed();
-            Kv.Append();
-            Position++;
+            var allocatedPages = Kv.AppendForTokenRange(Position, 1);
+            Position = checked(Position + 1);
             Version++;
+            return allocatedPages;
         }
     }
 

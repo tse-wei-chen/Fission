@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Fission.Abstractions;
 using Fission.Abstractions.Execution;
+using Fission.Abstractions.Scheduling;
 using Fission.Runtime.Kv;
 using Fission.Runtime.Sequences;
 using Fission.Runtime.Tracing;
@@ -70,6 +71,11 @@ public sealed class ExecutionPlanExecutor : IDisposable
     public int SequenceCount => _sequences.Count;
     public int SnapshotCount => _snapshots.Count;
     public KvPagePool KvPages => _kvPagePool;
+    public RuntimeKvCapacity KvCapacity => new(
+        _kvPagePool.Capacity,
+        _kvPagePool.AllocatedPages,
+        _kvPagePool.AvailablePages,
+        _kvPagePool.TokensPerPage);
 
     public bool TryGetSequence(SequenceId sequenceId, out SequenceProcess? sequence) =>
         _sequences.TryGetValue(sequenceId, out sequence);
@@ -246,7 +252,11 @@ public sealed class ExecutionPlanExecutor : IDisposable
             cancellationToken).ConfigureAwait(false);
 
         sequence.RecordPrefill(step.TokenCount);
-        sequence.TransitionTo(SequenceStatus.Decoding);
+        if (step.CompletesPrefill)
+        {
+            sequence.TransitionTo(SequenceStatus.Decoding);
+        }
+
         results.Add(result);
     }
 
