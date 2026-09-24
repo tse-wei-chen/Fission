@@ -43,8 +43,9 @@ public sealed class KvPagePool
         ArgumentOutOfRangeException.ThrowIfNegative(position);
         ArgumentOutOfRangeException.ThrowIfNegative(tokenCount);
 
-        var endPosition = checked((long)position + tokenCount);
-        return checked(PagesForTokens(endPosition) - PagesForTokens(position));
+        var endPosition = (long)position + tokenCount;
+        var pageDelta = PagesForTokens(endPosition) - PagesForTokens(position);
+        return checked((int)pageDelta);
     }
 
     public int TokensWritableWith(int position, int additionalPages)
@@ -53,8 +54,10 @@ public sealed class KvPagePool
         ArgumentOutOfRangeException.ThrowIfNegative(additionalPages);
 
         var currentPages = PagesForTokens(position);
-        var capacityTokens = checked((long)(currentPages + additionalPages) * _tokensPerPage);
-        return checked((int)Math.Max(0L, capacityTokens - position));
+        var capacityPages = currentPages + additionalPages;
+        var capacityTokens = checked(capacityPages * _tokensPerPage);
+        var writable = Math.Max(0L, capacityTokens - position);
+        return writable > int.MaxValue ? int.MaxValue : (int)writable;
     }
 
     internal IReadOnlyList<KvPageLease> Rent(int count)
@@ -99,13 +102,13 @@ public sealed class KvPagePool
         }
     }
 
-    private int PagesForTokens(long tokenCount)
+    private long PagesForTokens(long tokenCount)
     {
         if (tokenCount <= 0)
         {
             return 0;
         }
 
-        return checked((int)(((tokenCount - 1) / _tokensPerPage) + 1));
+        return ((tokenCount - 1) / _tokensPerPage) + 1;
     }
 }
