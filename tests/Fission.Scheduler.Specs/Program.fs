@@ -6,7 +6,7 @@ let require condition message =
     if not condition then
         invalidOp message
 
-let sid value =
+let sid (value: string) =
     SequenceId(Guid.Parse(value))
 
 let now = DateTimeOffset(2026, 9, 24, 12, 0, 0, TimeSpan.Zero)
