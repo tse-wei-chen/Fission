@@ -32,6 +32,9 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         _pump = Task.Run(PumpAsync);
     }
 
+    public DeviceId Device => _backend.Device;
+    public string BackendName => _backend.Name;
+
     public static async ValueTask<ContinuousBatchExecutor> CreateAsync(
         IInferenceBackend backend,
         int capacity = 4096,
