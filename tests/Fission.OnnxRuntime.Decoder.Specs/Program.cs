@@ -82,6 +82,7 @@ Require(prefill.TokenId == 36, "Toy decoder prefill must execute the live ONNX g
 Require(binding.PrefillStates.Count == 1, "Prefill must publish one immutable decoder state version.");
 var sharedState = binding.PrefillStates[0];
 Require(sharedState.Position == 6, "Prefill state position must equal the prompt token count.");
+Require(sharedState.NextTokenId == 36, "Prefill state must retain the sampled next-token frontier.");
 
 await executor.SnapshotSequenceAsync(parent, snapshot);
 await executor.ForkSequenceAsync(parent, new[] { branch });
@@ -92,6 +93,7 @@ Require(branchDecode.TokenId == 42, "Branch decode must execute from restored po
 Require(binding.DecodeStates.Count == 1, "Branch decode must publish a new immutable state version.");
 var divergentState = binding.DecodeStates[0];
 Require(divergentState.Position == 7, "Decode must advance physical decoder state by one position.");
+Require(divergentState.NextTokenId == 42, "Decode state must retain its sampled next-token frontier.");
 Require(!sharedState.IsDisposed, "Parent/snapshot owners must keep the shared prefill state alive after branch divergence.");
 Require(!divergentState.IsDisposed, "Divergent branch state must remain alive while the branch owns it.");
 
@@ -291,7 +293,8 @@ sealed class ToyDecoderBinding : IDecoderOrtModelBinding
             var tokenId = checked((int)MathF.Round(keyBuffer[^1]));
             var state = new DecoderOrtState(
                 nextPosition,
-                new[] { new DecoderOrtLayerState(keyOutput, valueOutput) });
+                new[] { new DecoderOrtLayerState(keyOutput, valueOutput) },
+                nextTokenId: tokenId);
             return new DecoderOrtStepResult(tokenId, state);
         }
         catch
