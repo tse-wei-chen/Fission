@@ -7,7 +7,9 @@ namespace Fission.Runtime.Execution;
 /// <summary>
 /// Single-device actor that owns backend execution. Producers enqueue work;
 /// one consumer drains currently available work into micro-batches and invokes
-/// the backend serially. This keeps request tasks from racing the device.
+/// the backend serially. Stateful control operations are queue-order barriers:
+/// inference before a control is flushed first, the control executes, then later
+/// inference may proceed.
 /// </summary>
 public sealed class ContinuousBatchExecutor : IAsyncDisposable
 {
@@ -59,15 +61,39 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         CancellationToken cancellationToken = default) =>
         SubmitInferenceAsync(new PendingDecode(item), cancellationToken);
 
-    public async ValueTask ReleaseSequenceAsync(
+    public ValueTask SnapshotSequenceAsync(
         SequenceId sequenceId,
-        CancellationToken cancellationToken = default)
-    {
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        var work = new PendingRelease(sequenceId);
-        await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
-        await work.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
-    }
+        KvSnapshotId snapshotId,
+        CancellationToken cancellationToken = default) =>
+        SubmitControlAsync(
+            new PendingSnapshot(sequenceId, snapshotId),
+            cancellationToken);
+
+    public ValueTask ForkSequenceAsync(
+        SequenceId parentSequenceId,
+        IReadOnlyList<SequenceId> branchSequenceIds,
+        CancellationToken cancellationToken = default) =>
+        SubmitControlAsync(
+            new PendingFork(parentSequenceId, branchSequenceIds.ToArray()),
+            cancellationToken);
+
+    public ValueTask RestoreSequenceAsync(
+        SequenceId sequenceId,
+        KvSnapshotId snapshotId,
+        CancellationToken cancellationToken = default) =>
+        SubmitControlAsync(
+            new PendingRestore(sequenceId, snapshotId),
+            cancellationToken);
+
+    public ValueTask ReleaseSnapshotAsync(
+        KvSnapshotId snapshotId,
+        CancellationToken cancellationToken = default) =>
+        SubmitControlAsync(new PendingReleaseSnapshot(snapshotId), cancellationToken);
+
+    public ValueTask ReleaseSequenceAsync(
+        SequenceId sequenceId,
+        CancellationToken cancellationToken = default) =>
+        SubmitControlAsync(new PendingReleaseSequence(sequenceId), cancellationToken);
 
     private async ValueTask<BackendStepResult> SubmitInferenceAsync<TWork>(
         TWork work,
@@ -77,6 +103,15 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
         return await work.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask SubmitControlAsync(
+        PendingControl work,
+        CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
+        await work.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task PumpAsync()
@@ -122,7 +157,36 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
 
     private async Task ExecuteBatchAsync(IReadOnlyList<PendingWork> batch)
     {
-        var prefills = batch.OfType<PendingPrefill>().ToArray();
+        var inferenceSegment = new List<PendingInference>(_maxBatchSize);
+
+        foreach (var work in batch)
+        {
+            if (work is PendingInference inference)
+            {
+                inferenceSegment.Add(inference);
+                continue;
+            }
+
+            await ExecuteInferenceSegmentAsync(inferenceSegment).ConfigureAwait(false);
+            inferenceSegment.Clear();
+
+            var control = (PendingControl)work;
+            await control.ExecuteAsync(_backend).ConfigureAwait(false);
+            control.Completion.TrySetResult(true);
+        }
+
+        await ExecuteInferenceSegmentAsync(inferenceSegment).ConfigureAwait(false);
+    }
+
+    private async Task ExecuteInferenceSegmentAsync(
+        IReadOnlyList<PendingInference> segment)
+    {
+        if (segment.Count == 0)
+        {
+            return;
+        }
+
+        var prefills = segment.OfType<PendingPrefill>().ToArray();
         if (prefills.Length != 0)
         {
             var input = new PrefillBatch(prefills.Select(static work => work.Item).ToArray());
@@ -130,18 +194,12 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
             Complete(prefills, results);
         }
 
-        var decodes = batch.OfType<PendingDecode>().ToArray();
+        var decodes = segment.OfType<PendingDecode>().ToArray();
         if (decodes.Length != 0)
         {
             var input = new DecodeBatch(decodes.Select(static work => work.Item).ToArray());
             var results = await _backend.DecodeAsync(input).ConfigureAwait(false);
             Complete(decodes, results);
-        }
-
-        foreach (var release in batch.OfType<PendingRelease>())
-        {
-            await _backend.ReleaseSequenceAsync(release.SequenceId).ConfigureAwait(false);
-            release.Completion.TrySetResult(true);
         }
     }
 
@@ -203,13 +261,56 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         public DecodeItem Item { get; } = item;
     }
 
-    private sealed class PendingRelease(SequenceId sequenceId) : PendingWork
+    private abstract class PendingControl : PendingWork
     {
-        public SequenceId SequenceId { get; } = sequenceId;
-        public TaskCompletionSource<bool> Completion { get; } = new(
-            TaskCreationOptions.RunContinuationsAsynchronously);
+        protected PendingControl()
+        {
+            Completion = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        public TaskCompletionSource<bool> Completion { get; }
+        public abstract ValueTask ExecuteAsync(IInferenceBackend backend);
 
         public override void Fail(Exception exception) =>
             Completion.TrySetException(exception);
+    }
+
+    private sealed class PendingSnapshot(
+        SequenceId sequenceId,
+        KvSnapshotId snapshotId) : PendingControl
+    {
+        public override ValueTask ExecuteAsync(IInferenceBackend backend) =>
+            backend.SnapshotSequenceAsync(sequenceId, snapshotId);
+    }
+
+    private sealed class PendingFork(
+        SequenceId parentSequenceId,
+        SequenceId[] branchSequenceIds) : PendingControl
+    {
+        public override ValueTask ExecuteAsync(IInferenceBackend backend) =>
+            backend.ForkSequenceAsync(parentSequenceId, branchSequenceIds);
+    }
+
+    private sealed class PendingRestore(
+        SequenceId sequenceId,
+        KvSnapshotId snapshotId) : PendingControl
+    {
+        public override ValueTask ExecuteAsync(IInferenceBackend backend) =>
+            backend.RestoreSequenceAsync(sequenceId, snapshotId);
+    }
+
+    private sealed class PendingReleaseSnapshot(
+        KvSnapshotId snapshotId) : PendingControl
+    {
+        public override ValueTask ExecuteAsync(IInferenceBackend backend) =>
+            backend.ReleaseSnapshotAsync(snapshotId);
+    }
+
+    private sealed class PendingReleaseSequence(
+        SequenceId sequenceId) : PendingControl
+    {
+        public override ValueTask ExecuteAsync(IInferenceBackend backend) =>
+            backend.ReleaseSequenceAsync(sequenceId);
     }
 }

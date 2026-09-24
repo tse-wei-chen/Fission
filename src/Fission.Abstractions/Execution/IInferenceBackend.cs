@@ -23,10 +23,9 @@ public readonly record struct BackendStepResult(
 /// in their returned result list so the runtime can complete individual tickets
 /// without sequence-id lookups on the hot path.
 ///
-/// Stateful backends may retain per-sequence logits, decoder state, or physical KV
-/// between PrefillAsync and DecodeAsync. ReleaseSequenceAsync is the lifecycle hook
-/// used to relinquish that backend-owned state when the runtime sequence terminates.
-/// The default implementation is a no-op for stateless backends.
+/// Stateful backends may retain logits, decoder state, physical KV, and snapshot
+/// state between calls. Lifecycle and transaction hooks are serialized by the
+/// device actor. Their default implementations are no-ops for stateless backends.
 /// </summary>
 public interface IInferenceBackend : IAsyncDisposable
 {
@@ -42,6 +41,41 @@ public interface IInferenceBackend : IAsyncDisposable
     ValueTask<IReadOnlyList<BackendStepResult>> DecodeAsync(
         DecodeBatch batch,
         CancellationToken cancellationToken = default);
+
+    ValueTask SnapshotSequenceAsync(
+        SequenceId sequenceId,
+        KvSnapshotId snapshotId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.CompletedTask;
+    }
+
+    ValueTask ForkSequenceAsync(
+        SequenceId parentSequenceId,
+        IReadOnlyList<SequenceId> branchSequenceIds,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.CompletedTask;
+    }
+
+    ValueTask RestoreSequenceAsync(
+        SequenceId sequenceId,
+        KvSnapshotId snapshotId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.CompletedTask;
+    }
+
+    ValueTask ReleaseSnapshotAsync(
+        KvSnapshotId snapshotId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.CompletedTask;
+    }
 
     ValueTask ReleaseSequenceAsync(
         SequenceId sequenceId,
