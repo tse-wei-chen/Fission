@@ -46,8 +46,10 @@ public sealed record ExecutionPlanResult(
 
 /// <summary>
 /// Interprets a compiled inference plan against the stateful runtime.
-/// Multiple plans may execute concurrently and converge on the single-device
-/// continuous batch executor for backend work.
+/// Plans targeting different sequences may execute concurrently and converge on
+/// the single-device continuous batch executor. A sequence, and any snapshot used
+/// by restore, is reserved for one plan at a time so metadata state cannot race
+/// backend transaction barriers.
 /// </summary>
 public sealed class ExecutionPlanExecutor : IDisposable
 {
@@ -56,6 +58,8 @@ public sealed class ExecutionPlanExecutor : IDisposable
     private readonly KvPagePool _kvPagePool;
     private readonly ConcurrentDictionary<SequenceId, SequenceProcess> _sequences = new();
     private readonly ConcurrentDictionary<KvSnapshotId, KvSnapshot> _snapshots = new();
+    private readonly ConcurrentDictionary<SequenceId, byte> _sequenceReservations = new();
+    private readonly ConcurrentDictionary<KvSnapshotId, byte> _snapshotReservations = new();
     private int _disposed;
 
     public ExecutionPlanExecutor(
@@ -85,28 +89,36 @@ public sealed class ExecutionPlanExecutor : IDisposable
         CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        ReserveSequence(sequenceId, "sequence release");
 
-        if (!_sequences.TryGetValue(sequenceId, out var sequence))
+        try
         {
-            return false;
-        }
+            if (!_sequences.TryGetValue(sequenceId, out var sequence))
+            {
+                return false;
+            }
 
-        if (sequence.Status is not SequenceStatus.Finished and not SequenceStatus.Cancelled)
+            if (sequence.Status is not SequenceStatus.Finished and not SequenceStatus.Cancelled)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot release sequence {sequenceId} while it is {sequence.Status}.");
+            }
+
+            await _device.ReleaseSequenceAsync(sequenceId, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!_sequences.TryRemove(sequenceId, out var removed))
+            {
+                return false;
+            }
+
+            removed.Dispose();
+            return true;
+        }
+        finally
         {
-            throw new InvalidOperationException(
-                $"Cannot release sequence {sequenceId} while it is {sequence.Status}.");
+            _sequenceReservations.TryRemove(sequenceId, out _);
         }
-
-        await _device.ReleaseSequenceAsync(sequenceId, cancellationToken)
-            .ConfigureAwait(false);
-
-        if (!_sequences.TryRemove(sequenceId, out var removed))
-        {
-            return false;
-        }
-
-        removed.Dispose();
-        return true;
     }
 
     public async ValueTask<bool> ReleaseSnapshotAsync(
@@ -114,22 +126,30 @@ public sealed class ExecutionPlanExecutor : IDisposable
         CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        ReserveSnapshot(snapshotId, "snapshot release");
 
-        if (!_snapshots.ContainsKey(snapshotId))
+        try
         {
-            return false;
+            if (!_snapshots.ContainsKey(snapshotId))
+            {
+                return false;
+            }
+
+            await _device.ReleaseSnapshotAsync(snapshotId, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!_snapshots.TryRemove(snapshotId, out var removed))
+            {
+                return false;
+            }
+
+            removed.Dispose();
+            return true;
         }
-
-        await _device.ReleaseSnapshotAsync(snapshotId, cancellationToken)
-            .ConfigureAwait(false);
-
-        if (!_snapshots.TryRemove(snapshotId, out var removed))
+        finally
         {
-            return false;
+            _snapshotReservations.TryRemove(snapshotId, out _);
         }
-
-        removed.Dispose();
-        return true;
     }
 
     public async ValueTask<ExecutionPlanResult> ExecuteAsync(
@@ -138,6 +158,10 @@ public sealed class ExecutionPlanExecutor : IDisposable
         CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        ArgumentNullException.ThrowIfNull(plan);
+        ArgumentNullException.ThrowIfNull(bindings);
+
+        using var reservation = ReservePlan(plan);
 
         var backendResults = new List<BackendStepResult>();
         var snapshotIds = new List<KvSnapshotId>();
@@ -348,6 +372,75 @@ public sealed class ExecutionPlanExecutor : IDisposable
         return new ExecutionPlanResult(plan.PlanId, backendResults, snapshotIds, forks);
     }
 
+    private PlanReservation ReservePlan(CompiledExecutionPlan plan)
+    {
+        var sequenceIds = plan.Steps
+            .Select(static step => step.SequenceId)
+            .Distinct()
+            .ToArray();
+        var snapshotIds = plan.Steps
+            .OfType<RestoreKvExecutionStep>()
+            .Select(static step => step.SnapshotId)
+            .Distinct()
+            .ToArray();
+
+        var reservedSequences = new List<SequenceId>(sequenceIds.Length);
+        var reservedSnapshots = new List<KvSnapshotId>(snapshotIds.Length);
+
+        try
+        {
+            foreach (var sequenceId in sequenceIds)
+            {
+                ReserveSequence(sequenceId, $"plan {plan.PlanId}");
+                reservedSequences.Add(sequenceId);
+            }
+
+            foreach (var snapshotId in snapshotIds)
+            {
+                ReserveSnapshot(snapshotId, $"plan {plan.PlanId}");
+                reservedSnapshots.Add(snapshotId);
+            }
+
+            return new PlanReservation(
+                _sequenceReservations,
+                _snapshotReservations,
+                reservedSequences.ToArray(),
+                reservedSnapshots.ToArray());
+        }
+        catch
+        {
+            foreach (var snapshotId in reservedSnapshots)
+            {
+                _snapshotReservations.TryRemove(snapshotId, out _);
+            }
+
+            foreach (var sequenceId in reservedSequences)
+            {
+                _sequenceReservations.TryRemove(sequenceId, out _);
+            }
+
+            throw;
+        }
+    }
+
+    private void ReserveSequence(SequenceId sequenceId, string operation)
+    {
+        if (!_sequenceReservations.TryAdd(sequenceId, 0))
+        {
+            throw new InvalidOperationException(
+                $"Sequence {sequenceId} is already reserved by another runtime operation; cannot start {operation}.");
+        }
+    }
+
+    private void ReserveSnapshot(KvSnapshotId snapshotId, string operation)
+    {
+        if (!_snapshotReservations.TryAdd(snapshotId, 0))
+        {
+            throw new InvalidOperationException(
+                $"Snapshot {snapshotId} is already reserved by another runtime operation; cannot start {operation}.");
+        }
+    }
+
     private async ValueTask ExecutePrefillAsync(
         PrefillExecutionStep step,
         ExecutionBindings bindings,
@@ -493,5 +586,46 @@ public sealed class ExecutionPlanExecutor : IDisposable
         }
 
         _sequences.Clear();
+        _sequenceReservations.Clear();
+        _snapshotReservations.Clear();
+    }
+
+    private sealed class PlanReservation : IDisposable
+    {
+        private readonly ConcurrentDictionary<SequenceId, byte> _sequenceReservations;
+        private readonly ConcurrentDictionary<KvSnapshotId, byte> _snapshotReservations;
+        private readonly SequenceId[] _sequenceIds;
+        private readonly KvSnapshotId[] _snapshotIds;
+        private int _disposed;
+
+        public PlanReservation(
+            ConcurrentDictionary<SequenceId, byte> sequenceReservations,
+            ConcurrentDictionary<KvSnapshotId, byte> snapshotReservations,
+            SequenceId[] sequenceIds,
+            KvSnapshotId[] snapshotIds)
+        {
+            _sequenceReservations = sequenceReservations;
+            _snapshotReservations = snapshotReservations;
+            _sequenceIds = sequenceIds;
+            _snapshotIds = snapshotIds;
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            foreach (var snapshotId in _snapshotIds)
+            {
+                _snapshotReservations.TryRemove(snapshotId, out _);
+            }
+
+            foreach (var sequenceId in _sequenceIds)
+            {
+                _sequenceReservations.TryRemove(sequenceId, out _);
+            }
+        }
     }
 }
