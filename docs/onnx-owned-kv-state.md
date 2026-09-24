@@ -52,6 +52,25 @@ Persistent decoder KV should instead be produced into adapter-owned output value
 
 Those caller-owned values can then be transferred into a new `DecoderOrtState` after a successful model step.
 
+## Proven caller-owned Run path
+
+Fission now exposes `CallerOwnedOrtRun.Execute(...)` as the explicit execution path for preallocated outputs.
+
+The primitive validates the input/output collection counts and requires unique tensor `OrtValue` instances for each output slot, then calls the ONNX Runtime overload that writes directly into caller-owned output values.
+
+The executable state spec proves the complete ownership path with a real ONNX graph:
+
+1. create caller-owned output buffers and `OrtValue`s before the run;
+2. execute `mul_1.onnx` into those outputs;
+3. dispose the input values, `RunOptions`, and `InferenceSession`;
+4. confirm the output `OrtValue`s are still valid and contain the expected inference results;
+5. transfer the output values into `DecoderOrtState`;
+6. fork the state through `DecoderStateStore`;
+7. release the parent while the branch keeps the outputs alive;
+8. release the final branch and let `DecoderOrtState` dispose the output values.
+
+This is the supported ownership bridge for a future decoder adapter. It avoids extracting children from an ORT-owned result collection and remains compatible with later output pooling and GPU IO binding.
+
 ## Current scope
 
 The current payload owns key/value tensors and records logical decoder position. It intentionally does not yet define:
@@ -68,13 +87,12 @@ Those constraints belong to the concrete decoder adapter/export geometry and out
 
 ## Next layer
 
-The next execution primitive should prove caller-owned ORT outputs end to end:
+The next layer is a real decoder-only execution adapter that combines the pieces already established:
 
-1. allocate an output buffer and `OrtValue` before `Run`;
-2. pass it to the ONNX Runtime overload that accepts output values;
-3. execute the graph;
-4. retain ownership after the call returns;
-5. transfer successful KV outputs into `DecoderOrtState`;
-6. let `DecoderStateStore` control snapshot/fork/restore lifetime.
+- `DecoderOnlyOnnxContract` for export-specific tensor names;
+- `CallerOwnedOrtRun` for persistent present-KV outputs;
+- `DecoderOrtState` for physical KV ownership;
+- `DecoderStateStore` for snapshot/fork/restore lifetime;
+- a logits reader/sampler for producing the next token.
 
-That path avoids ambiguous ownership transfer and is also compatible with later buffer pooling and GPU IO binding.
+The first implementation should target one known export geometry rather than pretending every Qwen/Llama ONNX export has identical KV shapes. Model-specific manifests should supply the tensor names and geometry while the generic adapter owns the execution/state protocol.
