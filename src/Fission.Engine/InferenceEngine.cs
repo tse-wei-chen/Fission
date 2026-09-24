@@ -5,6 +5,13 @@ using Fission.Runtime.Sequences;
 
 namespace Fission.Engine;
 
+public enum InferenceFinishReason
+{
+    Stop,
+    Length,
+    Cancelled
+}
+
 public sealed record InferenceEngineOptions(
     int MaxBatchTokens,
     int MaxBatchSequences,
@@ -16,6 +23,7 @@ public sealed record InferenceRequestSnapshot(
     int PromptTokenCount,
     IReadOnlyList<int> GeneratedTokens,
     bool IsCompleted,
+    InferenceFinishReason? FinishReason,
     DateTimeOffset EnqueuedAt,
     DateTimeOffset? Deadline,
     int Priority);
@@ -141,6 +149,61 @@ public sealed class InferenceEngine : IDisposable
         }
     }
 
+    /// <summary>
+    /// Cancels a request at the same serialization boundary used by scheduler
+    /// cycles. Callers never release live KV state concurrently with backend work.
+    /// </summary>
+    public async ValueTask<InferenceRequestSnapshot> CancelAsync(
+        SequenceId sequenceId,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        await _cycleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            RequestState request;
+            lock (_gate)
+            {
+                if (!_requests.TryGetValue(sequenceId, out request!))
+                {
+                    throw new KeyNotFoundException($"Request {sequenceId} does not exist.");
+                }
+
+                if (request.IsCompleted)
+                {
+                    return request.Snapshot();
+                }
+            }
+
+            if (_runtime.TryGetSequence(sequenceId, out var sequence) && sequence is not null)
+            {
+                if (sequence.Status != SequenceStatus.Finished &&
+                    sequence.Status != SequenceStatus.Cancelled)
+                {
+                    sequence.TransitionTo(SequenceStatus.Cancelled);
+                }
+
+                if (!_runtime.ReleaseSequence(sequenceId))
+                {
+                    throw new InvalidOperationException(
+                        $"Runtime sequence {sequenceId} could not be released after cancellation.");
+                }
+            }
+
+            lock (_gate)
+            {
+                request.IsCompleted = true;
+                request.FinishReason = InferenceFinishReason.Cancelled;
+                return request.Snapshot();
+            }
+        }
+        finally
+        {
+            _cycleGate.Release();
+        }
+    }
+
     public async ValueTask<InferenceCycleResult> RunCycleAsync(
         DateTimeOffset now,
         CancellationToken cancellationToken = default)
@@ -236,9 +299,10 @@ public sealed class InferenceEngine : IDisposable
                     CommitDecodeResult(item.SequenceId, backendResult.TokenId);
                 }
 
-                if (ShouldComplete(item.SequenceId, backendResult.IsFinished))
+                var finishReason = GetFinishReason(item.SequenceId, backendResult.IsFinished);
+                if (finishReason is not null)
                 {
-                    CompleteAndRelease(item.SequenceId);
+                    CompleteAndRelease(item.SequenceId, finishReason.Value);
                     completed.Add(item.SequenceId);
                 }
             }
@@ -371,20 +435,29 @@ public sealed class InferenceEngine : IDisposable
         }
     }
 
-    private bool ShouldComplete(SequenceId sequenceId, bool backendFinished)
+    private InferenceFinishReason? GetFinishReason(SequenceId sequenceId, bool backendFinished)
     {
         lock (_gate)
         {
             if (!_requests.TryGetValue(sequenceId, out var request) || request.IsCompleted)
             {
-                return false;
+                return null;
             }
 
-            return backendFinished || request.GeneratedTokens.Count >= request.MaxNewTokens;
+            if (backendFinished)
+            {
+                return InferenceFinishReason.Stop;
+            }
+
+            return request.GeneratedTokens.Count >= request.MaxNewTokens
+                ? InferenceFinishReason.Length
+                : null;
         }
     }
 
-    private void CompleteAndRelease(SequenceId sequenceId)
+    private void CompleteAndRelease(
+        SequenceId sequenceId,
+        InferenceFinishReason finishReason)
     {
         if (!_runtime.TryGetSequence(sequenceId, out var sequence) || sequence is null)
         {
@@ -402,18 +475,19 @@ public sealed class InferenceEngine : IDisposable
                 $"Cannot complete request {sequenceId} while runtime sequence is {sequence.Status}.");
         }
 
+        if (!_runtime.ReleaseSequence(sequenceId))
+        {
+            throw new InvalidOperationException(
+                $"Runtime sequence {sequenceId} could not be released after completion.");
+        }
+
         lock (_gate)
         {
             if (_requests.TryGetValue(sequenceId, out var request))
             {
                 request.IsCompleted = true;
+                request.FinishReason = finishReason;
             }
-        }
-
-        if (!_runtime.ReleaseSequence(sequenceId))
-        {
-            throw new InvalidOperationException(
-                $"Runtime sequence {sequenceId} could not be released after completion.");
         }
     }
 
@@ -456,6 +530,7 @@ public sealed class InferenceEngine : IDisposable
         public DateTimeOffset EnqueuedAt { get; }
         public List<int> GeneratedTokens { get; } = new();
         public bool IsCompleted { get; set; }
+        public InferenceFinishReason? FinishReason { get; set; }
 
         public RequestView View() => new(
             SequenceId,
@@ -473,6 +548,7 @@ public sealed class InferenceEngine : IDisposable
             PromptTokens.Length,
             GeneratedTokens.ToArray(),
             IsCompleted,
+            FinishReason,
             EnqueuedAt,
             Deadline,
             Priority);
