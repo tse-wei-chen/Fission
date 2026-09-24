@@ -14,8 +14,8 @@ public sealed record OnnxRuntimeBackendOptions(
 
 /// <summary>
 /// ONNX Runtime session host. Model-specific tensor names, shapes, KV schemas,
-/// sampling, and batching live in IOnnxRuntimeExecutionAdapter rather than in
-/// the generic runtime backend.
+/// sampling, batching, and state transactions live in
+/// IOnnxRuntimeExecutionAdapter rather than in the generic runtime backend.
 /// </summary>
 public sealed class OnnxRuntimeBackend : IInferenceBackend
 {
@@ -114,6 +114,41 @@ public sealed class OnnxRuntimeBackend : IInferenceBackend
         return _adapter.DecodeAsync(session, batch, cancellationToken);
     }
 
+    public ValueTask SnapshotSequenceAsync(
+        SequenceId sequenceId,
+        KvSnapshotId snapshotId,
+        CancellationToken cancellationToken = default)
+    {
+        _ = GetSession();
+        return _adapter.SnapshotSequenceAsync(sequenceId, snapshotId, cancellationToken);
+    }
+
+    public ValueTask ForkSequenceAsync(
+        SequenceId parentSequenceId,
+        IReadOnlyList<SequenceId> branchSequenceIds,
+        CancellationToken cancellationToken = default)
+    {
+        _ = GetSession();
+        return _adapter.ForkSequenceAsync(parentSequenceId, branchSequenceIds, cancellationToken);
+    }
+
+    public ValueTask RestoreSequenceAsync(
+        SequenceId sequenceId,
+        KvSnapshotId snapshotId,
+        CancellationToken cancellationToken = default)
+    {
+        _ = GetSession();
+        return _adapter.RestoreSequenceAsync(sequenceId, snapshotId, cancellationToken);
+    }
+
+    public ValueTask ReleaseSnapshotAsync(
+        KvSnapshotId snapshotId,
+        CancellationToken cancellationToken = default)
+    {
+        _ = GetSession();
+        return _adapter.ReleaseSnapshotAsync(snapshotId, cancellationToken);
+    }
+
     public ValueTask ReleaseSequenceAsync(
         SequenceId sequenceId,
         CancellationToken cancellationToken = default)
@@ -151,8 +186,6 @@ public sealed class OnnxRuntimeBackend : IInferenceBackend
             return ValueTask.CompletedTask;
         }
 
-        // Adapter-owned OrtValues/per-sequence state must go first; the session
-        // may still be referenced while those objects are being disposed.
         _adapter.Dispose();
         Interlocked.Exchange(ref _session, null)?.Dispose();
         return ValueTask.CompletedTask;
