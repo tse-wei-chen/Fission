@@ -2,6 +2,7 @@ using Fission.Abstractions;
 using Fission.Abstractions.Execution;
 using Fission.Runtime.Backends;
 using Fission.Runtime.Execution;
+using Fission.Runtime.Sequences;
 
 static void Require(bool condition, string message)
 {
@@ -9,6 +10,16 @@ static void Require(bool condition, string message)
     {
         throw new InvalidOperationException(message);
     }
+}
+
+static SequenceProcess GetSequence(ExecutionPlanExecutor runtime, SequenceId sequenceId)
+{
+    if (!runtime.TryGetSequence(sequenceId, out var sequence) || sequence is null)
+    {
+        throw new InvalidOperationException($"Sequence {sequenceId} is missing.");
+    }
+
+    return sequence;
 }
 
 var model = new ModelId("spec-model");
@@ -24,7 +35,7 @@ using var runtime = new ExecutionPlanExecutor(deviceExecutor);
 
 var initialPlan = new CompiledExecutionPlan(
     Guid.NewGuid(),
-    priority: 100,
+    100,
     new ExecutionStep[]
     {
         new PrefillExecutionStep(parentId, model, 4),
@@ -34,7 +45,7 @@ var initialPlan = new CompiledExecutionPlan(
 var bindings = new ExecutionBindings(
     new Dictionary<SequenceId, ReadOnlyMemory<int>>
     {
-        [parentId] = new[] { 10, 11, 12, 13 }
+        [parentId] = new ReadOnlyMemory<int>(new[] { 10, 11, 12, 13 })
     });
 
 var initialResult = await runtime.ExecuteAsync(initialPlan, bindings);
@@ -43,10 +54,9 @@ Require(initialResult.Forks[0].Branches.Count == 2, "Expected two forked branche
 
 var branchAId = initialResult.Forks[0].Branches[0];
 var branchBId = initialResult.Forks[0].Branches[1];
-
-Require(runtime.TryGetSequence(parentId, out var parent) && parent is not null, "Parent sequence missing.");
-Require(runtime.TryGetSequence(branchAId, out var branchA) && branchA is not null, "Branch A missing.");
-Require(runtime.TryGetSequence(branchBId, out var branchB) && branchB is not null, "Branch B missing.");
+var parent = GetSequence(runtime, parentId);
+var branchA = GetSequence(runtime, branchAId);
+var branchB = GetSequence(runtime, branchBId);
 
 var sharedPages = parent.Kv.PageIds.ToArray();
 Require(sharedPages.Length == 1, "Prefill should create one logical KV page in the metadata backend.");
@@ -56,7 +66,7 @@ Require(branchA.Position == parent.Position && branchB.Position == parent.Positi
 
 var branchDecode = new CompiledExecutionPlan(
     Guid.NewGuid(),
-    priority: 50,
+    50,
     new ExecutionStep[]
     {
         new DecodeExecutionStep(branchAId, 1)
@@ -74,7 +84,7 @@ Require(parent.Kv.PageIds.SequenceEqual(sharedPages), "Parent must remain unchan
 
 var snapshotPlan = new CompiledExecutionPlan(
     Guid.NewGuid(),
-    priority: 50,
+    50,
     new ExecutionStep[]
     {
         new SnapshotKvExecutionStep(parentId)
@@ -91,7 +101,7 @@ var snapshotPages = parent.Kv.PageIds.ToArray();
 
 var mutateParentPlan = new CompiledExecutionPlan(
     Guid.NewGuid(),
-    priority: 50,
+    50,
     new ExecutionStep[]
     {
         new DecodeExecutionStep(parentId, 2)
@@ -106,7 +116,7 @@ Require(parent.Kv.PageIds.Count == snapshotPages.Length + 2, "Parent decode shou
 
 var rollbackPlan = new CompiledExecutionPlan(
     Guid.NewGuid(),
-    priority: 50,
+    50,
     new ExecutionStep[]
     {
         new RestoreKvExecutionStep(parentId, snapshotId)
