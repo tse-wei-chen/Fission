@@ -184,7 +184,8 @@ public sealed class InferenceEngine : IDisposable
                     sequence.TransitionTo(SequenceStatus.Cancelled);
                 }
 
-                if (!_runtime.ReleaseSequence(sequenceId))
+                if (!await _runtime.ReleaseSequenceAsync(sequenceId, cancellationToken)
+                        .ConfigureAwait(false))
                 {
                     throw new InvalidOperationException(
                         $"Runtime sequence {sequenceId} could not be released after cancellation.");
@@ -302,7 +303,11 @@ public sealed class InferenceEngine : IDisposable
                 var finishReason = GetFinishReason(item.SequenceId, backendResult.IsFinished);
                 if (finishReason is not null)
                 {
-                    CompleteAndRelease(item.SequenceId, finishReason.Value);
+                    await CompleteAndReleaseAsync(
+                            item.SequenceId,
+                            finishReason.Value,
+                            cancellationToken)
+                        .ConfigureAwait(false);
                     completed.Add(item.SequenceId);
                 }
             }
@@ -455,9 +460,10 @@ public sealed class InferenceEngine : IDisposable
         }
     }
 
-    private void CompleteAndRelease(
+    private async ValueTask CompleteAndReleaseAsync(
         SequenceId sequenceId,
-        InferenceFinishReason finishReason)
+        InferenceFinishReason finishReason,
+        CancellationToken cancellationToken)
     {
         if (!_runtime.TryGetSequence(sequenceId, out var sequence) || sequence is null)
         {
@@ -475,7 +481,8 @@ public sealed class InferenceEngine : IDisposable
                 $"Cannot complete request {sequenceId} while runtime sequence is {sequence.Status}.");
         }
 
-        if (!_runtime.ReleaseSequence(sequenceId))
+        if (!await _runtime.ReleaseSequenceAsync(sequenceId, cancellationToken)
+                .ConfigureAwait(false))
         {
             throw new InvalidOperationException(
                 $"Runtime sequence {sequenceId} could not be released after completion.");
