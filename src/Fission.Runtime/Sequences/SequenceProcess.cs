@@ -15,11 +15,12 @@ public enum SequenceStatus
 
 public sealed class SequenceProcess : IDisposable
 {
+    private static long _nextLogicalPageId;
     private readonly object _gate = new();
     private bool _disposed;
 
     public SequenceProcess(ModelId model, DeviceId device)
-        : this(SequenceId.New(), model, device, new KvPageTable(), 0)
+        : this(SequenceId.New(), model, device, new KvPageTable(), 0, 0)
     {
     }
 
@@ -28,13 +29,15 @@ public sealed class SequenceProcess : IDisposable
         ModelId model,
         DeviceId device,
         KvPageTable kv,
-        long version)
+        long version,
+        int position)
     {
         Id = id;
         Model = model;
         Device = device;
         Kv = kv;
         Version = version;
+        Position = position;
         Status = SequenceStatus.Waiting;
     }
 
@@ -43,7 +46,14 @@ public sealed class SequenceProcess : IDisposable
     public DeviceId Device { get; private set; }
     public SequenceStatus Status { get; private set; }
     public long Version { get; private set; }
-    public KvPageTable Kv { get; }
+    public int Position { get; private set; }
+    public KvPageTable Kv { get; private set; }
+
+    internal static SequenceProcess Create(
+        SequenceId id,
+        ModelId model,
+        DeviceId device) =>
+        new(id, model, device, new KvPageTable(), 0, 0);
 
     public void TransitionTo(SequenceStatus next)
     {
@@ -65,7 +75,7 @@ public sealed class SequenceProcess : IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            return Kv.Snapshot(Id, Version);
+            return Kv.Snapshot(Id, Version, Position);
         }
     }
 
@@ -74,10 +84,47 @@ public sealed class SequenceProcess : IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            return new SequenceProcess(SequenceId.New(), Model, Device, Kv.Fork(), Version)
+            return new SequenceProcess(SequenceId.New(), Model, Device, Kv.Fork(), Version, Position)
             {
                 Status = Status
             };
+        }
+    }
+
+    internal void Restore(KvSnapshot snapshot)
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            var restored = KvPageTable.Restore(snapshot);
+            Kv.Dispose();
+            Kv = restored;
+            Position = snapshot.Position;
+            Version = Math.Max(Version, snapshot.Version) + 1;
+        }
+    }
+
+    internal void RecordPrefill(int tokenCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tokenCount);
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            Kv.Append(Interlocked.Increment(ref _nextLogicalPageId));
+            Position += tokenCount;
+            Version++;
+        }
+    }
+
+    internal void RecordDecode()
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            Kv.Append(Interlocked.Increment(ref _nextLogicalPageId));
+            Position++;
+            Version++;
         }
     }
 

@@ -2,8 +2,9 @@ name: build
 
 on:
   push:
-    branches: [ master ]
+    branches: [ develop ]
   pull_request:
+    branches: [ develop ]
 
 jobs:
   build:
@@ -16,3 +17,4 @@ jobs:
       - run: dotnet restore Fission.slnx
       - run: dotnet build Fission.slnx -c Release --no-restore
       - run: dotnet run --project samples/Fission.Demo/Fission.Demo.csproj -c Release --no-build
+      - run: dotnet run --project samples/Fission.PlanDemo/Fission.PlanDemo.fsproj -c Release --no-build

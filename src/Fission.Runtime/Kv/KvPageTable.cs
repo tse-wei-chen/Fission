@@ -30,6 +30,18 @@ public sealed class KvPageTable : IDisposable
         }
     }
 
+    public IReadOnlyList<long> PageIds
+    {
+        get
+        {
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+                return _pages.Select(static page => page.PageId).ToArray();
+            }
+        }
+    }
+
     public void Append(long pageId)
     {
         lock (_gate)
@@ -48,13 +60,13 @@ public sealed class KvPageTable : IDisposable
         }
     }
 
-    public KvSnapshot Snapshot(SequenceId sequenceId, long version)
+    public KvSnapshot Snapshot(SequenceId sequenceId, long version, int position)
     {
         lock (_gate)
         {
             ThrowIfDisposed();
             var acquiredPages = _pages.Select(static page => page.Acquire()).ToArray();
-            return new KvSnapshot(sequenceId, version, acquiredPages);
+            return new KvSnapshot(sequenceId, version, position, acquiredPages);
         }
     }
 
