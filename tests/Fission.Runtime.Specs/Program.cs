@@ -3,6 +3,7 @@ using Fission.Abstractions.Execution;
 using Fission.Abstractions.Scheduling;
 using Fission.Runtime.Backends;
 using Fission.Runtime.Execution;
+using Fission.Runtime.Kv;
 using Fission.Runtime.Sequences;
 using Fission.Runtime.Tracing;
 
@@ -38,13 +39,16 @@ var model = new ModelId("spec-model");
 var device = new DeviceId("cpu:0");
 var parentId = SequenceId.New();
 var trace = new InMemoryExecutionTraceSink();
+var kvPool = new KvPagePool(capacity: 4);
 
 await using var deviceExecutor = await ContinuousBatchExecutor.CreateAsync(
     new DeterministicBackend(device),
     capacity: 128,
     maxBatchSize: 16);
 
-using var runtime = new ExecutionPlanExecutor(deviceExecutor, trace);
+using var runtime = new ExecutionPlanExecutor(deviceExecutor, trace, kvPool);
+Require(runtime.KvPages == kvPool, "Runtime must expose its configured KV page pool.");
+Require(kvPool.AllocatedPages == 0 && kvPool.AvailablePages == 4, "KV pool must start empty.");
 
 var initialPlan = new CompiledExecutionPlan(
     Guid.NewGuid(),
@@ -64,6 +68,7 @@ var bindings = new ExecutionBindings(
 var initialResult = await runtime.ExecuteAsync(initialPlan, bindings);
 Require(initialResult.Forks.Count == 1, "Expected one fork result.");
 Require(initialResult.Forks[0].Branches.Count == 2, "Expected two forked branches.");
+Require(kvPool.AllocatedPages == 1, "Forking shared history must not allocate additional physical KV pages.");
 
 var branchAId = initialResult.Forks[0].Branches[0];
 var branchBId = initialResult.Forks[0].Branches[1];
@@ -94,6 +99,7 @@ Require(branchAPages.Length == sharedPages.Length + 1, "Decoded branch must appe
 Require(branchAPages.Take(sharedPages.Length).SequenceEqual(sharedPages), "Decoded branch must preserve shared KV prefix.");
 Require(branchB.Kv.PageIds.SequenceEqual(sharedPages), "Sibling branch must remain unchanged when another branch decodes.");
 Require(parent.Kv.PageIds.SequenceEqual(sharedPages), "Parent must remain unchanged when a child branch decodes.");
+Require(kvPool.AllocatedPages == 2, "Branch divergence must allocate exactly one new physical KV page.");
 
 var snapshotPlan = new CompiledExecutionPlan(
     Guid.NewGuid(),
@@ -108,6 +114,7 @@ var snapshotResult = await runtime.ExecuteAsync(
     new ExecutionBindings(new Dictionary<SequenceId, ReadOnlyMemory<int>>()));
 
 Require(snapshotResult.Snapshots.Count == 1, "Expected one snapshot id.");
+Require(kvPool.AllocatedPages == 2, "Snapshot references must not consume additional physical KV capacity.");
 var snapshotId = snapshotResult.Snapshots[0];
 var snapshotPosition = parent.Position;
 var snapshotPages = parent.Kv.PageIds.ToArray();
@@ -126,6 +133,7 @@ await runtime.ExecuteAsync(
 
 Require(parent.Position == snapshotPosition + 2, "Parent decode should advance token position.");
 Require(parent.Kv.PageIds.Count == snapshotPages.Length + 2, "Parent decode should append logical KV pages.");
+Require(kvPool.AllocatedPages == 4 && kvPool.AvailablePages == 0, "Parent mutations must consume the remaining two KV pages.");
 
 var rollbackPlan = new CompiledExecutionPlan(
     Guid.NewGuid(),
@@ -142,6 +150,7 @@ await runtime.ExecuteAsync(
 Require(parent.Position == snapshotPosition, "Restore must rewind token position to the snapshot.");
 Require(parent.Kv.PageIds.SequenceEqual(snapshotPages), "Restore must rewind KV page history to the snapshot.");
 Require(branchA.Kv.PageIds.Take(sharedPages.Length).SequenceEqual(parent.Kv.PageIds), "Forked branch must retain the original shared prefix after parent rollback.");
+Require(kvPool.AllocatedPages == 2 && kvPool.AvailablePages == 2, "Rollback must return discarded mutation pages to the pool.");
 
 var recordedTrace = trace.Snapshot();
 Require(recordedTrace.Count > 0, "Execution trace must contain events.");
@@ -189,6 +198,7 @@ var scheduledBindings = new ScheduledExecutionBindings(
 var scheduledResult = await scheduledExecutor.ExecuteAsync(validSchedule, scheduledBindings);
 Require(scheduledResult.ScheduleId == validSchedule.ScheduleId, "Scheduled execution must preserve schedule id.");
 Require(scheduledResult.ItemResults.Count == 2, "Scheduled execution must return one result per work item.");
+Require(kvPool.AllocatedPages == 4 && kvPool.AvailablePages == 0, "Scheduled prefill/decode must consume their physical KV page grants.");
 
 var scheduledPrefill = GetSequence(runtime, scheduledPrefillId);
 Require(scheduledPrefill.Position == 3, "Scheduled prefill must advance the new sequence by its token grant.");
@@ -227,6 +237,31 @@ catch (InvalidOperationException)
 Require(invalidRejected, "Invalid scheduled resource accounting must be rejected.");
 Require(runtime.SequenceCount == sequenceCountBeforeInvalidSchedule, "Invalid schedule validation must complete before runtime side effects begin.");
 Require(!runtime.TryGetSequence(invalidPrefillId, out _), "Invalid scheduled prefill must not create a sequence.");
+Require(kvPool.AllocatedPages == 4, "Rejected scheduled work must not leak or consume KV pages.");
+
+var exhaustedPosition = branchA.Position;
+var capacityRejected = false;
+try
+{
+    await runtime.ExecuteAsync(
+        new CompiledExecutionPlan(
+            Guid.NewGuid(),
+            0,
+            new ExecutionStep[] { new DecodeExecutionStep(branchAId, 1) }),
+        new ExecutionBindings(new Dictionary<SequenceId, ReadOnlyMemory<int>>()));
+}
+catch (KvPageCapacityExceededException)
+{
+    capacityRejected = true;
+}
+
+Require(capacityRejected, "Runtime must reject KV allocation when page capacity is exhausted.");
+Require(branchA.Position == exhaustedPosition, "Capacity rejection must not advance sequence state.");
+Require(kvPool.AllocatedPages == 4, "Capacity rejection must not leak page accounting.");
+
+var finalBranchAPageCount = branchA.Kv.PageIds.Count;
+runtime.Dispose();
+Require(kvPool.AllocatedPages == 0 && kvPool.AvailablePages == kvPool.Capacity, "Runtime disposal must release every physical KV page lease.");
 
 Console.WriteLine(
-    $"Fission runtime specs passed: shared={sharedPages.Length}, branchA={branchA.Kv.PageIds.Count}, rollback={parent.Kv.PageIds.Count}, traceEvents={recordedTrace.Count}, scheduledItems={scheduledResult.ItemResults.Count}.");
+    $"Fission runtime specs passed: shared={sharedPages.Length}, branchA={finalBranchAPageCount}, rollback={snapshotPages.Length}, traceEvents={recordedTrace.Count}, scheduledItems={scheduledResult.ItemResults.Count}, kvCapacity={kvPool.Capacity}.");
