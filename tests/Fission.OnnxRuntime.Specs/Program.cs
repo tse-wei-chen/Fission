@@ -122,6 +122,63 @@ catch (InvalidOperationException)
 }
 Require(incompleteCacheRejected, "Partial past/present cache manifests must be rejected.");
 
+// Caller-owned/preallocated output proof. The same output OrtValue is reused
+// across runs and remains valid after RunOptions disposal because ORT only writes
+// into the caller-supplied handle; it does not return/own an output collection.
+using (var sessionOptions = new SessionOptions())
+using (var directSession = new InferenceSession(modelBytes, sessionOptions))
+using (var preallocatedInput = new OwnedOrtTensor<float>(
+    new[] { 1f, 2f, 3f, 4f, 5f, 6f },
+    new long[] { 3, 2 }))
+using (var preallocatedOutput = new OwnedOrtTensor<float>(new long[] { 3, 2 }))
+{
+    using (var runOptions = new RunOptions())
+    {
+        directSession.Run(
+            runOptions,
+            new[] { "X" },
+            new[] { preallocatedInput.Value },
+            new[] { "Y" },
+            new[] { preallocatedOutput.Value });
+    }
+
+    Require(preallocatedOutput.ReadOnlySpan[^1] == 36f, "Preallocated ORT output buffer must receive the first graph result (6*6=36).");
+    Require(!preallocatedOutput.IsDisposed, "Run/RunOptions disposal must not transfer or release caller-owned output OrtValue ownership.");
+    Require(preallocatedOutput.Value.GetTensorDataAsSpan<float>()[^1] == 36f, "Caller-owned output OrtValue must remain readable after the run returns.");
+
+    preallocatedInput.Span.CopyTo(new float[0]);
+    var secondInput = preallocatedInput.Span;
+    secondInput[0] = 2f;
+    secondInput[1] = 3f;
+    secondInput[2] = 4f;
+    secondInput[3] = 5f;
+    secondInput[4] = 6f;
+    secondInput[5] = 7f;
+
+    using (var runOptions = new RunOptions())
+    {
+        directSession.Run(
+            runOptions,
+            new[] { "X" },
+            new[] { preallocatedInput.Value },
+            new[] { "Y" },
+            new[] { preallocatedOutput.Value });
+    }
+
+    Require(preallocatedOutput.ReadOnlySpan[^1] == 42f, "The same preallocated output buffer must be reusable across model steps (7*6=42).");
+}
+
+var invalidShapeRejected = false;
+try
+{
+    using var invalidTensor = new OwnedOrtTensor<float>(new float[5], new long[] { 3, 2 });
+}
+catch (ArgumentException)
+{
+    invalidShapeRejected = true;
+}
+Require(invalidShapeRejected, "OwnedOrtTensor must reject buffer/shape element-count mismatches before creating an OrtValue.");
+
 var adapter = new MulSpecAdapter();
 var backend = new OnnxRuntimeBackend(
     new OnnxRuntimeBackendOptions(
