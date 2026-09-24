@@ -52,16 +52,27 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
     public ValueTask<BackendStepResult> SubmitPrefillAsync(
         PrefillItem item,
         CancellationToken cancellationToken = default) =>
-        SubmitAsync(new PendingPrefill(item), cancellationToken);
+        SubmitInferenceAsync(new PendingPrefill(item), cancellationToken);
 
     public ValueTask<BackendStepResult> SubmitDecodeAsync(
         DecodeItem item,
         CancellationToken cancellationToken = default) =>
-        SubmitAsync(new PendingDecode(item), cancellationToken);
+        SubmitInferenceAsync(new PendingDecode(item), cancellationToken);
 
-    private async ValueTask<BackendStepResult> SubmitAsync(
-        PendingWork work,
+    public async ValueTask ReleaseSequenceAsync(
+        SequenceId sequenceId,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        var work = new PendingRelease(sequenceId);
+        await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
+        await work.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<BackendStepResult> SubmitInferenceAsync<TWork>(
+        TWork work,
         CancellationToken cancellationToken)
+        where TWork : PendingInference
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
@@ -82,7 +93,19 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
                     batch.Add(work);
                 }
 
-                await ExecuteBatchAsync(batch).ConfigureAwait(false);
+                try
+                {
+                    await ExecuteBatchAsync(batch).ConfigureAwait(false);
+                }
+                catch (Exception exception)
+                {
+                    foreach (var work in batch)
+                    {
+                        work.Fail(exception);
+                    }
+
+                    throw;
+                }
             }
         }
         catch (Exception exception)
@@ -90,7 +113,7 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
             _queue.Writer.TryComplete(exception);
             while (reader.TryRead(out var work))
             {
-                work.Completion.TrySetException(exception);
+                work.Fail(exception);
             }
 
             throw;
@@ -114,12 +137,18 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
             var results = await _backend.DecodeAsync(input).ConfigureAwait(false);
             Complete(decodes, results);
         }
+
+        foreach (var release in batch.OfType<PendingRelease>())
+        {
+            await _backend.ReleaseSequenceAsync(release.SequenceId).ConfigureAwait(false);
+            release.Completion.TrySetResult(true);
+        }
     }
 
     private static void Complete<TWork>(
         IReadOnlyList<TWork> work,
         IReadOnlyList<BackendStepResult> results)
-        where TWork : PendingWork
+        where TWork : PendingInference
     {
         if (work.Count != results.Count)
         {
@@ -147,22 +176,40 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
 
     private abstract class PendingWork
     {
-        protected PendingWork()
+        public abstract void Fail(Exception exception);
+    }
+
+    private abstract class PendingInference : PendingWork
+    {
+        protected PendingInference()
         {
             Completion = new TaskCompletionSource<BackendStepResult>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
         }
 
         public TaskCompletionSource<BackendStepResult> Completion { get; }
+
+        public override void Fail(Exception exception) =>
+            Completion.TrySetException(exception);
     }
 
-    private sealed class PendingPrefill(PrefillItem item) : PendingWork
+    private sealed class PendingPrefill(PrefillItem item) : PendingInference
     {
         public PrefillItem Item { get; } = item;
     }
 
-    private sealed class PendingDecode(DecodeItem item) : PendingWork
+    private sealed class PendingDecode(DecodeItem item) : PendingInference
     {
         public DecodeItem Item { get; } = item;
+    }
+
+    private sealed class PendingRelease(SequenceId sequenceId) : PendingWork
+    {
+        public SequenceId SequenceId { get; } = sequenceId;
+        public TaskCompletionSource<bool> Completion { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override void Fail(Exception exception) =>
+            Completion.TrySetException(exception);
     }
 }
