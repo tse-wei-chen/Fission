@@ -9,15 +9,18 @@ public sealed record InferenceWorkerOptions(int AdmissionCapacity = 1024);
 public sealed class InferenceStream
 {
     private readonly ChannelReader<int> _tokens;
+    private readonly Func<SequenceId, CancellationToken, ValueTask<InferenceRequestSnapshot>> _cancel;
 
     internal InferenceStream(
         SequenceId sequenceId,
         ChannelReader<int> tokens,
-        Task<InferenceRequestSnapshot> completion)
+        Task<InferenceRequestSnapshot> completion,
+        Func<SequenceId, CancellationToken, ValueTask<InferenceRequestSnapshot>> cancel)
     {
         SequenceId = sequenceId;
         _tokens = tokens;
         Completion = completion;
+        _cancel = cancel;
     }
 
     public SequenceId SequenceId { get; }
@@ -26,17 +29,22 @@ public sealed class InferenceStream
     public IAsyncEnumerable<int> ReadTokensAsync(
         CancellationToken cancellationToken = default) =>
         _tokens.ReadAllAsync(cancellationToken);
+
+    public ValueTask<InferenceRequestSnapshot> CancelAsync(
+        CancellationToken cancellationToken = default) =>
+        _cancel(SequenceId, cancellationToken);
 }
 
 /// <summary>
 /// Single scheduler actor for high-concurrency serving. Producers enqueue
 /// admission requests through a bounded channel; one pump owns scheduler-cycle
-/// progression and fans decode tokens out to per-request async streams.
+/// progression, serialized cancellation, and per-request token fan-out.
 /// </summary>
 public sealed class InferenceWorker : IAsyncDisposable
 {
     private readonly InferenceEngine _engine;
     private readonly Channel<PendingSubmission> _admission;
+    private readonly Channel<PendingCancellation> _cancellation;
     private readonly Dictionary<SequenceId, SessionState> _sessions = new();
     private readonly Task _pump;
     private int _disposed;
@@ -56,6 +64,13 @@ public sealed class InferenceWorker : IAsyncDisposable
                 SingleReader = true,
                 SingleWriter = false,
                 FullMode = BoundedChannelFullMode.Wait
+            });
+        _cancellation = Channel.CreateUnbounded<PendingCancellation>(
+            new UnboundedChannelOptions
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                AllowSynchronousContinuations = false
             });
         _pump = Task.Run(PumpAsync);
     }
@@ -96,15 +111,20 @@ public sealed class InferenceWorker : IAsyncDisposable
         {
             while (true)
             {
-                if (_engine.ActiveRequestCount == 0)
+                if (_engine.ActiveRequestCount == 0 &&
+                    !HasImmediatelyAvailableWork() &&
+                    !await WaitForWorkAsync().ConfigureAwait(false))
                 {
-                    if (!await AdmitAtLeastOneAsync().ConfigureAwait(false))
-                    {
-                        break;
-                    }
+                    break;
                 }
 
+                await DrainCancellationsAsync().ConfigureAwait(false);
                 DrainAdmissions();
+
+                if (_engine.ActiveRequestCount == 0)
+                {
+                    continue;
+                }
 
                 var cycle = await _engine.RunCycleAsync(DateTimeOffset.UtcNow)
                     .ConfigureAwait(false);
@@ -127,22 +147,34 @@ public sealed class InferenceWorker : IAsyncDisposable
         finally
         {
             FailPendingAdmissions(failure);
+            FailPendingCancellations(failure);
             CompleteOpenSessions(failure);
         }
     }
 
-    private async ValueTask<bool> AdmitAtLeastOneAsync()
+    private bool HasImmediatelyAvailableWork() =>
+        _admission.Reader.TryPeek(out _) || _cancellation.Reader.TryPeek(out _);
+
+    private async ValueTask<bool> WaitForWorkAsync()
     {
-        while (await _admission.Reader.WaitToReadAsync().ConfigureAwait(false))
+        while (true)
         {
-            if (_admission.Reader.TryRead(out var pending))
+            var admissionWait = _admission.Reader.WaitToReadAsync().AsTask();
+            var cancellationWait = _cancellation.Reader.WaitToReadAsync().AsTask();
+            var completed = await Task.WhenAny(admissionWait, cancellationWait)
+                .ConfigureAwait(false);
+
+            if (await completed.ConfigureAwait(false))
             {
-                Admit(pending);
                 return true;
             }
-        }
 
-        return false;
+            if (_admission.Reader.Completion.IsCompleted &&
+                _cancellation.Reader.Completion.IsCompleted)
+            {
+                return false;
+            }
+        }
     }
 
     private void DrainAdmissions()
@@ -150,6 +182,30 @@ public sealed class InferenceWorker : IAsyncDisposable
         while (_admission.Reader.TryRead(out var pending))
         {
             Admit(pending);
+        }
+    }
+
+    private async ValueTask DrainCancellationsAsync()
+    {
+        while (_cancellation.Reader.TryRead(out var pending))
+        {
+            try
+            {
+                var snapshot = await _engine.CancelAsync(pending.SequenceId)
+                    .ConfigureAwait(false);
+
+                if (_sessions.Remove(pending.SequenceId, out var session))
+                {
+                    session.Writer.TryComplete();
+                    session.Completion.TrySetResult(snapshot);
+                }
+
+                pending.Completed.TrySetResult(snapshot);
+            }
+            catch (Exception exception)
+            {
+                pending.Completed.TrySetException(exception);
+            }
         }
     }
 
@@ -177,7 +233,8 @@ public sealed class InferenceWorker : IAsyncDisposable
             var stream = new InferenceStream(
                 sequenceId,
                 tokenChannel.Reader,
-                completion.Task);
+                completion.Task,
+                RequestCancellationAsync);
 
             _sessions.Add(
                 sequenceId,
@@ -188,6 +245,19 @@ public sealed class InferenceWorker : IAsyncDisposable
         {
             pending.Accepted.TrySetException(exception);
         }
+    }
+
+    private async ValueTask<InferenceRequestSnapshot> RequestCancellationAsync(
+        SequenceId sequenceId,
+        CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+        var pending = new PendingCancellation(sequenceId);
+        await _cancellation.Writer.WriteAsync(pending, cancellationToken)
+            .ConfigureAwait(false);
+        return await pending.Completed.Task.WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
     }
 
     private void PublishDecodeTokens(InferenceCycleResult cycle)
@@ -253,6 +323,22 @@ public sealed class InferenceWorker : IAsyncDisposable
         }
     }
 
+    private void FailPendingCancellations(Exception? failure)
+    {
+        while (_cancellation.Reader.TryRead(out var pending))
+        {
+            if (failure is null)
+            {
+                pending.Completed.TrySetException(
+                    new ObjectDisposedException(nameof(InferenceWorker)));
+            }
+            else
+            {
+                pending.Completed.TrySetException(failure);
+            }
+        }
+    }
+
     private void CompleteOpenSessions(Exception? failure)
     {
         foreach (var session in _sessions.Values)
@@ -281,6 +367,7 @@ public sealed class InferenceWorker : IAsyncDisposable
         }
 
         _admission.Writer.TryComplete();
+        _cancellation.Writer.TryComplete();
         await _pump.ConfigureAwait(false);
     }
 
@@ -293,6 +380,12 @@ public sealed class InferenceWorker : IAsyncDisposable
         DateTimeOffset EnqueuedAt)
     {
         public TaskCompletionSource<InferenceStream> Accepted { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    private sealed record PendingCancellation(SequenceId SequenceId)
+    {
+        public TaskCompletionSource<InferenceRequestSnapshot> Completed { get; } = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
