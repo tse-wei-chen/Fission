@@ -1,5 +1,6 @@
 open System
 open Fission.Abstractions
+open Fission.Abstractions.Scheduling
 open Fission.Scheduler
 
 let require condition message =
@@ -87,6 +88,18 @@ require
     (mixedDecision.Deferred.Head.Sequence.SequenceId = highPriorityPrefill.SequenceId
      && mixedDecision.Deferred.Head.Reason = BatchSequenceBudget)
     "The non-urgent prefill should be deferred by batch sequence capacity."
+
+let scheduleId = Guid.Parse("11111111-1111-1111-1111-111111111111")
+let compiledBatch = ScheduleCompiler.compile scheduleId mixedDecision
+
+require (compiledBatch.ScheduleId = scheduleId) "Compiled schedule id must be preserved."
+require (compiledBatch.Items.Count = mixedDecision.Selected.Length) "Compiled work item count must match the selected decision."
+require (compiledBatch.ConsumedTokens = mixedDecision.ConsumedTokens) "Compiled token accounting must match the decision."
+require (compiledBatch.ConsumedKvPages = mixedDecision.ConsumedKvPages) "Compiled KV accounting must match the decision."
+require (compiledBatch.Items[0].Kind = ScheduledWorkKind.Decode) "First reserved decode must compile as decode work."
+require (compiledBatch.Items[1].Kind = ScheduledWorkKind.Decode) "Second reserved decode must compile as decode work."
+require (compiledBatch.Items[2].Kind = ScheduledWorkKind.Prefill) "Urgent prefill must compile as prefill work."
+require (compiledBatch.Items[2].TokenGrant = 4) "Compiled prefill token grant must be preserved."
 
 let admissionPolicy =
     { DecodeTokenReserve = 0
@@ -191,8 +204,9 @@ require
     "Stable sequence-id tie breaking must make scheduling independent of input order."
 
 printfn
-    "Fission scheduler specs passed: selected=%d tokens=%d kv=%d rejected=%d"
+    "Fission scheduler specs passed: selected=%d tokens=%d kv=%d rejected=%d compiled=%d"
     mixedDecision.Selected.Length
     mixedDecision.ConsumedTokens
     mixedDecision.ConsumedKvPages
     admissionDecision.Rejected.Length
+    compiledBatch.Items.Count
