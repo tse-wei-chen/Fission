@@ -11,23 +11,26 @@ let sid (value: string) =
     SequenceId(Guid.Parse(value))
 
 let now = DateTimeOffset(2026, 9, 24, 12, 0, 0, TimeSpan.Zero)
+let blockSize = 4
 
-let mk sequenceId phase priority deadline enqueuedAt tokenDemand kvPageDemand =
+let mk sequenceId phase priority deadline enqueuedAt tokenDemand position tokensPerKvPage =
     { SequenceId = sequenceId
       Phase = phase
       Deadline = deadline
       EnqueuedAt = enqueuedAt
       TokenDemand = tokenDemand
-      KvPageDemand = kvPageDemand
+      Position = position
+      TokensPerKvPage = tokensPerKvPage
       Priority = priority }
 
 let policy =
     { DecodeTokenReserve = 2
+      MaxPrefillChunkTokens = 4
       DeadlineUrgencyWindow = TimeSpan.FromMilliseconds(50.0) }
 
 let budget =
     { MaxBatchTokens = 8
-      AvailableKvPages = 4
+      AvailableKvPages = 2
       MaxBatchSequences = 3 }
 
 let decodeA =
@@ -38,7 +41,8 @@ let decodeA =
         None
         (now - TimeSpan.FromMilliseconds(4.0))
         1
-        1
+        4
+        blockSize
 
 let decodeB =
     mk
@@ -48,7 +52,8 @@ let decodeB =
         None
         (now - TimeSpan.FromMilliseconds(3.0))
         1
-        1
+        3
+        blockSize
 
 let urgentPrefill =
     mk
@@ -57,8 +62,9 @@ let urgentPrefill =
         -10
         (Some(now + TimeSpan.FromMilliseconds(10.0)))
         (now - TimeSpan.FromMilliseconds(2.0))
-        4
-        1
+        10
+        0
+        blockSize
 
 let highPriorityPrefill =
     mk
@@ -68,7 +74,8 @@ let highPriorityPrefill =
         None
         (now - TimeSpan.FromMilliseconds(1.0))
         4
-        1
+        0
+        blockSize
 
 let mixedDecision =
     Scheduler.scheduleAt now budget policy [ highPriorityPrefill; urgentPrefill; decodeB; decodeA ]
@@ -81,8 +88,12 @@ require
     (selectedIds = [ decodeA.SequenceId; decodeB.SequenceId; urgentPrefill.SequenceId ])
     "Decode reserve should protect two decode quanta before SLO-aware mixed selection."
 
+require (mixedDecision.Selected[0].KvPageGrant = 1) "Decode at a page boundary must reserve a new KV page."
+require (mixedDecision.Selected[1].KvPageGrant = 0) "Decode inside an existing KV page must not reserve another page."
+require (mixedDecision.Selected[2].TokenGrant = 4) "Long prefill must be chunked by MaxPrefillChunkTokens."
+require (mixedDecision.Selected[2].KvPageGrant = 1) "Four prefill tokens at block size four must reserve one page."
 require (mixedDecision.ConsumedTokens = 6) "Mixed scheduling token accounting is incorrect."
-require (mixedDecision.ConsumedKvPages = 3) "Mixed scheduling KV accounting is incorrect."
+require (mixedDecision.ConsumedKvPages = 2) "Mixed scheduling KV accounting is incorrect."
 require (mixedDecision.Deferred.Length = 1) "Expected one deferred prefill after batch sequence capacity is reached."
 require
     (mixedDecision.Deferred.Head.Sequence.SequenceId = highPriorityPrefill.SequenceId
@@ -100,44 +111,85 @@ require (compiledBatch.Items[0].Kind = ScheduledWorkKind.Decode) "First reserved
 require (compiledBatch.Items[1].Kind = ScheduledWorkKind.Decode) "Second reserved decode must compile as decode work."
 require (compiledBatch.Items[2].Kind = ScheduledWorkKind.Prefill) "Urgent prefill must compile as prefill work."
 require (compiledBatch.Items[2].TokenGrant = 4) "Compiled prefill token grant must be preserved."
+require (not compiledBatch.Items[2].CompletesPrefill) "A 4-token grant from 10 remaining tokens must remain a partial prefill."
 
 let admissionPolicy =
     { DecodeTokenReserve = 0
+      MaxPrefillChunkTokens = 4
       DeadlineUrgencyWindow = TimeSpan.FromMilliseconds(50.0) }
 
 let invalidToken =
-    mk (sid "00000000-0000-0000-0000-000000000010") Prefilling 0 None now 0 0
+    mk (sid "00000000-0000-0000-0000-000000000010") Prefilling 0 None now 0 0 blockSize
 
-let invalidKv =
-    mk (sid "00000000-0000-0000-0000-000000000011") Prefilling 0 None now 1 -1
+let invalidPosition =
+    mk (sid "00000000-0000-0000-0000-000000000011") Prefilling 0 None now 1 -1 blockSize
+
+let invalidPageSize =
+    mk (sid "00000000-0000-0000-0000-000000000012") Prefilling 0 None now 1 0 0
 
 let invalidDecodeQuantum =
-    mk (sid "00000000-0000-0000-0000-000000000012") Decoding 0 None now 2 0
-
-let oversizedToken =
-    mk (sid "00000000-0000-0000-0000-000000000013") Prefilling 0 None now 9 0
-
-let oversizedKv =
-    mk (sid "00000000-0000-0000-0000-000000000014") Prefilling 0 None now 1 5
+    mk (sid "00000000-0000-0000-0000-000000000013") Decoding 0 None now 2 0 blockSize
 
 let waiting =
-    mk (sid "00000000-0000-0000-0000-000000000015") Waiting 0 None now 1 0
+    mk (sid "00000000-0000-0000-0000-000000000014") Waiting 0 None now 1 0 blockSize
 
 let admissionDecision =
     Scheduler.scheduleAt
         now
         budget
         admissionPolicy
-        [ invalidToken; invalidKv; invalidDecodeQuantum; oversizedToken; oversizedKv; waiting ]
+        [ invalidToken; invalidPosition; invalidPageSize; invalidDecodeQuantum; waiting ]
 
 require admissionDecision.Selected.IsEmpty "Invalid/non-runnable work must not be selected."
-require (admissionDecision.Rejected.Length = 5) "Expected five admission rejections."
+require (admissionDecision.Rejected.Length = 4) "Expected four admission rejections."
 require (admissionDecision.Deferred.Length = 1) "Expected one non-runnable deferral."
 require (admissionDecision.Deferred.Head.Reason = NotRunnable) "Waiting work must be deferred as non-runnable."
 
+let longPrefill =
+    mk (sid "00000000-0000-0000-0000-000000000015") Prefilling 0 None now 100 0 blockSize
+
+let longDecision =
+    Scheduler.scheduleAt now { budget with MaxBatchSequences = 1 } admissionPolicy [ longPrefill ]
+
+require (longDecision.Rejected.IsEmpty) "Long prefills must be chunked instead of rejected for exceeding batch token capacity."
+require (longDecision.Selected.Head.TokenGrant = 4) "Long prefill must receive only one configured chunk."
+
+let pressurePolicy =
+    { admissionPolicy with MaxPrefillChunkTokens = 16 }
+
+let pressureBudget =
+    { MaxBatchTokens = 16
+      AvailableKvPages = 1
+      MaxBatchSequences = 1 }
+
+let pressurePrefill =
+    mk (sid "00000000-0000-0000-0000-000000000016") Prefilling 0 None now 16 0 blockSize
+
+let pressureDecision =
+    Scheduler.scheduleAt now pressureBudget pressurePolicy [ pressurePrefill ]
+
+require (pressureDecision.Selected.Head.TokenGrant = 4) "KV pressure must shrink a large prefill chunk to one writable page."
+require (pressureDecision.Selected.Head.KvPageGrant = 1) "KV-pressure-limited chunk must account for one page."
+
+let noPageBudget =
+    { MaxBatchTokens = 4
+      AvailableKvPages = 0
+      MaxBatchSequences = 1 }
+
+let decodeInsidePage =
+    mk (sid "00000000-0000-0000-0000-000000000017") Decoding 0 None now 1 3 blockSize
+
+let decodeAtBoundary =
+    mk (sid "00000000-0000-0000-0000-000000000018") Decoding 0 None now 1 4 blockSize
+
+let insideDecision = Scheduler.scheduleAt now noPageBudget admissionPolicy [ decodeInsidePage ]
+let boundaryDecision = Scheduler.scheduleAt now noPageBudget admissionPolicy [ decodeAtBoundary ]
+require (insideDecision.Selected.Length = 1 && insideDecision.ConsumedKvPages = 0) "Existing page slack must allow decode without free pages."
+require (boundaryDecision.Selected.IsEmpty && boundaryDecision.Deferred.Head.Reason = KvBudget) "Decode at a full-page boundary must wait when no KV page is available."
+
 let oneSlotBudget =
     { MaxBatchTokens = 4
-      AvailableKvPages = 4
+      AvailableKvPages = 1
       MaxBatchSequences = 1 }
 
 let urgentLowPriority =
@@ -148,7 +200,8 @@ let urgentLowPriority =
         (Some(now + TimeSpan.FromMilliseconds(10.0)))
         now
         4
-        1
+        0
+        blockSize
 
 let nonUrgentHighPriority =
     mk
@@ -158,7 +211,8 @@ let nonUrgentHighPriority =
         None
         now
         4
-        1
+        0
+        blockSize
 
 let urgentDecision =
     Scheduler.scheduleAt now oneSlotBudget admissionPolicy [ nonUrgentHighPriority; urgentLowPriority ]
@@ -166,6 +220,9 @@ let urgentDecision =
 require
     (urgentDecision.Selected.Head.Sequence.SequenceId = urgentLowPriority.SequenceId)
     "A deadline inside the urgency window must outrank non-urgent priority."
+
+let urgentCompiled = ScheduleCompiler.compileNew urgentDecision
+require urgentCompiled.Items[0].CompletesPrefill "A grant that consumes the full prefill demand must be marked final."
 
 let distantDeadline =
     { urgentLowPriority with
@@ -188,6 +245,7 @@ let tieA =
         now
         4
         0
+        blockSize
 
 let tieB =
     { tieA with SequenceId = sid "00000000-0000-0000-0000-000000000031" }
@@ -204,9 +262,10 @@ require
     "Stable sequence-id tie breaking must make scheduling independent of input order."
 
 printfn
-    "Fission scheduler specs passed: selected=%d tokens=%d kv=%d rejected=%d compiled=%d"
+    "Fission scheduler specs passed: selected=%d tokens=%d kv=%d rejected=%d compiled=%d pressureGrant=%d"
     mixedDecision.Selected.Length
     mixedDecision.ConsumedTokens
     mixedDecision.ConsumedKvPages
     admissionDecision.Rejected.Length
     compiledBatch.Items.Count
+    pressureDecision.Selected.Head.TokenGrant
