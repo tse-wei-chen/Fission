@@ -22,3 +22,4 @@ jobs:
       - run: dotnet run --project tests/Fission.Scheduler.Specs/Fission.Scheduler.Specs.fsproj -c Release --no-build
       - run: dotnet run --project tests/Fission.Engine.Specs/Fission.Engine.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.Server.Specs/Fission.Server.Specs.csproj -c Release --no-build
+      - run: dotnet run --project tests/Fission.OnnxRuntime.Specs/Fission.OnnxRuntime.Specs.csproj -c Release --no-build
