@@ -3,6 +3,7 @@ using Fission.Abstractions.Execution;
 using Fission.Runtime.Backends;
 using Fission.Runtime.Execution;
 using Fission.Runtime.Sequences;
+using Fission.Runtime.Tracing;
 
 static void Require(bool condition, string message)
 {
@@ -22,16 +23,27 @@ static SequenceProcess GetSequence(ExecutionPlanExecutor runtime, SequenceId seq
     return sequence;
 }
 
+static ReplaySequenceState GetReplaySequence(ExecutionReplayResult replay, SequenceId sequenceId)
+{
+    if (!replay.Sequences.TryGetValue(sequenceId, out var sequence))
+    {
+        throw new InvalidOperationException($"Replay is missing sequence {sequenceId}.");
+    }
+
+    return sequence;
+}
+
 var model = new ModelId("spec-model");
 var device = new DeviceId("cpu:0");
 var parentId = SequenceId.New();
+var trace = new InMemoryExecutionTraceSink();
 
 await using var deviceExecutor = await ContinuousBatchExecutor.CreateAsync(
     new DeterministicBackend(device),
     capacity: 128,
     maxBatchSize: 16);
 
-using var runtime = new ExecutionPlanExecutor(deviceExecutor);
+using var runtime = new ExecutionPlanExecutor(deviceExecutor, trace);
 
 var initialPlan = new CompiledExecutionPlan(
     Guid.NewGuid(),
@@ -130,5 +142,27 @@ Require(parent.Position == snapshotPosition, "Restore must rewind token position
 Require(parent.Kv.PageIds.SequenceEqual(snapshotPages), "Restore must rewind KV page history to the snapshot.");
 Require(branchA.Kv.PageIds.Take(sharedPages.Length).SequenceEqual(parent.Kv.PageIds), "Forked branch must retain the original shared prefix after parent rollback.");
 
+var recordedTrace = trace.Snapshot();
+Require(recordedTrace.Count > 0, "Execution trace must contain events.");
+Require(
+    recordedTrace.Select(static item => item.Ordinal).SequenceEqual(Enumerable.Range(1, recordedTrace.Count).Select(static value => (long)value)),
+    "Execution trace ordinals must be contiguous and deterministic for this single-threaded spec.");
+
+var replay = ExecutionTraceReplay.Replay(recordedTrace);
+Require(replay.Snapshots.Contains(snapshotId), "Replay must retain snapshot creation metadata.");
+Require(replay.Sequences.Count == runtime.SequenceCount, "Replay must reconstruct every live sequence.");
+
+foreach (var sequence in new[] { parent, branchA, branchB })
+{
+    var replayed = GetReplaySequence(replay, sequence.Id);
+    Require(replayed.Position == sequence.Position, $"Replay position mismatch for {sequence.Id}.");
+    Require(replayed.KvPageCount == sequence.Kv.Count, $"Replay KV page count mismatch for {sequence.Id}.");
+    Require(replayed.Device == sequence.Device, $"Replay device mismatch for {sequence.Id}.");
+}
+
+Require(GetReplaySequence(replay, parentId).ParentSequenceId is null, "Parent sequence must have no replay parent.");
+Require(GetReplaySequence(replay, branchAId).ParentSequenceId == parentId, "Branch A replay must preserve fork ancestry.");
+Require(GetReplaySequence(replay, branchBId).ParentSequenceId == parentId, "Branch B replay must preserve fork ancestry.");
+
 Console.WriteLine(
-    $"Fission runtime specs passed: shared={sharedPages.Length}, branchA={branchA.Kv.PageIds.Count}, rollback={parent.Kv.PageIds.Count}.");
+    $"Fission runtime specs passed: shared={sharedPages.Length}, branchA={branchA.Kv.PageIds.Count}, rollback={parent.Kv.PageIds.Count}, traceEvents={recordedTrace.Count}.");

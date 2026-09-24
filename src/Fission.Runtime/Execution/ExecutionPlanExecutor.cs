@@ -3,6 +3,7 @@ using Fission.Abstractions;
 using Fission.Abstractions.Execution;
 using Fission.Runtime.Kv;
 using Fission.Runtime.Sequences;
+using Fission.Runtime.Tracing;
 
 namespace Fission.Runtime.Execution;
 
@@ -50,13 +51,17 @@ public sealed record ExecutionPlanResult(
 public sealed class ExecutionPlanExecutor : IDisposable
 {
     private readonly ContinuousBatchExecutor _device;
+    private readonly IExecutionTraceSink? _trace;
     private readonly ConcurrentDictionary<SequenceId, SequenceProcess> _sequences = new();
     private readonly ConcurrentDictionary<KvSnapshotId, KvSnapshot> _snapshots = new();
     private int _disposed;
 
-    public ExecutionPlanExecutor(ContinuousBatchExecutor device)
+    public ExecutionPlanExecutor(
+        ContinuousBatchExecutor device,
+        IExecutionTraceSink? trace = null)
     {
         _device = device;
+        _trace = trace;
     }
 
     public int SequenceCount => _sequences.Count;
@@ -76,9 +81,24 @@ public sealed class ExecutionPlanExecutor : IDisposable
         var snapshotIds = new List<KvSnapshotId>();
         var forks = new List<ForkExecutionResult>();
 
-        foreach (var step in plan.Steps)
+        Record(new ExecutionTraceEvent(
+            plan.PlanId,
+            ExecutionTraceKind.PlanStarted,
+            -1,
+            "Plan"));
+
+        for (var stepIndex = 0; stepIndex < plan.Steps.Count; stepIndex++)
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            var step = plan.Steps[stepIndex];
+            var operation = step.GetType().Name;
+            RecordSequenceState(
+                plan.PlanId,
+                ExecutionTraceKind.StepStarted,
+                stepIndex,
+                operation,
+                step.SequenceId);
 
             switch (step)
             {
@@ -103,6 +123,16 @@ public sealed class ExecutionPlanExecutor : IDisposable
                     }
 
                     snapshotIds.Add(state.Id);
+                    Record(new ExecutionTraceEvent(
+                        plan.PlanId,
+                        ExecutionTraceKind.SnapshotCreated,
+                        stepIndex,
+                        operation,
+                        sequence.Id,
+                        SnapshotId: state.Id,
+                        Position: sequence.Position,
+                        KvPageCount: sequence.Kv.Count,
+                        Device: sequence.Device));
                     break;
                 }
 
@@ -122,6 +152,16 @@ public sealed class ExecutionPlanExecutor : IDisposable
                         }
 
                         branchIds[index] = branch.Id;
+                        Record(new ExecutionTraceEvent(
+                            plan.PlanId,
+                            ExecutionTraceKind.SequenceForked,
+                            stepIndex,
+                            operation,
+                            branch.Id,
+                            RelatedSequenceId: parent.Id,
+                            Position: branch.Position,
+                            KvPageCount: branch.Kv.Count,
+                            Device: branch.Device));
                     }
 
                     forks.Add(new ForkExecutionResult(parent.Id, branchIds));
@@ -150,7 +190,20 @@ public sealed class ExecutionPlanExecutor : IDisposable
                 default:
                     throw new NotSupportedException($"Unsupported execution step: {step.GetType().Name}.");
             }
+
+            RecordSequenceState(
+                plan.PlanId,
+                ExecutionTraceKind.StepCompleted,
+                stepIndex,
+                operation,
+                step.SequenceId);
         }
+
+        Record(new ExecutionTraceEvent(
+            plan.PlanId,
+            ExecutionTraceKind.PlanCompleted,
+            plan.Steps.Count,
+            "Plan"));
 
         return new ExecutionPlanResult(plan.PlanId, backendResults, snapshotIds, forks);
     }
@@ -238,6 +291,43 @@ public sealed class ExecutionPlanExecutor : IDisposable
 
         throw new KeyNotFoundException($"Sequence {sequenceId} does not exist in this executor.");
     }
+
+    private void RecordSequenceState(
+        Guid planId,
+        ExecutionTraceKind kind,
+        int stepIndex,
+        string operation,
+        SequenceId sequenceId)
+    {
+        if (_trace is null)
+        {
+            return;
+        }
+
+        if (!_sequences.TryGetValue(sequenceId, out var sequence))
+        {
+            Record(new ExecutionTraceEvent(
+                planId,
+                kind,
+                stepIndex,
+                operation,
+                sequenceId));
+            return;
+        }
+
+        Record(new ExecutionTraceEvent(
+            planId,
+            kind,
+            stepIndex,
+            operation,
+            sequence.Id,
+            Position: sequence.Position,
+            KvPageCount: sequence.Kv.Count,
+            Device: sequence.Device));
+    }
+
+    private void Record(ExecutionTraceEvent traceEvent) =>
+        _trace?.Record(traceEvent);
 
     public void Dispose()
     {
