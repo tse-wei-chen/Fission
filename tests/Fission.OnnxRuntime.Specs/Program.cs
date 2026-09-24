@@ -3,6 +3,7 @@ using Fission.Abstractions.Execution;
 using Fission.Backends.OnnxRuntime;
 using Fission.Runtime.Execution;
 using Microsoft.ML.OnnxRuntime;
+using Microsoft.ML.OnnxRuntime.Tensors;
 
 static void Require(bool condition, string message)
 {
