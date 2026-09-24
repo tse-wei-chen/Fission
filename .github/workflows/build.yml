@@ -25,4 +25,5 @@ jobs:
       - run: dotnet run --project tests/Fission.OnnxRuntime.Specs/Fission.OnnxRuntime.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.OnnxRuntime.State.Specs/Fission.OnnxRuntime.State.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.OnnxRuntime.Decoder.Specs/Fission.OnnxRuntime.Decoder.Specs.csproj -c Release --no-build
+      - run: dotnet run --project tests/Fission.OnnxRuntime.Geometry.Specs/Fission.OnnxRuntime.Geometry.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.BackendTransactions.Specs/Fission.BackendTransactions.Specs.csproj -c Release --no-build
