@@ -39,7 +39,7 @@ var model = new ModelId("spec-model");
 var device = new DeviceId("cpu:0");
 var parentId = SequenceId.New();
 var trace = new InMemoryExecutionTraceSink();
-var kvPool = new KvPagePool(capacity: 4);
+var kvPool = new KvPagePool(capacity: 7, tokensPerPage: 4);
 
 await using var deviceExecutor = await ContinuousBatchExecutor.CreateAsync(
     new DeterministicBackend(device),
@@ -48,14 +48,15 @@ await using var deviceExecutor = await ContinuousBatchExecutor.CreateAsync(
 
 using var runtime = new ExecutionPlanExecutor(deviceExecutor, trace, kvPool);
 Require(runtime.KvPages == kvPool, "Runtime must expose its configured KV page pool.");
-Require(kvPool.AllocatedPages == 0 && kvPool.AvailablePages == 4, "KV pool must start empty.");
+Require(runtime.KvCapacity.TokensPerPage == 4, "Runtime KV feedback must expose the page block size.");
+Require(runtime.KvCapacity.AvailablePages == 7, "Runtime KV feedback must expose live available capacity.");
 
 var initialPlan = new CompiledExecutionPlan(
     Guid.NewGuid(),
     100,
     new ExecutionStep[]
     {
-        new PrefillExecutionStep(parentId, model, 4),
+        new PrefillExecutionStep(parentId, model, 4, CompletesPrefill: true),
         new ForkKvExecutionStep(parentId, 2)
     });
 
@@ -77,7 +78,7 @@ var branchA = GetSequence(runtime, branchAId);
 var branchB = GetSequence(runtime, branchBId);
 
 var sharedPages = parent.Kv.PageIds.ToArray();
-Require(sharedPages.Length == 1, "Prefill should create one logical KV page in the metadata backend.");
+Require(sharedPages.Length == 1, "Four prefill tokens at block size four must create one KV page.");
 Require(branchA.Kv.PageIds.SequenceEqual(sharedPages), "Branch A must share the parent's KV history after fork.");
 Require(branchB.Kv.PageIds.SequenceEqual(sharedPages), "Branch B must share the parent's KV history after fork.");
 Require(branchA.Position == parent.Position && branchB.Position == parent.Position, "Forked branches must inherit token position.");
@@ -95,7 +96,7 @@ await runtime.ExecuteAsync(
     new ExecutionBindings(new Dictionary<SequenceId, ReadOnlyMemory<int>>()));
 
 var branchAPages = branchA.Kv.PageIds.ToArray();
-Require(branchAPages.Length == sharedPages.Length + 1, "Decoded branch must append its own KV page.");
+Require(branchAPages.Length == sharedPages.Length + 1, "Decode at a page boundary must allocate a new KV page.");
 Require(branchAPages.Take(sharedPages.Length).SequenceEqual(sharedPages), "Decoded branch must preserve shared KV prefix.");
 Require(branchB.Kv.PageIds.SequenceEqual(sharedPages), "Sibling branch must remain unchanged when another branch decodes.");
 Require(parent.Kv.PageIds.SequenceEqual(sharedPages), "Parent must remain unchanged when a child branch decodes.");
@@ -132,8 +133,8 @@ await runtime.ExecuteAsync(
     new ExecutionBindings(new Dictionary<SequenceId, ReadOnlyMemory<int>>()));
 
 Require(parent.Position == snapshotPosition + 2, "Parent decode should advance token position.");
-Require(parent.Kv.PageIds.Count == snapshotPages.Length + 2, "Parent decode should append logical KV pages.");
-Require(kvPool.AllocatedPages == 4 && kvPool.AvailablePages == 0, "Parent mutations must consume the remaining two KV pages.");
+Require(parent.Kv.PageIds.Count == snapshotPages.Length + 1, "Two decodes inside one token block must materialize only one new page.");
+Require(kvPool.AllocatedPages == 3, "Parent mutations must consume one block-sized KV page.");
 
 var rollbackPlan = new CompiledExecutionPlan(
     Guid.NewGuid(),
@@ -150,7 +151,7 @@ await runtime.ExecuteAsync(
 Require(parent.Position == snapshotPosition, "Restore must rewind token position to the snapshot.");
 Require(parent.Kv.PageIds.SequenceEqual(snapshotPages), "Restore must rewind KV page history to the snapshot.");
 Require(branchA.Kv.PageIds.Take(sharedPages.Length).SequenceEqual(parent.Kv.PageIds), "Forked branch must retain the original shared prefix after parent rollback.");
-Require(kvPool.AllocatedPages == 2 && kvPool.AvailablePages == 2, "Rollback must return discarded mutation pages to the pool.");
+Require(kvPool.AllocatedPages == 2, "Rollback must return the discarded mutation block to the pool.");
 
 var recordedTrace = trace.Snapshot();
 Require(recordedTrace.Count > 0, "Execution trace must contain events.");
@@ -181,8 +182,8 @@ var validSchedule = new ScheduledBatch(
     Guid.NewGuid(),
     new ScheduledWorkItem[]
     {
-        new(scheduledPrefillId, ScheduledWorkKind.Prefill, 3, 1, 25),
-        new(branchBId, ScheduledWorkKind.Decode, 1, 1, 10)
+        new(scheduledPrefillId, ScheduledWorkKind.Prefill, 3, 1, 25, CompletesPrefill: true),
+        new(branchBId, ScheduledWorkKind.Decode, 1, 1, 10, CompletesPrefill: false)
     },
     ConsumedTokens: 4,
     ConsumedKvPages: 2);
@@ -198,12 +199,54 @@ var scheduledBindings = new ScheduledExecutionBindings(
 var scheduledResult = await scheduledExecutor.ExecuteAsync(validSchedule, scheduledBindings);
 Require(scheduledResult.ScheduleId == validSchedule.ScheduleId, "Scheduled execution must preserve schedule id.");
 Require(scheduledResult.ItemResults.Count == 2, "Scheduled execution must return one result per work item.");
-Require(kvPool.AllocatedPages == 4 && kvPool.AvailablePages == 0, "Scheduled prefill/decode must consume their physical KV page grants.");
+Require(kvPool.AllocatedPages == 4, "Scheduled prefill plus boundary decode must consume two physical KV pages.");
 
 var scheduledPrefill = GetSequence(runtime, scheduledPrefillId);
 Require(scheduledPrefill.Position == 3, "Scheduled prefill must advance the new sequence by its token grant.");
-Require(scheduledPrefill.Status == SequenceStatus.Decoding, "Scheduled prefill must leave the sequence ready to decode.");
+Require(scheduledPrefill.Status == SequenceStatus.Decoding, "Final scheduled prefill must leave the sequence ready to decode.");
 Require(branchB.Position == branchBPositionBeforeScheduledDecode + 1, "Scheduled decode must advance the existing sequence by one token.");
+
+var chunkedId = SequenceId.New();
+var fullPrompt = new ReadOnlyMemory<int>(new[] { 30, 31, 32, 33, 34, 35, 36, 37, 38, 39 });
+var chunkBindings = new ScheduledExecutionBindings(
+    new Dictionary<SequenceId, ScheduledPrefillBinding>
+    {
+        [chunkedId] = new(model, fullPrompt)
+    });
+
+async Task RunChunkAsync(int tokenGrant, int kvGrant, bool completesPrefill)
+{
+    var batch = new ScheduledBatch(
+        Guid.NewGuid(),
+        new[]
+        {
+            new ScheduledWorkItem(
+                chunkedId,
+                ScheduledWorkKind.Prefill,
+                tokenGrant,
+                kvGrant,
+                Priority: 5,
+                CompletesPrefill: completesPrefill)
+        },
+        ConsumedTokens: tokenGrant,
+        ConsumedKvPages: kvGrant);
+
+    await scheduledExecutor.ExecuteAsync(batch, chunkBindings);
+}
+
+await RunChunkAsync(4, 1, completesPrefill: false);
+var chunked = GetSequence(runtime, chunkedId);
+Require(chunked.Position == 4 && chunked.Status == SequenceStatus.Prefilling, "First partial chunk must keep the sequence in prefill state.");
+Require(kvPool.AllocatedPages == 5, "First four-token chunk must allocate one page.");
+
+await RunChunkAsync(4, 1, completesPrefill: false);
+Require(chunked.Position == 8 && chunked.Status == SequenceStatus.Prefilling, "Second partial chunk must keep the sequence in prefill state.");
+Require(kvPool.AllocatedPages == 6, "Second four-token chunk must allocate one additional page.");
+
+await RunChunkAsync(2, 1, completesPrefill: true);
+Require(chunked.Position == 10 && chunked.Status == SequenceStatus.Decoding, "Final chunk must transition the sequence to decode state.");
+Require(chunked.Kv.PageIds.Count == 3, "Ten tokens at block size four must occupy three KV pages.");
+Require(kvPool.AllocatedPages == 7 && kvPool.AvailablePages == 0, "Chunked prefill must consume the final three KV blocks exactly.");
 
 var sequenceCountBeforeInvalidSchedule = runtime.SequenceCount;
 var invalidPrefillId = SequenceId.New();
@@ -211,8 +254,8 @@ var invalidSchedule = new ScheduledBatch(
     Guid.NewGuid(),
     new ScheduledWorkItem[]
     {
-        new(invalidPrefillId, ScheduledWorkKind.Prefill, 2, 1, 0),
-        new(SequenceId.New(), ScheduledWorkKind.Prefill, 2, 1, 0)
+        new(invalidPrefillId, ScheduledWorkKind.Prefill, 2, 1, 0, CompletesPrefill: true),
+        new(SequenceId.New(), ScheduledWorkKind.Prefill, 2, 1, 0, CompletesPrefill: true)
     },
     ConsumedTokens: 5,
     ConsumedKvPages: 2);
@@ -220,8 +263,8 @@ var invalidSchedule = new ScheduledBatch(
 var invalidBindings = new ScheduledExecutionBindings(
     new Dictionary<SequenceId, ScheduledPrefillBinding>
     {
-        [invalidPrefillId] = new(model, new ReadOnlyMemory<int>(new[] { 30, 31 })),
-        [invalidSchedule.Items[1].SequenceId] = new(model, new ReadOnlyMemory<int>(new[] { 40, 41 }))
+        [invalidPrefillId] = new(model, new ReadOnlyMemory<int>(new[] { 40, 41 })),
+        [invalidSchedule.Items[1].SequenceId] = new(model, new ReadOnlyMemory<int>(new[] { 50, 51 }))
     });
 
 var invalidRejected = false;
@@ -237,7 +280,16 @@ catch (InvalidOperationException)
 Require(invalidRejected, "Invalid scheduled resource accounting must be rejected.");
 Require(runtime.SequenceCount == sequenceCountBeforeInvalidSchedule, "Invalid schedule validation must complete before runtime side effects begin.");
 Require(!runtime.TryGetSequence(invalidPrefillId, out _), "Invalid scheduled prefill must not create a sequence.");
-Require(kvPool.AllocatedPages == 4, "Rejected scheduled work must not leak or consume KV pages.");
+Require(kvPool.AllocatedPages == 7, "Rejected scheduled work must not leak or consume KV pages.");
+
+await runtime.ExecuteAsync(
+    new CompiledExecutionPlan(
+        Guid.NewGuid(),
+        0,
+        new ExecutionStep[] { new DecodeExecutionStep(branchAId, 3) }),
+    new ExecutionBindings(new Dictionary<SequenceId, ReadOnlyMemory<int>>()));
+Require(branchA.Position == 8, "Existing KV page slack must permit decoding while the global page pool is full.");
+Require(kvPool.AllocatedPages == 7, "Decode within an already materialized page must not consume capacity.");
 
 var exhaustedPosition = branchA.Position;
 var capacityRejected = false;
@@ -255,13 +307,13 @@ catch (KvPageCapacityExceededException)
     capacityRejected = true;
 }
 
-Require(capacityRejected, "Runtime must reject KV allocation when page capacity is exhausted.");
-Require(branchA.Position == exhaustedPosition, "Capacity rejection must not advance sequence state.");
-Require(kvPool.AllocatedPages == 4, "Capacity rejection must not leak page accounting.");
+Require(capacityRejected, "Runtime must reject a boundary decode when KV page capacity is exhausted.");
+Require(branchA.Position == exhaustedPosition, "Capacity rejection must not advance sequence metadata.");
+Require(kvPool.AllocatedPages == 7, "Capacity rejection must not leak page accounting.");
 
 var finalBranchAPageCount = branchA.Kv.PageIds.Count;
 runtime.Dispose();
 Require(kvPool.AllocatedPages == 0 && kvPool.AvailablePages == kvPool.Capacity, "Runtime disposal must release every physical KV page lease.");
 
 Console.WriteLine(
-    $"Fission runtime specs passed: shared={sharedPages.Length}, branchA={finalBranchAPageCount}, rollback={snapshotPages.Length}, traceEvents={recordedTrace.Count}, scheduledItems={scheduledResult.ItemResults.Count}, kvCapacity={kvPool.Capacity}.");
+    $"Fission runtime specs passed: block={kvPool.TokensPerPage}, shared={sharedPages.Length}, branchA={finalBranchAPageCount}, chunks=3, traceEvents={recordedTrace.Count}, kvCapacity={kvPool.Capacity}.");
