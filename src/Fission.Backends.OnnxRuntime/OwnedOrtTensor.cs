@@ -4,18 +4,21 @@ namespace Fission.Backends.OnnxRuntime;
 
 /// <summary>
 /// Caller-owned tensor buffer plus the OrtValue view pinned over that buffer.
-/// The buffer can be reused across inference calls while the tensor is alive.
-/// Disposing this object releases the OrtValue and its pin; ONNX Runtime does not
-/// take ownership when the value is supplied through the preallocated-output Run
-/// overload.
+/// The buffer can be reused across inference calls while ownership is active.
+/// Ownership may be explicitly transferred with DetachValue; after transfer this
+/// wrapper no longer disposes or exposes the OrtValue/buffer.
 /// </summary>
 public sealed class OwnedOrtTensor<T> : IDisposable
     where T : unmanaged
 {
+    private const int Active = 0;
+    private const int Disposed = 1;
+    private const int Transferred = 2;
+
     private readonly T[] _buffer;
     private readonly long[] _shape;
     private OrtValue? _value;
-    private int _disposed;
+    private int _state;
 
     public OwnedOrtTensor(long[] shape)
         : this(new T[ComputeElementCount(shape)], shape)
@@ -42,14 +45,16 @@ public sealed class OwnedOrtTensor<T> : IDisposable
 
     public int ElementCount => _buffer.Length;
     public IReadOnlyList<long> Shape => _shape;
-    public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+    public bool IsDisposed => Volatile.Read(ref _state) == Disposed;
+    public bool IsTransferred => Volatile.Read(ref _state) == Transferred;
+    public bool OwnsValue => Volatile.Read(ref _state) == Active;
 
     public OrtValue Value
     {
         get
         {
-            ObjectDisposedException.ThrowIf(IsDisposed, this);
-            return _value ?? throw new ObjectDisposedException(nameof(OwnedOrtTensor<T>));
+            ThrowIfNotActive();
+            return _value ?? throw new InvalidOperationException("Owned OrtValue is missing.");
         }
     }
 
@@ -57,7 +62,7 @@ public sealed class OwnedOrtTensor<T> : IDisposable
     {
         get
         {
-            ObjectDisposedException.ThrowIf(IsDisposed, this);
+            ThrowIfNotActive();
             return _buffer.AsSpan();
         }
     }
@@ -66,19 +71,51 @@ public sealed class OwnedOrtTensor<T> : IDisposable
     {
         get
         {
-            ObjectDisposedException.ThrowIf(IsDisposed, this);
+            ThrowIfNotActive();
             return _buffer.AsSpan();
         }
     }
 
+    /// <summary>
+    /// Transfers the OrtValue to another owner without disposing it. This wrapper
+    /// becomes permanently transferred and cannot be used for tensor/buffer access.
+    /// Dispose becomes a no-op after transfer.
+    /// </summary>
+    public OrtValue DetachValue()
+    {
+        if (Interlocked.CompareExchange(ref _state, Transferred, Active) != Active)
+        {
+            ThrowIfNotActive();
+        }
+
+        return Interlocked.Exchange(ref _value, null)
+            ?? throw new InvalidOperationException("Owned OrtValue is missing during transfer.");
+    }
+
     public void Dispose()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        var previous = Interlocked.CompareExchange(ref _state, Disposed, Active);
+        if (previous != Active)
         {
             return;
         }
 
         Interlocked.Exchange(ref _value, null)?.Dispose();
+    }
+
+    private void ThrowIfNotActive()
+    {
+        var state = Volatile.Read(ref _state);
+        if (state == Disposed)
+        {
+            throw new ObjectDisposedException(nameof(OwnedOrtTensor<T>));
+        }
+
+        if (state == Transferred)
+        {
+            throw new InvalidOperationException(
+                "OwnedOrtTensor has transferred its OrtValue to another owner.");
+        }
     }
 
     private static int ComputeElementCount(long[] shape)
