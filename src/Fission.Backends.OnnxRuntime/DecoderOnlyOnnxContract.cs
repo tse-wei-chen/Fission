@@ -23,7 +23,12 @@ public sealed record DecoderOnlyOnnxContract(
     int? LogitsRank = 3,
     TensorElementType InputIdsElementType = TensorElementType.Int64,
     IReadOnlyList<OnnxTensorContract>? AdditionalInputs = null,
-    IReadOnlyList<OnnxTensorContract>? AdditionalOutputs = null)
+    IReadOnlyList<OnnxTensorContract>? AdditionalOutputs = null,
+    TensorElementType? AttentionMaskElementType = null,
+    TensorElementType? PositionIdsElementType = TensorElementType.Int64,
+    int? KvRank = null,
+    TensorElementType? KvElementType = null,
+    TensorElementType? LogitsElementType = null)
 {
     public bool UsesPastKeyValues =>
         PastKeyNames is not null ||
@@ -42,6 +47,11 @@ public sealed record DecoderOnlyOnnxContract(
             throw new ArgumentOutOfRangeException(nameof(LogitsRank));
         }
 
+        if (KvRank is <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(KvRank));
+        }
+
         ValidateCachePatterns();
 
         var inputs = new List<OnnxTensorContract>
@@ -51,7 +61,11 @@ public sealed record DecoderOnlyOnnxContract(
 
         if (!string.IsNullOrWhiteSpace(AttentionMask))
         {
-            inputs.Add(new OnnxTensorContract("attention_mask", AttentionMask!, Rank: 2));
+            inputs.Add(new OnnxTensorContract(
+                "attention_mask",
+                AttentionMask!,
+                Rank: 2,
+                ElementType: AttentionMaskElementType));
         }
 
         if (!string.IsNullOrWhiteSpace(PositionIds))
@@ -60,12 +74,12 @@ public sealed record DecoderOnlyOnnxContract(
                 "position_ids",
                 PositionIds!,
                 Rank: 2,
-                ElementType: TensorElementType.Int64));
+                ElementType: PositionIdsElementType));
         }
 
         var outputs = new List<OnnxTensorContract>
         {
-            new("logits", Logits, LogitsRank)
+            new("logits", Logits, LogitsRank, LogitsElementType)
         };
 
         if (UsesPastKeyValues)
@@ -74,16 +88,24 @@ public sealed record DecoderOnlyOnnxContract(
             {
                 inputs.Add(new OnnxTensorContract(
                     $"past_key[{layer}]",
-                    ExpandLayerName(PastKeyNames!, layer)));
+                    ExpandLayerName(PastKeyNames!, layer),
+                    KvRank,
+                    KvElementType));
                 inputs.Add(new OnnxTensorContract(
                     $"past_value[{layer}]",
-                    ExpandLayerName(PastValueNames!, layer)));
+                    ExpandLayerName(PastValueNames!, layer),
+                    KvRank,
+                    KvElementType));
                 outputs.Add(new OnnxTensorContract(
                     $"present_key[{layer}]",
-                    ExpandLayerName(PresentKeyNames!, layer)));
+                    ExpandLayerName(PresentKeyNames!, layer),
+                    KvRank,
+                    KvElementType));
                 outputs.Add(new OnnxTensorContract(
                     $"present_value[{layer}]",
-                    ExpandLayerName(PresentValueNames!, layer)));
+                    ExpandLayerName(PresentValueNames!, layer),
+                    KvRank,
+                    KvElementType));
             }
         }
 
