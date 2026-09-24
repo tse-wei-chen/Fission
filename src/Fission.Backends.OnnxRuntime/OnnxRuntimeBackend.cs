@@ -17,8 +17,8 @@ public sealed record OnnxRuntimeBackendOptions(
 /// ONNX Runtime session host. Model-specific tensor names, shapes, KV schemas,
 /// sampling, batching, and state transactions live in
 /// IOnnxRuntimeExecutionAdapter rather than in the generic runtime backend.
-/// An optional session contract validates the live graph signature before the
-/// adapter initializes any model-owned state.
+/// A configured session contract, or a contract supplied by the adapter, validates
+/// the live graph signature before the adapter initializes model-owned state.
 /// </summary>
 public sealed class OnnxRuntimeBackend : IInferenceBackend
 {
@@ -88,7 +88,10 @@ public sealed class OnnxRuntimeBackend : IInferenceBackend
         var session = _options.Model.CreateSession(sessionOptions);
         try
         {
-            _options.SessionContract?.Validate(session);
+            var sessionContract = _options.SessionContract ??
+                (_adapter as IOnnxRuntimeSessionContractProvider)?.SessionContract;
+            sessionContract?.Validate(session);
+
             await _adapter.InitializeAsync(session, cancellationToken)
                 .ConfigureAwait(false);
             _session = session;
