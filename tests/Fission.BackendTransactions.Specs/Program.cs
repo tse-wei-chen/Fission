@@ -136,6 +136,38 @@ Require(backend.SequenceStates[branchAId] == 5, "Decoded branch must advance ind
 Require(backend.SequenceStates[branchBId] == 4, "Sibling branch backend state must remain shared/logically unchanged.");
 Require(GetSequence(runtime, branchAId).Position == 5 && GetSequence(runtime, branchBId).Position == 4, "Metadata branches must mirror backend divergence.");
 
+// Same-sequence plans must not overlap. Otherwise metadata can be sampled before
+// one operation while its backend barrier executes after another queued decode.
+backend.BlockNextDecode();
+var blockedDecode = runtime.ExecuteAsync(
+    new CompiledExecutionPlan(
+        Guid.NewGuid(),
+        0,
+        new ExecutionStep[] { new DecodeExecutionStep(branchBId, 1) }),
+    emptyBindings).AsTask();
+await backend.WaitForBlockedDecodeAsync();
+
+var reservationRejected = false;
+try
+{
+    await runtime.ExecuteAsync(
+        new CompiledExecutionPlan(
+            Guid.NewGuid(),
+            0,
+            new ExecutionStep[] { new SnapshotKvExecutionStep(branchBId) }),
+        emptyBindings);
+}
+catch (InvalidOperationException exception)
+    when (exception.Message.Contains("already reserved", StringComparison.Ordinal))
+{
+    reservationRejected = true;
+}
+
+Require(reservationRejected, "A second plan targeting an in-flight sequence must be rejected before it can queue backend work.");
+backend.ReleaseBlockedDecode();
+await blockedDecode;
+Require(GetSequence(runtime, branchBId).Position == 5 && backend.SequenceStates[branchBId] == 5, "The reserved sequence must converge after the original plan finishes.");
+
 Require(await runtime.ReleaseSnapshotAsync(snapshotId), "Explicit snapshot release must succeed.");
 Require(runtime.SnapshotCount == 0 && backend.SnapshotStates.Count == 0, "Snapshot release must converge backend and metadata ownership.");
 
@@ -157,6 +189,9 @@ Console.WriteLine(
 sealed class TransactionalBackend : IInferenceBackend
 {
     private bool _initialized;
+    private int _blockNextDecode;
+    private TaskCompletionSource<bool>? _decodeEntered;
+    private TaskCompletionSource<bool>? _decodeRelease;
 
     public TransactionalBackend(DeviceId device)
     {
@@ -197,11 +232,20 @@ sealed class TransactionalBackend : IInferenceBackend
         return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(results);
     }
 
-    public ValueTask<IReadOnlyList<BackendStepResult>> DecodeAsync(
+    public async ValueTask<IReadOnlyList<BackendStepResult>> DecodeAsync(
         DecodeBatch batch,
         CancellationToken cancellationToken = default)
     {
         EnsureInitialized();
+
+        if (Interlocked.Exchange(ref _blockNextDecode, 0) != 0)
+        {
+            var entered = _decodeEntered ?? throw new InvalidOperationException("Decode block entry signal is missing.");
+            var release = _decodeRelease ?? throw new InvalidOperationException("Decode block release signal is missing.");
+            entered.TrySetResult(true);
+            await release.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         var results = new BackendStepResult[batch.Items.Count];
         for (var index = 0; index < batch.Items.Count; index++)
         {
@@ -218,7 +262,27 @@ sealed class TransactionalBackend : IInferenceBackend
             results[index] = new BackendStepResult(item.SequenceId, state);
         }
 
-        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(results);
+        return results;
+    }
+
+    public void BlockNextDecode()
+    {
+        if (Interlocked.Exchange(ref _blockNextDecode, 1) != 0)
+        {
+            throw new InvalidOperationException("A decode is already configured to block.");
+        }
+
+        _decodeEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _decodeRelease = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    public Task WaitForBlockedDecodeAsync() =>
+        (_decodeEntered ?? throw new InvalidOperationException("No blocked decode has been configured.")).Task;
+
+    public void ReleaseBlockedDecode()
+    {
+        var release = _decodeRelease ?? throw new InvalidOperationException("No blocked decode has been configured.");
+        release.TrySetResult(true);
     }
 
     public ValueTask SnapshotSequenceAsync(
@@ -311,6 +375,8 @@ sealed class TransactionalBackend : IInferenceBackend
         SequenceStates.Clear();
         SnapshotStates.Clear();
         _initialized = false;
+        _decodeEntered?.TrySetCanceled();
+        _decodeRelease?.TrySetCanceled();
         return ValueTask.CompletedTask;
     }
 
