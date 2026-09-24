@@ -10,12 +10,15 @@ public sealed record OnnxRuntimeBackendOptions(
     OnnxRuntimeModelSource Model,
     int? IntraOpNumThreads = null,
     int? InterOpNumThreads = null,
-    GraphOptimizationLevel GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL);
+    GraphOptimizationLevel GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
+    OnnxSessionContract? SessionContract = null);
 
 /// <summary>
 /// ONNX Runtime session host. Model-specific tensor names, shapes, KV schemas,
 /// sampling, batching, and state transactions live in
 /// IOnnxRuntimeExecutionAdapter rather than in the generic runtime backend.
+/// An optional session contract validates the live graph signature before the
+/// adapter initializes any model-owned state.
 /// </summary>
 public sealed class OnnxRuntimeBackend : IInferenceBackend
 {
@@ -85,6 +88,7 @@ public sealed class OnnxRuntimeBackend : IInferenceBackend
         var session = _options.Model.CreateSession(sessionOptions);
         try
         {
+            _options.SessionContract?.Validate(session);
             await _adapter.InitializeAsync(session, cancellationToken)
                 .ConfigureAwait(false);
             _session = session;
