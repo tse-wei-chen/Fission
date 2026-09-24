@@ -21,7 +21,9 @@ public sealed class ScheduledExecutionBindings
 
     public ScheduledPrefillBinding ResolvePrefill(
         SequenceId sequenceId,
-        int expectedTokenCount)
+        int position,
+        int expectedTokenCount,
+        bool completesPrefill)
     {
         if (!_prefills.TryGetValue(sequenceId, out var binding))
         {
@@ -29,14 +31,29 @@ public sealed class ScheduledExecutionBindings
                 $"No scheduled prefill binding exists for sequence {sequenceId}.");
         }
 
-        if (binding.Tokens.Length != expectedTokenCount)
+        var end = checked(position + expectedTokenCount);
+        if (end > binding.Tokens.Length)
         {
             throw new InvalidOperationException(
-                $"Schedule grants {expectedTokenCount} prefill tokens for {sequenceId}, " +
-                $"but binding contains {binding.Tokens.Length}.");
+                $"Schedule grants tokens [{position}..{end}) for {sequenceId}, " +
+                $"but the prompt contains only {binding.Tokens.Length} tokens.");
         }
 
-        return binding;
+        if (completesPrefill && end != binding.Tokens.Length)
+        {
+            throw new InvalidOperationException(
+                $"Schedule marks the prefill chunk for {sequenceId} complete at position {end}, " +
+                $"but the prompt length is {binding.Tokens.Length}.");
+        }
+
+        if (!completesPrefill && end >= binding.Tokens.Length)
+        {
+            throw new InvalidOperationException(
+                $"Schedule marks the prefill chunk for {sequenceId} partial, " +
+                "but the chunk consumes the remaining prompt.");
+        }
+
+        return binding with { Tokens = binding.Tokens.Slice(position, expectedTokenCount) };
     }
 }
 
@@ -88,7 +105,7 @@ public sealed class ScheduledBatchExecutor
         return new ScheduledBatchResult(batch.ScheduleId, results);
     }
 
-    private static PreparedItem[] Prepare(
+    private PreparedItem[] Prepare(
         ScheduledBatch batch,
         ScheduledExecutionBindings bindings)
     {
@@ -109,6 +126,17 @@ public sealed class ScheduledBatchExecutor
                     $"Scheduled batch {batch.ScheduleId} contains sequence {item.SequenceId} more than once.");
             }
 
+            var hasExistingSequence = _runtime.TryGetSequence(item.SequenceId, out var existingSequence);
+            var position = existingSequence?.Position ?? 0;
+            var expectedKvPages = _runtime.KvPages.IncrementalPagesFor(position, item.TokenGrant);
+            if (expectedKvPages != item.KvPageGrant)
+            {
+                throw new InvalidOperationException(
+                    $"Schedule grants {item.KvPageGrant} KV page(s) for {item.SequenceId}, " +
+                    $"but runtime position {position} requires {expectedKvPages} page(s) " +
+                    $"at {_runtime.KvPages.TokensPerPage} tokens/page.");
+            }
+
             consumedTokens = checked(consumedTokens + item.TokenGrant);
             consumedKvPages = checked(consumedKvPages + item.KvPageGrant);
 
@@ -119,11 +147,16 @@ public sealed class ScheduledBatchExecutor
             {
                 case ScheduledWorkKind.Prefill:
                 {
-                    var binding = bindings.ResolvePrefill(item.SequenceId, item.TokenGrant);
+                    var binding = bindings.ResolvePrefill(
+                        item.SequenceId,
+                        position,
+                        item.TokenGrant,
+                        item.CompletesPrefill);
                     step = new PrefillExecutionStep(
                         item.SequenceId,
                         binding.ModelId,
-                        item.TokenGrant);
+                        item.TokenGrant,
+                        item.CompletesPrefill);
                     executionBindings = new ExecutionBindings(
                         new Dictionary<SequenceId, ReadOnlyMemory<int>>
                         {
@@ -133,6 +166,12 @@ public sealed class ScheduledBatchExecutor
                 }
 
                 case ScheduledWorkKind.Decode:
+                    if (!hasExistingSequence)
+                    {
+                        throw new KeyNotFoundException(
+                            $"Scheduled decode sequence {item.SequenceId} does not exist in the runtime.");
+                    }
+
                     if (item.TokenGrant != 1)
                     {
                         throw new InvalidOperationException(
@@ -168,6 +207,13 @@ public sealed class ScheduledBatchExecutor
             throw new InvalidOperationException(
                 $"Scheduled batch {batch.ScheduleId} reports {batch.ConsumedKvPages} consumed KV pages, " +
                 $"but its work items sum to {consumedKvPages}.");
+        }
+
+        if (consumedKvPages > _runtime.KvPages.AvailablePages)
+        {
+            throw new InvalidOperationException(
+                $"Scheduled batch {batch.ScheduleId} needs {consumedKvPages} KV page(s), " +
+                $"but runtime has only {_runtime.KvPages.AvailablePages} available.");
         }
 
         return prepared;
