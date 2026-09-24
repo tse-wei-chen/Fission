@@ -62,24 +62,27 @@ module Scheduler =
                     if byArrival <> 0 then byArrival
                     else compare left.SequenceId.Value right.SequenceId.Value
 
-    let private pagesForTokens tokensPerPage tokenCount =
-        if tokenCount <= 0 then
+    let private pagesForTokens tokensPerPage (tokenCount: int64) =
+        if tokenCount <= 0L then
             0L
         else
-            ((int64 tokenCount - 1L) / int64 tokensPerPage) + 1L
+            ((tokenCount - 1L) / int64 tokensPerPage) + 1L
 
     let private kvPagesForGrant (sequence: ReadySequence) tokenGrant =
-        let before = pagesForTokens sequence.TokensPerKvPage sequence.Position
-        let afterPosition = checked (sequence.Position + tokenGrant)
+        let before = pagesForTokens sequence.TokensPerKvPage (int64 sequence.Position)
+        let afterPosition = int64 sequence.Position + int64 tokenGrant
         let after = pagesForTokens sequence.TokensPerKvPage afterPosition
-        checked (int (after - before))
+        let pageDelta = after - before
+        if pageDelta > int64 Int32.MaxValue then
+            invalidOp "KV page grant exceeds Int32 capacity."
+        int pageDelta
 
     let private tokensWritableWithKvPages (sequence: ReadySequence) availablePages =
-        let currentPages = pagesForTokens sequence.TokensPerKvPage sequence.Position
+        let currentPages = pagesForTokens sequence.TokensPerKvPage (int64 sequence.Position)
         let capacityPages = currentPages + int64 availablePages
         let capacityTokens = capacityPages * int64 sequence.TokensPerKvPage
         let writable = max 0L (capacityTokens - int64 sequence.Position)
-        min Int32.MaxValue (int writable)
+        if writable > int64 Int32.MaxValue then Int32.MaxValue else int writable
 
     let private classifyAdmission (sequence: ReadySequence) =
         if not (isRunnable sequence) then
