@@ -4,4 +4,5 @@
   <Project Path="src/Fission.Runtime/Fission.Runtime.csproj" />
   <Project Path="src/Fission.Scheduler/Fission.Scheduler.fsproj" />
   <Project Path="samples/Fission.Demo/Fission.Demo.csproj" />
+  <Project Path="samples/Fission.PlanDemo/Fission.PlanDemo.fsproj" />
 </Solution>
