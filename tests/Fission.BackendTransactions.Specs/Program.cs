@@ -79,7 +79,7 @@ await runtime.ExecuteAsync(
         0,
         new ExecutionStep[]
         {
-            new PrefillExecutionStep(parentId, model, 4)
+            new PrefillExecutionStep(parentId, model, 4, CompletesPrefill: true)
         }),
     new ExecutionBindings(
         new Dictionary<SequenceId, ReadOnlyMemory<int>>
