@@ -13,5 +13,6 @@
   <Project Path="tests/Fission.Engine.Specs/Fission.Engine.Specs.csproj" />
   <Project Path="tests/Fission.Server.Specs/Fission.Server.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.Specs/Fission.OnnxRuntime.Specs.csproj" />
+  <Project Path="tests/Fission.OnnxRuntime.State.Specs/Fission.OnnxRuntime.State.Specs.csproj" />
   <Project Path="tests/Fission.BackendTransactions.Specs/Fission.BackendTransactions.Specs.csproj" />
 </Solution>
