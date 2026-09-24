@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="../../src/Fission.Abstractions/Fission.Abstractions.csproj" />
+    <ProjectReference Include="../../src/Fission.Engine/Fission.Engine.csproj" />
+    <ProjectReference Include="../../src/Fission.Runtime/Fission.Runtime.csproj" />
+    <ProjectReference Include="../../src/Fission.Scheduler/Fission.Scheduler.fsproj" />
+    <ProjectReference Include="../../src/Fission.Server/Fission.Server.csproj" />
+  </ItemGroup>
+</Project>
