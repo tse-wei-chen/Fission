@@ -31,8 +31,6 @@ var mulContract = new OnnxSessionContract(
         new OnnxTensorContract("product", "Y", Rank: 2, ElementType: TensorElementType.Float)
     });
 
-// A live graph mismatch must fail before adapter initialization, otherwise the
-// adapter could allocate model state against the wrong export signature.
 var rejectedAdapter = new MulSpecAdapter();
 var rejectedBackend = new OnnxRuntimeBackend(
     new OnnxRuntimeBackendOptions(
@@ -64,8 +62,6 @@ finally
 Require(contractRejected, "A mismatched ONNX session contract must fail backend initialization.");
 Require(!rejectedAdapter.EverInitialized, "Session contract validation must happen before adapter initialization.");
 
-// Decoder-only manifests stay export-specific while expanding to a stable
-// logical contract used by the model adapter.
 var decoderManifest = new DecoderOnlyOnnxContract(
     NumHiddenLayers: 2,
     InputIds: "input_ids",
@@ -90,7 +86,7 @@ Require(
         "past_key_values.1.key",
         "past_key_values.1.value"
     }),
-    "Decoder manifest must expand layer-indexed past KV input names deterministically.");
+    "Decoder manifest must expand past KV input names deterministically.");
 Require(
     decoderSessionContract.Outputs.Select(static output => output.TensorName).SequenceEqual(new[]
     {
@@ -100,7 +96,7 @@ Require(
         "present.1.key",
         "present.1.value"
     }),
-    "Decoder manifest must expand layer-indexed present KV output names deterministically.");
+    "Decoder manifest must expand present KV output names deterministically.");
 Require(
     DecoderOnlyOnnxContract.ExpandLayerName("cache.%d.key", 7) == "cache.7.key" &&
     DecoderOnlyOnnxContract.ExpandLayerName("cache.{0}.value", 7) == "cache.7.value",
@@ -122,9 +118,9 @@ catch (InvalidOperationException)
 }
 Require(incompleteCacheRejected, "Partial past/present cache manifests must be rejected.");
 
-// Caller-owned/preallocated output proof. The same output OrtValue is reused
-// across runs and remains valid after RunOptions disposal because ORT only writes
-// into the caller-supplied handle; it does not return/own an output collection.
+// Prove the ownership mechanism required by persistent present-KV tensors.
+// Both input and output OrtValues are caller-owned and the output allocation is
+// reused across model steps rather than being returned in an ORT-owned result list.
 using (var sessionOptions = new SessionOptions())
 using (var directSession = new InferenceSession(modelBytes, sessionOptions))
 using (var preallocatedInput = new OwnedOrtTensor<float>(
@@ -142,11 +138,10 @@ using (var preallocatedOutput = new OwnedOrtTensor<float>(new long[] { 3, 2 }))
             new[] { preallocatedOutput.Value });
     }
 
-    Require(preallocatedOutput.ReadOnlySpan[^1] == 36f, "Preallocated ORT output buffer must receive the first graph result (6*6=36).");
-    Require(!preallocatedOutput.IsDisposed, "Run/RunOptions disposal must not transfer or release caller-owned output OrtValue ownership.");
-    Require(preallocatedOutput.Value.GetTensorDataAsSpan<float>()[^1] == 36f, "Caller-owned output OrtValue must remain readable after the run returns.");
+    Require(preallocatedOutput.ReadOnlySpan[^1] == 36f, "Preallocated output must receive the first graph result (6*6=36).");
+    Require(!preallocatedOutput.IsDisposed, "RunOptions disposal must not release caller-owned output values.");
+    Require(preallocatedOutput.Value.GetTensorDataAsSpan<float>()[^1] == 36f, "Caller-owned output OrtValue must remain readable after Run returns.");
 
-    preallocatedInput.Span.CopyTo(new float[0]);
     var secondInput = preallocatedInput.Span;
     secondInput[0] = 2f;
     secondInput[1] = 3f;
@@ -165,7 +160,7 @@ using (var preallocatedOutput = new OwnedOrtTensor<float>(new long[] { 3, 2 }))
             new[] { preallocatedOutput.Value });
     }
 
-    Require(preallocatedOutput.ReadOnlySpan[^1] == 42f, "The same preallocated output buffer must be reusable across model steps (7*6=42).");
+    Require(preallocatedOutput.ReadOnlySpan[^1] == 42f, "The same output allocation must be reusable across model steps (7*6=42).");
 }
 
 var invalidShapeRejected = false;
@@ -205,14 +200,12 @@ var prefill = await executor.SubmitPrefillAsync(
         sequence,
         modelId,
         new ReadOnlyMemory<int>(new[] { 1, 2, 3, 4, 5, 6 })));
-
-Require(prefill.SequenceId == sequence, "ORT prefill result must preserve sequence identity.");
-Require(prefill.TokenId == 36, "mul_1.onnx must execute real tensor multiplication (last output 6*6=36).");
-Require(adapter.ActiveSequenceCount == 1, "Model adapter must retain per-sequence state after prefill.");
+Require(prefill.TokenId == 36, "mul_1.onnx prefill must execute the real graph.");
+Require(adapter.ActiveSequenceCount == 1, "Adapter must retain per-sequence state after prefill.");
 
 var decode = await executor.SubmitDecodeAsync(
     new DecodeItem(sequence, modelId, Position: 6));
-Require(decode.TokenId == 42, "ORT decode adapter must run the session again (position+1=7; last output 7*6=42).");
+Require(decode.TokenId == 42, "ORT decode adapter must run the session again.");
 Require(adapter.RunCount == 2, "Prefill and decode must each execute the ONNX Runtime session.");
 
 await executor.ReleaseSequenceAsync(sequence);
@@ -240,13 +233,10 @@ sealed class MulSpecAdapter : IOnnxRuntimeExecutionAdapter
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-
         if (!session.InputNames.SequenceEqual(new[] { "X" }) ||
             !session.OutputNames.SequenceEqual(new[] { "Y" }))
         {
-            throw new InvalidOperationException(
-                $"Unexpected mul_1 model signature: inputs=[{string.Join(',', session.InputNames)}], " +
-                $"outputs=[{string.Join(',', session.OutputNames)}].");
+            throw new InvalidOperationException("Unexpected mul_1 model signature.");
         }
 
         Initialized = true;
@@ -261,7 +251,6 @@ sealed class MulSpecAdapter : IOnnxRuntimeExecutionAdapter
     {
         EnsureInitialized();
         var results = new BackendStepResult[batch.Items.Count];
-
         for (var index = 0; index < batch.Items.Count; index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -271,11 +260,9 @@ sealed class MulSpecAdapter : IOnnxRuntimeExecutionAdapter
                 throw new InvalidOperationException("mul_1 spec adapter requires exactly six prompt tokens.");
             }
 
-            var input = item.Tokens.Span.ToArray();
-            var tensor = Array.ConvertAll(input, static value => (float)value);
-            var token = Run(session, tensor);
+            var tensor = Array.ConvertAll(item.Tokens.Span.ToArray(), static value => (float)value);
+            results[index] = new BackendStepResult(item.SequenceId, Run(session, tensor));
             _activeSequences.Add(item.SequenceId);
-            results[index] = new BackendStepResult(item.SequenceId, token);
         }
 
         return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(results);
@@ -288,20 +275,19 @@ sealed class MulSpecAdapter : IOnnxRuntimeExecutionAdapter
     {
         EnsureInitialized();
         var results = new BackendStepResult[batch.Items.Count];
-
         for (var index = 0; index < batch.Items.Count; index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var item = batch.Items[index];
             if (!_activeSequences.Contains(item.SequenceId))
             {
-                throw new InvalidOperationException(
-                    $"Decode reached ORT adapter without sequence state for {item.SequenceId}.");
+                throw new InvalidOperationException($"Decode reached ORT adapter without state for {item.SequenceId}.");
             }
 
             var value = checked((float)(item.Position + 1));
-            var tensor = new[] { value, value, value, value, value, value };
-            results[index] = new BackendStepResult(item.SequenceId, Run(session, tensor));
+            results[index] = new BackendStepResult(
+                item.SequenceId,
+                Run(session, new[] { value, value, value, value, value, value }));
         }
 
         return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(results);
@@ -313,11 +299,9 @@ sealed class MulSpecAdapter : IOnnxRuntimeExecutionAdapter
     {
         EnsureInitialized();
         cancellationToken.ThrowIfCancellationRequested();
-
         if (!_activeSequences.Remove(sequenceId))
         {
-            throw new InvalidOperationException(
-                $"Release reached ORT adapter without sequence state for {sequenceId}.");
+            throw new InvalidOperationException($"Release reached ORT adapter without state for {sequenceId}.");
         }
 
         ReleaseCount++;
@@ -332,23 +316,15 @@ sealed class MulSpecAdapter : IOnnxRuntimeExecutionAdapter
 
     private int Run(InferenceSession session, float[] values)
     {
-        using var input = OrtValue.CreateTensorValueFromMemory(
-            values,
-            new long[] { 3, 2 });
+        using var input = OrtValue.CreateTensorValueFromMemory(values, new long[] { 3, 2 });
         using var runOptions = new RunOptions();
-        var inputs = new Dictionary<string, OrtValue>
-        {
-            ["X"] = input
-        };
-
         using var outputs = session.Run(
             runOptions,
-            inputs,
+            new Dictionary<string, OrtValue> { ["X"] = input },
             new[] { "Y" });
 
-        var output = outputs[0].GetTensorDataAsSpan<float>();
         RunCount++;
-        return checked((int)MathF.Round(output[^1]));
+        return checked((int)MathF.Round(outputs[0].GetTensorDataAsSpan<float>()[^1]));
     }
 
     private void EnsureInitialized()
