@@ -23,6 +23,16 @@ static SequenceProcess GetSequence(ExecutionPlanExecutor runtime, SequenceId seq
     return sequence;
 }
 
+static ReplaySequenceState GetReplaySequence(ExecutionReplayResult replay, SequenceId sequenceId)
+{
+    if (!replay.Sequences.TryGetValue(sequenceId, out var sequence))
+    {
+        throw new InvalidOperationException($"Replay is missing sequence {sequenceId}.");
+    }
+
+    return sequence;
+}
+
 var model = new ModelId("spec-model");
 var device = new DeviceId("cpu:0");
 var parentId = SequenceId.New();
@@ -144,15 +154,15 @@ Require(replay.Sequences.Count == runtime.SequenceCount, "Replay must reconstruc
 
 foreach (var sequence in new[] { parent, branchA, branchB })
 {
-    Require(replay.Sequences.TryGetValue(sequence.Id, out var replayed), $"Replay is missing sequence {sequence.Id}.");
+    var replayed = GetReplaySequence(replay, sequence.Id);
     Require(replayed.Position == sequence.Position, $"Replay position mismatch for {sequence.Id}.");
     Require(replayed.KvPageCount == sequence.Kv.Count, $"Replay KV page count mismatch for {sequence.Id}.");
     Require(replayed.Device == sequence.Device, $"Replay device mismatch for {sequence.Id}.");
 }
 
-Require(replay.Sequences[parentId].ParentSequenceId is null, "Parent sequence must have no replay parent.");
-Require(replay.Sequences[branchAId].ParentSequenceId == parentId, "Branch A replay must preserve fork ancestry.");
-Require(replay.Sequences[branchBId].ParentSequenceId == parentId, "Branch B replay must preserve fork ancestry.");
+Require(GetReplaySequence(replay, parentId).ParentSequenceId is null, "Parent sequence must have no replay parent.");
+Require(GetReplaySequence(replay, branchAId).ParentSequenceId == parentId, "Branch A replay must preserve fork ancestry.");
+Require(GetReplaySequence(replay, branchBId).ParentSequenceId == parentId, "Branch B replay must preserve fork ancestry.");
 
 Console.WriteLine(
     $"Fission runtime specs passed: shared={sharedPages.Length}, branchA={branchA.Kv.PageIds.Count}, rollback={parent.Kv.PageIds.Count}, traceEvents={recordedTrace.Count}.");
