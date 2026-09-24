@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Fission.Abstractions/Fission.Abstractions.csproj" />
+    <ProjectReference Include="../../src/Fission.Runtime/Fission.Runtime.csproj" />
+    <ProjectReference Include="../../src/Fission.Backends.OnnxRuntime/Fission.Backends.OnnxRuntime.csproj" />
+  </ItemGroup>
+</Project>
