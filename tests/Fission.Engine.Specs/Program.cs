@@ -89,6 +89,8 @@ var snapshotA = engine.GetSnapshot(requestA);
 var snapshotB = engine.GetSnapshot(requestB);
 Require(snapshotA.IsCompleted && snapshotA.GeneratedTokens.Count == 3, "Request A must stop exactly at max_new_tokens=3.");
 Require(snapshotB.IsCompleted && snapshotB.GeneratedTokens.Count == 2, "Request B must stop exactly at max_new_tokens=2.");
+Require(snapshotA.FinishReason == InferenceFinishReason.Length, "Request A must report a length finish reason.");
+Require(snapshotB.FinishReason == InferenceFinishReason.Length, "Request B must report a length finish reason.");
 Require(runtime.SequenceCount == 0, "Completed engine requests must release runtime sequence ownership.");
 Require(kvPool.AllocatedPages == 0, "Completed requests must return every KV page to the shared pool.");
 Require(kvPool.AvailablePages == kvPool.Capacity, "KV capacity must be fully reusable after request completion.");
@@ -129,6 +131,8 @@ var completions = await Task.WhenAll(streams[0].Completion, streams[1].Completio
 Require(streamed[0].Length == 4, "Worker stream C must publish exactly max_new_tokens=4 decode tokens.");
 Require(streamed[1].Length == 3, "Worker stream D must publish exactly max_new_tokens=3 decode tokens.");
 Require(completions[0].IsCompleted && completions[1].IsCompleted, "Worker completion tasks must finish with terminal snapshots.");
+Require(completions[0].FinishReason == InferenceFinishReason.Length, "Worker stream C must finish by length.");
+Require(completions[1].FinishReason == InferenceFinishReason.Length, "Worker stream D must finish by length.");
 Require(streamed[0].SequenceEqual(completions[0].GeneratedTokens), "Stream C token order must match engine request history.");
 Require(streamed[1].SequenceEqual(completions[1].GeneratedTokens), "Stream D token order must match engine request history.");
 Require(runtime.SequenceCount == 0, "Async worker must release all terminal runtime sequences.");
