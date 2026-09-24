@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="src/Fission.Abstractions/Fission.Abstractions.csproj" />
+  <Project Path="src/Fission.Plan/Fission.Plan.fsproj" />
+  <Project Path="src/Fission.Runtime/Fission.Runtime.csproj" />
+  <Project Path="src/Fission.Scheduler/Fission.Scheduler.fsproj" />
+</Solution>

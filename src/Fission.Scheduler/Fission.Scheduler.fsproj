@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <Compile Include="Model.fs" />
+    <Compile Include="Scheduler.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Fission.Abstractions/Fission.Abstractions.csproj" />
+    <ProjectReference Include="../Fission.Plan/Fission.Plan.fsproj" />
+  </ItemGroup>
+</Project>
