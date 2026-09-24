@@ -7,7 +7,12 @@ public readonly record struct DecoderOrtLayerState(
     OrtValue Value);
 
 /// <summary>
-/// Immutable owned physical KV payload for one decoder state version.
+/// Immutable owned physical decoder state for one version.
+///
+/// Besides KV tensors, the state may retain NextTokenId: the sampled token that
+/// must be fed as input to the next one-token decode step. Keeping that token in
+/// the same immutable object as KV means snapshot/fork/restore moves the complete
+/// causal frontier rather than only the cache payload.
 ///
 /// Construction transfers ownership of every layer Key/Value OrtValue to this
 /// instance only after the complete payload validates. The same OrtValue instance
@@ -22,9 +27,15 @@ public sealed class DecoderOrtState : IDisposable
 
     public DecoderOrtState(
         int position,
-        IReadOnlyList<DecoderOrtLayerState> layers)
+        IReadOnlyList<DecoderOrtLayerState> layers,
+        int? nextTokenId = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(position);
+        if (nextTokenId is < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(nextTokenId));
+        }
+
         ArgumentNullException.ThrowIfNull(layers);
         if (layers.Count == 0)
         {
@@ -74,10 +85,19 @@ public sealed class DecoderOrtState : IDisposable
         }
 
         Position = position;
+        NextTokenId = nextTokenId;
         _layers = validated;
     }
 
     public int Position { get; }
+
+    /// <summary>
+    /// Sampled token to feed into the next decode step. It is null for payloads
+    /// created outside the causal-LM execution protocol (for example low-level
+    /// ownership tests).
+    /// </summary>
+    public int? NextTokenId { get; }
+
     public int LayerCount => _layers.Length;
     public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 
