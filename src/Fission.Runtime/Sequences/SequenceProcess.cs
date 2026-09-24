@@ -15,7 +15,6 @@ public enum SequenceStatus
 
 public sealed class SequenceProcess : IDisposable
 {
-    private static long _nextLogicalPageId;
     private readonly object _gate = new();
     private bool _disposed;
 
@@ -52,8 +51,9 @@ public sealed class SequenceProcess : IDisposable
     internal static SequenceProcess Create(
         SequenceId id,
         ModelId model,
-        DeviceId device) =>
-        new(id, model, device, new KvPageTable(), 0, 0);
+        DeviceId device,
+        KvPagePool pagePool) =>
+        new(id, model, device, new KvPageTable(pagePool), 0, 0);
 
     public void TransitionTo(SequenceStatus next)
     {
@@ -111,7 +111,7 @@ public sealed class SequenceProcess : IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            Kv.Append(Interlocked.Increment(ref _nextLogicalPageId));
+            Kv.Append();
             Position += tokenCount;
             Version++;
         }
@@ -122,7 +122,7 @@ public sealed class SequenceProcess : IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            Kv.Append(Interlocked.Increment(ref _nextLogicalPageId));
+            Kv.Append();
             Position++;
             Version++;
         }
