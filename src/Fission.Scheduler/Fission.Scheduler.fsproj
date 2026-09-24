@@ -2,6 +2,7 @@
   <ItemGroup>
     <Compile Include="Model.fs" />
     <Compile Include="Scheduler.fs" />
+    <Compile Include="Compiler.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Fission.Abstractions/Fission.Abstractions.csproj" />

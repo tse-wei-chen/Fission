@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Fission.Abstractions/Fission.Abstractions.csproj" />
+    <ProjectReference Include="../../src/Fission.Scheduler/Fission.Scheduler.fsproj" />
+    <ProjectReference Include="../../src/Fission.Runtime/Fission.Runtime.csproj" />
+  </ItemGroup>
+</Project>

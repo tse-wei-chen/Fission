@@ -1,0 +1,33 @@
+namespace Fission.Scheduler
+
+open System
+open Fission.Abstractions.Scheduling
+
+[<RequireQualifiedAccess>]
+module ScheduleCompiler =
+    let compile (scheduleId: Guid) (decision: SchedulingDecision) =
+        let items =
+            decision.Selected
+            |> List.map (fun selected ->
+                let kind =
+                    match selected.Sequence.Phase with
+                    | Prefilling -> ScheduledWorkKind.Prefill
+                    | Decoding -> ScheduledWorkKind.Decode
+                    | phase -> invalidOp $"Cannot compile non-runnable phase {phase}."
+
+                ScheduledWorkItem(
+                    selected.Sequence.SequenceId,
+                    kind,
+                    selected.TokenGrant,
+                    selected.KvPageGrant,
+                    selected.Sequence.Priority))
+            |> List.toArray
+
+        ScheduledBatch(
+            scheduleId,
+            items,
+            decision.ConsumedTokens,
+            decision.ConsumedKvPages)
+
+    let compileNew (decision: SchedulingDecision) =
+        compile (Guid.NewGuid()) decision

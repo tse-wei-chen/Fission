@@ -1,5 +1,6 @@
 using Fission.Abstractions;
 using Fission.Abstractions.Execution;
+using Fission.Abstractions.Scheduling;
 using Fission.Runtime.Backends;
 using Fission.Runtime.Execution;
 using Fission.Runtime.Sequences;
@@ -164,5 +165,68 @@ Require(GetReplaySequence(replay, parentId).ParentSequenceId is null, "Parent se
 Require(GetReplaySequence(replay, branchAId).ParentSequenceId == parentId, "Branch A replay must preserve fork ancestry.");
 Require(GetReplaySequence(replay, branchBId).ParentSequenceId == parentId, "Branch B replay must preserve fork ancestry.");
 
+var scheduledExecutor = new ScheduledBatchExecutor(runtime);
+var scheduledPrefillId = SequenceId.New();
+var branchBPositionBeforeScheduledDecode = branchB.Position;
+var validSchedule = new ScheduledBatch(
+    Guid.NewGuid(),
+    new ScheduledWorkItem[]
+    {
+        new(scheduledPrefillId, ScheduledWorkKind.Prefill, 3, 1, 25),
+        new(branchBId, ScheduledWorkKind.Decode, 1, 1, 10)
+    },
+    ConsumedTokens: 4,
+    ConsumedKvPages: 2);
+
+var scheduledBindings = new ScheduledExecutionBindings(
+    new Dictionary<SequenceId, ScheduledPrefillBinding>
+    {
+        [scheduledPrefillId] = new(
+            model,
+            new ReadOnlyMemory<int>(new[] { 20, 21, 22 }))
+    });
+
+var scheduledResult = await scheduledExecutor.ExecuteAsync(validSchedule, scheduledBindings);
+Require(scheduledResult.ScheduleId == validSchedule.ScheduleId, "Scheduled execution must preserve schedule id.");
+Require(scheduledResult.ItemResults.Count == 2, "Scheduled execution must return one result per work item.");
+
+var scheduledPrefill = GetSequence(runtime, scheduledPrefillId);
+Require(scheduledPrefill.Position == 3, "Scheduled prefill must advance the new sequence by its token grant.");
+Require(scheduledPrefill.Status == SequenceStatus.Decoding, "Scheduled prefill must leave the sequence ready to decode.");
+Require(branchB.Position == branchBPositionBeforeScheduledDecode + 1, "Scheduled decode must advance the existing sequence by one token.");
+
+var sequenceCountBeforeInvalidSchedule = runtime.SequenceCount;
+var invalidPrefillId = SequenceId.New();
+var invalidSchedule = new ScheduledBatch(
+    Guid.NewGuid(),
+    new ScheduledWorkItem[]
+    {
+        new(invalidPrefillId, ScheduledWorkKind.Prefill, 2, 1, 0),
+        new(SequenceId.New(), ScheduledWorkKind.Prefill, 2, 1, 0)
+    },
+    ConsumedTokens: 5,
+    ConsumedKvPages: 2);
+
+var invalidBindings = new ScheduledExecutionBindings(
+    new Dictionary<SequenceId, ScheduledPrefillBinding>
+    {
+        [invalidPrefillId] = new(model, new ReadOnlyMemory<int>(new[] { 30, 31 })),
+        [invalidSchedule.Items[1].SequenceId] = new(model, new ReadOnlyMemory<int>(new[] { 40, 41 }))
+    });
+
+var invalidRejected = false;
+try
+{
+    await scheduledExecutor.ExecuteAsync(invalidSchedule, invalidBindings);
+}
+catch (InvalidOperationException)
+{
+    invalidRejected = true;
+}
+
+Require(invalidRejected, "Invalid scheduled resource accounting must be rejected.");
+Require(runtime.SequenceCount == sequenceCountBeforeInvalidSchedule, "Invalid schedule validation must complete before runtime side effects begin.");
+Require(!runtime.TryGetSequence(invalidPrefillId, out _), "Invalid scheduled prefill must not create a sequence.");
+
 Console.WriteLine(
-    $"Fission runtime specs passed: shared={sharedPages.Length}, branchA={branchA.Kv.PageIds.Count}, rollback={parent.Kv.PageIds.Count}, traceEvents={recordedTrace.Count}.");
+    $"Fission runtime specs passed: shared={sharedPages.Length}, branchA={branchA.Kv.PageIds.Count}, rollback={parent.Kv.PageIds.Count}, traceEvents={recordedTrace.Count}, scheduledItems={scheduledResult.ItemResults.Count}.");
