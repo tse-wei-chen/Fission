@@ -7,17 +7,23 @@ public sealed class KvSnapshot : IDisposable
     private readonly IReadOnlyList<KvPageLease> _pages;
     private int _disposed;
 
-    internal KvSnapshot(SequenceId sequenceId, long version, IReadOnlyList<KvPageLease> acquiredPages)
+    internal KvSnapshot(
+        SequenceId sequenceId,
+        long version,
+        int position,
+        IReadOnlyList<KvPageLease> acquiredPages)
     {
         Id = KvSnapshotId.New();
         SequenceId = sequenceId;
         Version = version;
+        Position = position;
         _pages = acquiredPages;
     }
 
     public KvSnapshotId Id { get; }
     public SequenceId SequenceId { get; }
     public long Version { get; }
+    public int Position { get; }
     public IReadOnlyList<long> PageIds => _pages.Select(static page => page.PageId).ToArray();
 
     internal IReadOnlyList<KvPageLease> AcquirePages()
