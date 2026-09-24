@@ -4,9 +4,15 @@ open System
 
 [<RequireQualifiedAccess>]
 module Scheduler =
+    type private AdmissionResult =
+        | Admitted of ReadySequence
+        | DeferredAdmission of DeferredSequence
+        | RejectedAdmission of RejectedSequence
+
     type private SelectionState =
         { SelectedRev: ScheduledSequence list
           DeferredRev: DeferredSequence list
+          SelectedCount: int
           UsedTokens: int
           UsedKvPages: int }
 
@@ -53,23 +59,23 @@ module Scheduler =
 
     let private classifyAdmission budget sequence =
         if not (isRunnable sequence) then
-            Choice2Of3 { Sequence = sequence; Reason = NotRunnable }
+            DeferredAdmission { Sequence = sequence; Reason = NotRunnable }
         elif sequence.TokenDemand <= 0 then
-            Choice3Of3 { Sequence = sequence; Reason = InvalidTokenDemand }
+            RejectedAdmission { Sequence = sequence; Reason = InvalidTokenDemand }
         elif sequence.KvPageDemand < 0 then
-            Choice3Of3 { Sequence = sequence; Reason = InvalidKvPageDemand }
+            RejectedAdmission { Sequence = sequence; Reason = InvalidKvPageDemand }
         elif sequence.Phase = Decoding && sequence.TokenDemand <> 1 then
-            Choice3Of3 { Sequence = sequence; Reason = InvalidDecodeQuantum }
+            RejectedAdmission { Sequence = sequence; Reason = InvalidDecodeQuantum }
         elif sequence.TokenDemand > budget.MaxBatchTokens then
-            Choice3Of3 { Sequence = sequence; Reason = TokenDemandExceedsBatchCapacity }
+            RejectedAdmission { Sequence = sequence; Reason = TokenDemandExceedsBatchCapacity }
         elif sequence.KvPageDemand > budget.AvailableKvPages then
-            Choice3Of3 { Sequence = sequence; Reason = KvDemandExceedsCapacity }
+            RejectedAdmission { Sequence = sequence; Reason = KvDemandExceedsCapacity }
         else
-            Choice1Of3 sequence
+            Admitted sequence
 
     let private trySelect budget state sequence =
         let reason =
-            if List.length state.SelectedRev >= budget.MaxBatchSequences then
+            if state.SelectedCount >= budget.MaxBatchSequences then
                 Some BatchSequenceBudget
             elif state.UsedTokens + sequence.TokenDemand > budget.MaxBatchTokens then
                 Some TokenBudget
@@ -90,6 +96,7 @@ module Scheduler =
                       TokenGrant = sequence.TokenDemand
                       KvPageGrant = sequence.KvPageDemand }
                     :: state.SelectedRev
+                SelectedCount = state.SelectedCount + 1
                 UsedTokens = state.UsedTokens + sequence.TokenDemand
                 UsedKvPages = state.UsedKvPages + sequence.KvPageDemand },
             true
@@ -110,19 +117,19 @@ module Scheduler =
         loop state orderedDecodes
 
     let scheduleAt now budget policy sequences =
-        if budget.MaxBatchTokens < 0 then invalidArg (nameof budget.MaxBatchTokens) "MaxBatchTokens cannot be negative."
-        if budget.AvailableKvPages < 0 then invalidArg (nameof budget.AvailableKvPages) "AvailableKvPages cannot be negative."
-        if budget.MaxBatchSequences < 0 then invalidArg (nameof budget.MaxBatchSequences) "MaxBatchSequences cannot be negative."
-        if policy.DecodeTokenReserve < 0 then invalidArg (nameof policy.DecodeTokenReserve) "DecodeTokenReserve cannot be negative."
-        if policy.DeadlineUrgencyWindow < TimeSpan.Zero then invalidArg (nameof policy.DeadlineUrgencyWindow) "DeadlineUrgencyWindow cannot be negative."
+        if budget.MaxBatchTokens < 0 then invalidArg "MaxBatchTokens" "MaxBatchTokens cannot be negative."
+        if budget.AvailableKvPages < 0 then invalidArg "AvailableKvPages" "AvailableKvPages cannot be negative."
+        if budget.MaxBatchSequences < 0 then invalidArg "MaxBatchSequences" "MaxBatchSequences cannot be negative."
+        if policy.DecodeTokenReserve < 0 then invalidArg "DecodeTokenReserve" "DecodeTokenReserve cannot be negative."
+        if policy.DeadlineUrgencyWindow < TimeSpan.Zero then invalidArg "DeadlineUrgencyWindow" "DeadlineUrgencyWindow cannot be negative."
 
         let admittedRev, deferredRev, rejectedRev =
             sequences
             |> List.fold (fun (admitted, deferred, rejected) sequence ->
                 match classifyAdmission budget sequence with
-                | Choice1Of3 candidate -> candidate :: admitted, deferred, rejected
-                | Choice2Of3 deferredItem -> admitted, deferredItem :: deferred, rejected
-                | Choice3Of3 rejectedItem -> admitted, deferred, rejectedItem :: rejected)
+                | Admitted candidate -> candidate :: admitted, deferred, rejected
+                | DeferredAdmission deferredItem -> admitted, deferredItem :: deferred, rejected
+                | RejectedAdmission rejectedItem -> admitted, deferred, rejectedItem :: rejected)
                 ([], [], [])
 
         let admitted = List.rev admittedRev
@@ -139,6 +146,7 @@ module Scheduler =
         let initialState =
             { SelectedRev = []
               DeferredRev = []
+              SelectedCount = 0
               UsedTokens = 0
               UsedKvPages = 0 }
 
