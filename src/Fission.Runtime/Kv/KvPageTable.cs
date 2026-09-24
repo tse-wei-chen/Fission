@@ -25,6 +25,8 @@ public sealed class KvPageTable : IDisposable
         _pages = [.. acquiredPages];
     }
 
+    public int TokensPerPage => _pool.TokensPerPage;
+
     public int Count
     {
         get
@@ -49,12 +51,23 @@ public sealed class KvPageTable : IDisposable
         }
     }
 
-    internal void Append()
+    internal int AppendForTokenRange(int position, int tokenCount)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(position);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tokenCount);
+
         lock (_gate)
         {
             ThrowIfDisposed();
-            _pages.Add(_pool.Rent());
+            var requiredPages = _pool.IncrementalPagesFor(position, tokenCount);
+            if (requiredPages == 0)
+            {
+                return 0;
+            }
+
+            var rented = _pool.Rent(requiredPages);
+            _pages.AddRange(rented);
+            return requiredPages;
         }
     }
 
