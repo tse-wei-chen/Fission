@@ -16,20 +16,25 @@ module Scheduler =
           UsedTokens: int
           UsedKvPages: int }
 
-    let private isRunnable sequence =
+    let private isRunnable (sequence: ReadySequence) =
         sequence.Phase = Prefilling || sequence.Phase = Decoding
 
-    let private deadlineTicks sequence =
+    let private deadlineTicks (sequence: ReadySequence) =
         sequence.Deadline
         |> Option.map _.UtcTicks
         |> Option.defaultValue Int64.MaxValue
 
-    let private isUrgent now policy sequence =
+    let private isUrgent (now: DateTimeOffset) (policy: SchedulingPolicy) (sequence: ReadySequence) =
         match sequence.Deadline with
-        | Some deadline -> deadline <= now + policy.DeadlineUrgencyWindow
+        | Some deadline -> deadline <= now.Add(policy.DeadlineUrgencyWindow)
         | None -> false
 
-    let private compareReady now policy left right =
+    let private compareReady
+        (now: DateTimeOffset)
+        (policy: SchedulingPolicy)
+        (left: ReadySequence)
+        (right: ReadySequence)
+        =
         let urgentLeft = isUrgent now policy left
         let urgentRight = isUrgent now policy right
 
@@ -57,7 +62,7 @@ module Scheduler =
                     if byArrival <> 0 then byArrival
                     else compare left.SequenceId.Value right.SequenceId.Value
 
-    let private classifyAdmission budget sequence =
+    let private classifyAdmission (budget: ResourceBudget) (sequence: ReadySequence) =
         if not (isRunnable sequence) then
             DeferredAdmission { Sequence = sequence; Reason = NotRunnable }
         elif sequence.TokenDemand <= 0 then
@@ -73,7 +78,7 @@ module Scheduler =
         else
             Admitted sequence
 
-    let private trySelect budget state sequence =
+    let private trySelect (budget: ResourceBudget) (state: SelectionState) (sequence: ReadySequence) =
         let reason =
             if state.SelectedCount >= budget.MaxBatchSequences then
                 Some BatchSequenceBudget
@@ -101,7 +106,12 @@ module Scheduler =
                 UsedKvPages = state.UsedKvPages + sequence.KvPageDemand },
             true
 
-    let private reserveDecodeTokens budget policy orderedDecodes state =
+    let private reserveDecodeTokens
+        (budget: ResourceBudget)
+        (policy: SchedulingPolicy)
+        (orderedDecodes: ReadySequence list)
+        (state: SelectionState)
+        =
         let reserveTarget = min policy.DecodeTokenReserve budget.MaxBatchTokens
 
         let rec loop current remaining =
@@ -116,7 +126,12 @@ module Scheduler =
 
         loop state orderedDecodes
 
-    let scheduleAt now budget policy sequences =
+    let scheduleAt
+        (now: DateTimeOffset)
+        (budget: ResourceBudget)
+        (policy: SchedulingPolicy)
+        (sequences: ReadySequence list)
+        =
         if budget.MaxBatchTokens < 0 then invalidArg "MaxBatchTokens" "MaxBatchTokens cannot be negative."
         if budget.AvailableKvPages < 0 then invalidArg "AvailableKvPages" "AvailableKvPages cannot be negative."
         if budget.MaxBatchSequences < 0 then invalidArg "MaxBatchSequences" "MaxBatchSequences cannot be negative."
@@ -167,5 +182,5 @@ module Scheduler =
           ConsumedTokens = finalState.UsedTokens
           ConsumedKvPages = finalState.UsedKvPages }
 
-    let schedule budget policy sequences =
+    let schedule (budget: ResourceBudget) (policy: SchedulingPolicy) (sequences: ReadySequence list) =
         scheduleAt DateTimeOffset.UtcNow budget policy sequences
