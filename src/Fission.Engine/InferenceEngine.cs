@@ -1,4 +1,5 @@
 using Fission.Abstractions;
+using Fission.Abstractions.Execution;
 using Fission.Abstractions.Scheduling;
 using Fission.Runtime.Execution;
 using Fission.Runtime.Sequences;
@@ -15,7 +16,8 @@ public enum InferenceFinishReason
 public sealed record InferenceEngineOptions(
     int MaxBatchTokens,
     int MaxBatchSequences,
-    SchedulingPolicyOptions Scheduling);
+    SchedulingPolicyOptions Scheduling,
+    long? MaxKvBytes = null);
 
 public sealed record InferenceRequestSnapshot(
     SequenceId SequenceId,
@@ -49,13 +51,15 @@ public sealed class InferenceEngine : IDisposable
     private readonly ScheduledBatchExecutor _scheduledExecutor;
     private readonly ISchedulingKernel _scheduler;
     private readonly InferenceEngineOptions _options;
+    private readonly IInferenceKvMemoryProfile? _kvMemoryProfile;
     private readonly Dictionary<SequenceId, RequestState> _requests = new();
     private int _disposed;
 
     public InferenceEngine(
         ExecutionPlanExecutor runtime,
         ISchedulingKernel scheduler,
-        InferenceEngineOptions options)
+        InferenceEngineOptions options,
+        IInferenceKvMemoryProfile? kvMemoryProfile = null)
     {
         ArgumentNullException.ThrowIfNull(runtime);
         ArgumentNullException.ThrowIfNull(scheduler);
@@ -64,6 +68,13 @@ public sealed class InferenceEngine : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(options.MaxBatchSequences);
         ArgumentOutOfRangeException.ThrowIfNegative(options.Scheduling.DecodeTokenReserve);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(options.Scheduling.MaxPrefillChunkTokens);
+
+        if (options.MaxKvBytes is <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                "MaxKvBytes must be positive when specified.");
+        }
 
         if (options.Scheduling.DeadlineUrgencyWindow < TimeSpan.Zero)
         {
@@ -76,6 +87,7 @@ public sealed class InferenceEngine : IDisposable
         _scheduledExecutor = new ScheduledBatchExecutor(runtime);
         _scheduler = scheduler;
         _options = options;
+        _kvMemoryProfile = kvMemoryProfile;
     }
 
     public int RequestCount
@@ -241,7 +253,8 @@ public sealed class InferenceEngine : IDisposable
                 new SchedulingBudget(
                     _options.MaxBatchTokens,
                     kvBefore.AvailablePages,
-                    _options.MaxBatchSequences),
+                    _options.MaxBatchSequences,
+                    GetAvailableKvBytes(active)),
                 _options.Scheduling,
                 candidates);
 
@@ -368,6 +381,8 @@ public sealed class InferenceEngine : IDisposable
 
     private SchedulingCandidate BuildCandidate(RequestView request, int tokensPerKvPage)
     {
+        var kvBytesPerToken = GetKvBytesPerToken(request.ModelId);
+
         if (!_runtime.TryGetSequence(request.SequenceId, out var sequence) || sequence is null)
         {
             return new SchedulingCandidate(
@@ -378,7 +393,8 @@ public sealed class InferenceEngine : IDisposable
                 request.PromptTokens.Length,
                 0,
                 tokensPerKvPage,
-                request.Priority);
+                request.Priority,
+                kvBytesPerToken);
         }
 
         return sequence.Status switch
@@ -391,7 +407,8 @@ public sealed class InferenceEngine : IDisposable
                 RemainingPromptTokens(request, sequence.Position),
                 sequence.Position,
                 tokensPerKvPage,
-                request.Priority),
+                request.Priority,
+                kvBytesPerToken),
 
             SequenceStatus.Decoding => new SchedulingCandidate(
                 request.SequenceId,
@@ -401,7 +418,8 @@ public sealed class InferenceEngine : IDisposable
                 1,
                 sequence.Position,
                 tokensPerKvPage,
-                request.Priority),
+                request.Priority,
+                kvBytesPerToken),
 
             SequenceStatus.Suspended => throw new InvalidOperationException(
                 $"Engine-owned request {request.SequenceId} is suspended without a resume phase."),
@@ -412,6 +430,43 @@ public sealed class InferenceEngine : IDisposable
             _ => throw new InvalidOperationException(
                 $"Unexpected runtime sequence state {sequence.Status} for request {request.SequenceId}.")
         };
+    }
+
+    private long GetAvailableKvBytes(RequestView[] active)
+    {
+        if (_options.MaxKvBytes is not { } maxKvBytes)
+        {
+            return long.MaxValue;
+        }
+
+        long retainedBytes = 0;
+        foreach (var request in active)
+        {
+            if (!_runtime.TryGetSequence(request.SequenceId, out var sequence) || sequence is null)
+            {
+                continue;
+            }
+
+            var bytesPerToken = GetKvBytesPerToken(request.ModelId);
+            retainedBytes = checked(
+                retainedBytes + checked((long)sequence.Position * bytesPerToken));
+        }
+
+        return retainedBytes >= maxKvBytes
+            ? 0L
+            : maxKvBytes - retainedBytes;
+    }
+
+    private long GetKvBytesPerToken(ModelId modelId)
+    {
+        var bytes = _kvMemoryProfile?.GetKvBytesPerToken(modelId) ?? 0L;
+        if (bytes < 0L)
+        {
+            throw new InvalidOperationException(
+                $"KV memory profile returned a negative byte cost ({bytes}) for model {modelId}.");
+        }
+
+        return bytes;
     }
 
     private static int RemainingPromptTokens(RequestView request, int position)
