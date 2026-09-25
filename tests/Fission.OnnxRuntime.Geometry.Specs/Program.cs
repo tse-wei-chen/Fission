@@ -1,3 +1,4 @@
+using Fission.Abstractions;
 using Fission.Backends.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 
@@ -49,6 +50,23 @@ Require(
 Require(
     geometry.GetKvBytesPerSequence(10) == 81_920,
     "KV byte accounting must include Float16 element width.");
+
+var modelId = new ModelId("geometry-model");
+var memoryProfile = new DecoderOrtGeometryKvMemoryProfile(modelId, geometry);
+Require(
+    memoryProfile.GetKvBytesPerToken(modelId) == 8_192,
+    "Geometry-backed memory profile must expose the full per-token KV byte cost.");
+
+var wrongModelRejected = false;
+try
+{
+    _ = memoryProfile.GetKvBytesPerToken(new ModelId("other-model"));
+}
+catch (InvalidOperationException)
+{
+    wrongModelRejected = true;
+}
+Require(wrongModelRejected, "Geometry-backed memory profile must reject a different model id.");
 
 var sessionContract = profile.SessionContract;
 Require(sessionContract.Inputs.Count == 7, "Two-layer profile must declare input_ids, mask, position_ids, and four past-KV inputs.");
@@ -147,4 +165,5 @@ Require(negativePastRejected, "Negative past sequence length must be rejected.")
 
 Console.WriteLine(
     $"Fission decoder geometry specs passed: kvShape=[{string.Join(',', geometry.GetPastKvShape(1, 5))}], " +
-    $"kvBytesAt10={geometry.GetKvBytesPerSequence(10)}, inputs={sessionContract.Inputs.Count}, outputs={sessionContract.Outputs.Count}.");
+    $"kvBytesAt10={geometry.GetKvBytesPerSequence(10)}, kvBytesPerToken={memoryProfile.GetKvBytesPerToken(modelId)}, " +
+    $"inputs={sessionContract.Inputs.Count}, outputs={sessionContract.Outputs.Count}.");
