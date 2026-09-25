@@ -187,21 +187,74 @@ Require(trackingBackend.ReleaseCount == 2, "Cancellation must invoke backend rel
 Require(trackingBackend.ReleasedSequences.Contains(cancelledStateful), "Cancelled sequence id must reach backend release hook.");
 Require(trackingRuntime.SequenceCount == 0 && trackingKvPool.AllocatedPages == 0, "Cancellation must release runtime and KV ownership after backend release.");
 
+var byteBackend = new TrackingStateBackend(
+    new DeviceId("cpu:byte-budget"),
+    kvBytesPerToken: 128);
+var byteKvPool = new KvPagePool(capacity: 16, tokensPerPage: 16);
+await using var byteDevice = await ContinuousBatchExecutor.CreateAsync(
+    byteBackend,
+    capacity: 16,
+    maxBatchSize: 4);
+using var byteRuntime = new ExecutionPlanExecutor(
+    byteDevice,
+    kvPagePool: byteKvPool);
+using var byteEngine = new InferenceEngine(
+    byteRuntime,
+    new SchedulingKernel(),
+    new InferenceEngineOptions(
+        MaxBatchTokens: 16,
+        MaxBatchSequences: 1,
+        Scheduling: new SchedulingPolicyOptions(
+            DecodeTokenReserve: 0,
+            MaxPrefillChunkTokens: 16,
+            DeadlineUrgencyWindow: TimeSpan.FromMilliseconds(50)),
+        MaxKvBytes: 512),
+    kvMemoryProfile: byteBackend);
+
+var byteLimited = byteEngine.Submit(
+    new ModelId("byte-model"),
+    new[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 },
+    maxNewTokens: 1,
+    enqueuedAt: baseTime.AddSeconds(4));
+
+var byteFirstCycle = await byteEngine.RunCycleAsync(baseTime.AddSeconds(4).AddMilliseconds(1));
+Require(byteFirstCycle.Batch.Items.Count == 1, "Byte-budget spec must select one partial prefill.");
+Require(byteFirstCycle.Batch.Items[0].TokenGrant == 4, "512 bytes at 128 bytes/token must admit exactly four prompt tokens.");
+Require(byteFirstCycle.Batch.Items[0].KvByteGrant == 512, "Scheduled work must preserve its physical KV byte grant.");
+Require(byteFirstCycle.Batch.ConsumedKvBytes == 512, "Scheduled batch must account for consumed physical KV bytes.");
+Require(
+    byteRuntime.TryGetSequence(byteLimited, out var byteSequence) && byteSequence?.Position == 4,
+    "Executed partial prefill must advance the live sequence position to four tokens.");
+
+var byteSecondCycle = await byteEngine.RunCycleAsync(baseTime.AddSeconds(4).AddMilliseconds(2));
+Require(byteSecondCycle.Batch.Items.Count == 0, "A fully retained byte budget must block the next prefill chunk.");
+Require(
+    byteSecondCycle.Deferred.Count == 1 &&
+    byteSecondCycle.Deferred[0].Reason == SchedulingDeferralReason.KvByteBudget,
+    "Live retained KV bytes must feed back into the next scheduler cycle.");
+
+var byteCancelled = await byteEngine.CancelAsync(byteLimited);
+Require(byteCancelled.FinishReason == InferenceFinishReason.Cancelled, "Byte-budget test request must be cancellable after partial prefill.");
+Require(byteRuntime.SequenceCount == 0 && byteKvPool.AllocatedPages == 0, "Byte-budget cancellation must release runtime KV ownership.");
+
 Console.WriteLine(
     $"Fission engine specs passed: cycles={cycles.Count}, prefill=[{string.Join(',', prefillGrants)}], " +
     $"manual={snapshotA.GeneratedTokens.Count + snapshotB.GeneratedTokens.Count}, " +
     $"streamed={streamed[0].Length + streamed[1].Length}, backendReleases={trackingBackend.ReleaseCount}, " +
-    $"kv={kvPool.AllocatedPages}/{kvPool.Capacity}.");
+    $"byteGrant={byteFirstCycle.Batch.ConsumedKvBytes}, kv={kvPool.AllocatedPages}/{kvPool.Capacity}.");
 
-sealed class TrackingStateBackend : IInferenceBackend
+sealed class TrackingStateBackend : IInferenceBackend, IInferenceKvMemoryProfile
 {
     private readonly HashSet<SequenceId> _active = new();
     private readonly HashSet<SequenceId> _released = new();
+    private readonly long _kvBytesPerToken;
     private bool _initialized;
 
-    public TrackingStateBackend(DeviceId device)
+    public TrackingStateBackend(DeviceId device, long kvBytesPerToken = 0)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(kvBytesPerToken);
         Device = device;
+        _kvBytesPerToken = kvBytesPerToken;
     }
 
     public string Name => "tracking-state";
@@ -209,6 +262,8 @@ sealed class TrackingStateBackend : IInferenceBackend
     public int ActiveSequenceCount => _active.Count;
     public int ReleaseCount { get; private set; }
     public IReadOnlySet<SequenceId> ReleasedSequences => _released;
+
+    public long GetKvBytesPerToken(ModelId modelId) => _kvBytesPerToken;
 
     public ValueTask InitializeAsync(CancellationToken cancellationToken = default)
     {
