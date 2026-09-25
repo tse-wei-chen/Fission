@@ -10,7 +10,8 @@ namespace Fission.Runtime.Execution;
 /// one consumer drains currently available work into micro-batches and invokes
 /// the backend serially. Stateful control operations are queue-order barriers:
 /// inference before a control is flushed first, the control executes, then later
-/// inference may proceed.
+/// inference may proceed. Mixed prefill/decode inference preserves queue order;
+/// only contiguous work of the same kind is coalesced into one backend batch.
 /// </summary>
 public sealed class ContinuousBatchExecutor : IAsyncDisposable
 {
@@ -182,25 +183,65 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
     private async Task ExecuteInferenceSegmentAsync(
         IReadOnlyList<PendingInference> segment)
     {
-        if (segment.Count == 0)
+        var index = 0;
+        while (index < segment.Count)
         {
-            return;
-        }
+            switch (segment[index])
+            {
+                case PendingPrefill:
+                {
+                    var end = index + 1;
+                    while (end < segment.Count && segment[end] is PendingPrefill)
+                    {
+                        end++;
+                    }
 
-        var prefills = segment.OfType<PendingPrefill>().ToArray();
-        if (prefills.Length != 0)
-        {
-            var input = new PrefillBatch(prefills.Select(static work => work.Item).ToArray());
-            var results = await _backend.PrefillAsync(input).ConfigureAwait(false);
-            Complete(prefills, results);
-        }
+                    var count = end - index;
+                    var work = new PendingPrefill[count];
+                    var items = new PrefillItem[count];
+                    for (var offset = 0; offset < count; offset++)
+                    {
+                        var pending = (PendingPrefill)segment[index + offset];
+                        work[offset] = pending;
+                        items[offset] = pending.Item;
+                    }
 
-        var decodes = segment.OfType<PendingDecode>().ToArray();
-        if (decodes.Length != 0)
-        {
-            var input = new DecodeBatch(decodes.Select(static work => work.Item).ToArray());
-            var results = await _backend.DecodeAsync(input).ConfigureAwait(false);
-            Complete(decodes, results);
+                    var results = await _backend.PrefillAsync(
+                        new PrefillBatch(items)).ConfigureAwait(false);
+                    Complete(work, results);
+                    index = end;
+                    break;
+                }
+
+                case PendingDecode:
+                {
+                    var end = index + 1;
+                    while (end < segment.Count && segment[end] is PendingDecode)
+                    {
+                        end++;
+                    }
+
+                    var count = end - index;
+                    var work = new PendingDecode[count];
+                    var items = new DecodeItem[count];
+                    for (var offset = 0; offset < count; offset++)
+                    {
+                        var pending = (PendingDecode)segment[index + offset];
+                        work[offset] = pending;
+                        items[offset] = pending.Item;
+                    }
+
+                    var results = await _backend.DecodeAsync(
+                        new DecodeBatch(items)).ConfigureAwait(false);
+                    Complete(work, results);
+                    index = end;
+                    break;
+                }
+
+                default:
+                    throw new InvalidOperationException(
+                        $"Unsupported inference work type {segment[index].GetType().Name}.");
+            }
         }
     }
 

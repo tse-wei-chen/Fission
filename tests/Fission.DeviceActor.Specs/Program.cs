@@ -103,9 +103,50 @@ Require(doubleFailureBackend.IsDisposed, "Backend must record the cleanup attemp
 await doubleFailureExecutor.DisposeAsync();
 Require(doubleFailureBackend.DisposeCount == 1, "Repeated disposal after an aggregate failure must remain idempotent.");
 
+// Scheduler-selected mixed work reaches the actor in queue order. The actor may
+// coalesce adjacent work of one kind, but it must not move a later prefill in
+// front of an earlier decode just to form a larger homogeneous batch.
+var orderingBackend = new RecordingBackend(new DeviceId("cpu:ordering"));
+await using (var orderingExecutor = await ContinuousBatchExecutor.CreateAsync(
+    orderingBackend,
+    capacity: 16,
+    maxBatchSize: 16))
+{
+    var firstDecodeId = SequenceId.New();
+    var prefillId = SequenceId.New();
+    var secondDecodeId = SequenceId.New();
+
+    var firstDecode = orderingExecutor.SubmitDecodeAsync(
+        new DecodeItem(firstDecodeId, model, Position: 1)).AsTask();
+    var prefill = orderingExecutor.SubmitPrefillAsync(
+        new PrefillItem(
+            prefillId,
+            model,
+            new ReadOnlyMemory<int>(new[] { 7, 8 }),
+            Position: 0)).AsTask();
+    var secondDecode = orderingExecutor.SubmitDecodeAsync(
+        new DecodeItem(secondDecodeId, model, Position: 4)).AsTask();
+
+    await Task.WhenAll(firstDecode, prefill, secondDecode)
+        .WaitAsync(TimeSpan.FromSeconds(5));
+}
+
+var orderedKinds = orderingBackend.Events
+    .Select(static entry => entry.Kind)
+    .ToArray();
+Require(
+    orderedKinds.SequenceEqual(new[] { "decode", "prefill", "decode" }),
+    "Mixed device inference must preserve queue order instead of moving prefills ahead of reserved decodes.");
+Require(
+    orderingBackend.Events[0].SequenceIds.Count == 1 &&
+    orderingBackend.Events[1].SequenceIds.Count == 1 &&
+    orderingBackend.Events[2].SequenceIds.Count == 1,
+    "Kind switches must form separate contiguous backend batches.");
+
 Console.WriteLine(
-    $"Fission device actor failure specs passed: cleanDisposes={cleanDisposeBackend.DisposeCount}, " +
-    $"aggregateDisposes={doubleFailureBackend.DisposeCount}, errors={aggregateFailure.InnerExceptions.Count}.");
+    $"Fission device actor specs passed: cleanDisposes={cleanDisposeBackend.DisposeCount}, " +
+    $"aggregateDisposes={doubleFailureBackend.DisposeCount}, errors={aggregateFailure.InnerExceptions.Count}, " +
+    $"mixedOrder={string.Join("->", orderedKinds)}.");
 
 sealed class FailingBackend : IInferenceBackend
 {
@@ -173,3 +214,64 @@ sealed class FailingBackend : IInferenceBackend
         }
     }
 }
+
+sealed class RecordingBackend : IInferenceBackend
+{
+    private bool _initialized;
+
+    public RecordingBackend(DeviceId device)
+    {
+        Device = device;
+    }
+
+    public string Name => "recording-order-backend";
+    public DeviceId Device { get; }
+    public List<BackendEvent> Events { get; } = new();
+
+    public ValueTask InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _initialized = true;
+        return ValueTask.CompletedTask;
+    }
+
+    public ValueTask<IReadOnlyList<BackendStepResult>> PrefillAsync(
+        PrefillBatch batch,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+        cancellationToken.ThrowIfCancellationRequested();
+        var ids = batch.Items.Select(static item => item.SequenceId).ToArray();
+        Events.Add(new BackendEvent("prefill", ids));
+        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(
+            ids.Select(static id => new BackendStepResult(id, TokenId: 101)).ToArray());
+    }
+
+    public ValueTask<IReadOnlyList<BackendStepResult>> DecodeAsync(
+        DecodeBatch batch,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+        cancellationToken.ThrowIfCancellationRequested();
+        var ids = batch.Items.Select(static item => item.SequenceId).ToArray();
+        Events.Add(new BackendEvent("decode", ids));
+        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(
+            ids.Select(static id => new BackendStepResult(id, TokenId: 202)).ToArray());
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _initialized = false;
+        return ValueTask.CompletedTask;
+    }
+
+    private void EnsureInitialized()
+    {
+        if (!_initialized)
+        {
+            throw new InvalidOperationException("Backend is not initialized.");
+        }
+    }
+}
+
+sealed record BackendEvent(string Kind, IReadOnlyList<SequenceId> SequenceIds);
