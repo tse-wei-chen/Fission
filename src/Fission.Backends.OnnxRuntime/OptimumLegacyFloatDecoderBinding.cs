@@ -17,26 +17,32 @@ namespace Fission.Backends.OnnxRuntime;
 /// row from that arena exactly once, its dense past KV is reused directly instead
 /// of being gathered and copied again.
 ///
-/// Batched present-KV backing buffers are rented from a binding-private ArrayPool
-/// by default. The arena returns them only after its builder reference and every
-/// row state release ownership, so a buffer is never returned while an OrtValue
-/// slice can still access it.
+/// Retained cohort KV and step-local scratch intentionally use separate pools.
+/// Cohort buffers follow arena ref-count ownership; transient input ids, position
+/// ids, masks, logits, and fallback packed past KV return immediately after their
+/// ORT handles are disposed at the end of the model step.
 /// </summary>
 public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBinding
 {
     private readonly OptimumLegacyDecoderProfile _profile;
     private readonly HashSet<int> _eosTokenIds;
     private readonly ArrayPool<float> _cohortBufferPool;
+    private readonly ArrayPool<float> _scratchFloatPool;
+    private readonly ArrayPool<long> _scratchLongPool;
     private int _ortRunCount;
     private int _pastKvPackCount;
     private int _pastKvArenaReuseCount;
     private long _pastKvCopiedElementCount;
+    private long _scratchFloatRentCount;
+    private long _scratchLongRentCount;
     private int _disposed;
 
     public OptimumLegacyFloatDecoderBinding(
         OptimumLegacyDecoderProfile profile,
         IEnumerable<int>? eosTokenIds = null,
-        ArrayPool<float>? cohortBufferPool = null)
+        ArrayPool<float>? cohortBufferPool = null,
+        ArrayPool<float>? scratchFloatPool = null,
+        ArrayPool<long>? scratchLongPool = null)
     {
         ArgumentNullException.ThrowIfNull(profile);
         if (profile.Geometry.KvElementType != TensorElementType.Float)
@@ -75,6 +81,8 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
             ? new HashSet<int>()
             : new HashSet<int>(eosTokenIds);
         _cohortBufferPool = cohortBufferPool ?? ArrayPool<float>.Create();
+        _scratchFloatPool = scratchFloatPool ?? ArrayPool<float>.Create();
+        _scratchLongPool = scratchLongPool ?? ArrayPool<long>.Create();
 
         if (_eosTokenIds.Any(static token => token < 0))
         {
@@ -91,6 +99,8 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
     public int PastKvPackCount => Volatile.Read(ref _pastKvPackCount);
     public int PastKvArenaReuseCount => Volatile.Read(ref _pastKvArenaReuseCount);
     public long PastKvCopiedElementCount => Interlocked.Read(ref _pastKvCopiedElementCount);
+    public long ScratchFloatRentCount => Interlocked.Read(ref _scratchFloatRentCount);
+    public long ScratchLongRentCount => Interlocked.Read(ref _scratchLongRentCount);
 
     public DecoderOrtStepResult ExecutePrefill(
         InferenceSession session,
@@ -252,14 +262,17 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
         var outputNames = new List<string>(1 + geometry.NumHiddenLayers * 2);
         var outputValues = new List<OrtValue>(outputNames.Capacity);
         var ownedOutputs = new List<OrtValue>(outputNames.Capacity);
+        var scratchLeases = new List<IDisposable>(4 + geometry.NumHiddenLayers * 2);
         var producedStates = new List<DecoderOrtState>(batchSize);
         DecoderOrtCohortArena? retainedInputArena = null;
         DecoderOrtCohortArena? nextArena = null;
 
         try
         {
-            var inputIds = new long[batchSize];
-            var positionIds = new long[batchSize];
+            var inputIdsLease = RentLongScratch(batchSize, scratchLeases);
+            var positionIdsLease = RentLongScratch(batchSize, scratchLeases);
+            var inputIds = inputIdsLease.Span;
+            var positionIds = positionIdsLease.Span;
             for (var row = 0; row < batchSize; row++)
             {
                 var itemIndex = execution.ItemIndicesByRow[row];
@@ -277,7 +290,8 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
 
             var inputIdsShape = geometry.GetInputIdsShape(batchSize, sequenceLength);
             var inputIdsValue = OrtValue.CreateTensorValueFromMemory(
-                inputIds,
+                OrtMemoryInfo.DefaultInstance,
+                inputIdsLease.Memory,
                 inputIdsShape);
             ownedInputs.Add(inputIdsValue);
             inputNames.Add(contract.InputIds);
@@ -287,17 +301,21 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
                 batchSize,
                 pastSequenceLength,
                 sequenceLength);
-            var attentionMask = new long[CheckedTensorLength(attentionMaskShape)];
-            Array.Fill(attentionMask, 1L);
+            var attentionMaskLease = RentLongScratch(
+                CheckedTensorLength(attentionMaskShape),
+                scratchLeases);
+            attentionMaskLease.Span.Fill(1L);
             var attentionMaskValue = OrtValue.CreateTensorValueFromMemory(
-                attentionMask,
+                OrtMemoryInfo.DefaultInstance,
+                attentionMaskLease.Memory,
                 attentionMaskShape);
             ownedInputs.Add(attentionMaskValue);
             inputNames.Add(contract.AttentionMask!);
             inputValues.Add(attentionMaskValue);
 
             var positionIdsValue = OrtValue.CreateTensorValueFromMemory(
-                positionIds,
+                OrtMemoryInfo.DefaultInstance,
+                positionIdsLease.Memory,
                 geometry.GetPositionIdsShape(batchSize, sequenceLength));
             ownedInputs.Add(positionIdsValue);
             inputNames.Add(contract.PositionIds!);
@@ -314,9 +332,6 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
 
             if (execution.ReusableArena is { } reusableArena)
             {
-                // Keep an execution reference independent of row-state lifetime so
-                // even an unexpected concurrent state release cannot return the
-                // backing arrays while ORT input handles are live.
                 reusableArena.Retain();
                 retainedInputArena = reusableArena;
 
@@ -362,8 +377,8 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
                         contract.PastValueNames!,
                         layer));
 
-                    var keyBuffer = new float[batchedPastLength];
-                    var valueBuffer = new float[batchedPastLength];
+                    var keyLease = RentFloatScratch(batchedPastLength, scratchLeases);
+                    var valueLease = RentFloatScratch(batchedPastLength, scratchLeases);
 
                     for (var row = 0; row < batchSize; row++)
                     {
@@ -379,15 +394,17 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
                         }
 
                         var offset = checked(row * perSequencePastLength);
-                        priorKey.CopyTo(keyBuffer.AsSpan(offset, perSequencePastLength));
-                        priorValue.CopyTo(valueBuffer.AsSpan(offset, perSequencePastLength));
+                        priorKey.CopyTo(keyLease.Span.Slice(offset, perSequencePastLength));
+                        priorValue.CopyTo(valueLease.Span.Slice(offset, perSequencePastLength));
                     }
 
                     var keyValue = OrtValue.CreateTensorValueFromMemory(
-                        keyBuffer,
+                        OrtMemoryInfo.DefaultInstance,
+                        keyLease.Memory,
                         batchedPastShape);
                     var valueValue = OrtValue.CreateTensorValueFromMemory(
-                        valueBuffer,
+                        OrtMemoryInfo.DefaultInstance,
+                        valueLease.Memory,
                         batchedPastShape);
                     ownedInputs.Add(keyValue);
                     ownedInputs.Add(valueValue);
@@ -402,9 +419,12 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
             }
 
             var logitsShape = geometry.GetLogitsShape(batchSize, sequenceLength);
-            var logits = new float[CheckedTensorLength(logitsShape)];
+            var logitsLease = RentFloatScratch(
+                CheckedTensorLength(logitsShape),
+                scratchLeases);
             var logitsValue = OrtValue.CreateTensorValueFromMemory(
-                logits,
+                OrtMemoryInfo.DefaultInstance,
+                logitsLease.Memory,
                 logitsShape);
             ownedOutputs.Add(logitsValue);
             outputNames.Add(contract.Logits);
@@ -494,7 +514,7 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
 
                     var logitsOffset = checked(row * perSequenceLogitsLength);
                     var tokenId = GreedySampleLastPosition(
-                        logits.AsSpan(logitsOffset, perSequenceLogitsLength),
+                        logitsLease.Span.Slice(logitsOffset, perSequenceLogitsLength),
                         sequenceLength,
                         geometry.VocabularySize);
                     var state = new DecoderOrtState(
@@ -533,9 +553,6 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
         }
         finally
         {
-            // Full-batch output/input handles pin the same memory as the arena row
-            // slices. Dispose those handles before releasing execution/builder refs;
-            // a final Release may immediately return the underlying array to pool.
             for (var index = ownedOutputs.Count - 1; index >= 0; index--)
             {
                 ownedOutputs[index].Dispose();
@@ -546,9 +563,34 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
                 ownedInputs[index].Dispose();
             }
 
+            for (var index = scratchLeases.Count - 1; index >= 0; index--)
+            {
+                scratchLeases[index].Dispose();
+            }
+
             retainedInputArena?.Release();
             nextArena?.Release();
         }
+    }
+
+    private PooledArrayLease<float> RentFloatScratch(
+        int length,
+        List<IDisposable> leases)
+    {
+        var lease = new PooledArrayLease<float>(_scratchFloatPool, length);
+        leases.Add(lease);
+        Interlocked.Increment(ref _scratchFloatRentCount);
+        return lease;
+    }
+
+    private PooledArrayLease<long> RentLongScratch(
+        int length,
+        List<IDisposable> leases)
+    {
+        var lease = new PooledArrayLease<long>(_scratchLongPool, length);
+        leases.Add(lease);
+        Interlocked.Increment(ref _scratchLongRentCount);
+        return lease;
     }
 
     private static CohortExecution BuildCohortExecution(
@@ -796,7 +838,6 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
                 nextTokenId: tokenId);
             stateOwnsKv = true;
 
-            // Logits are step-local; KV outputs have transferred into state.
             logitsValue.Dispose();
             ownedOutputs.Remove(logitsValue);
             ownedOutputs.Clear();
