@@ -5,17 +5,15 @@ using Microsoft.ML.OnnxRuntime.Tensors;
 namespace Fission.Backends.OnnxRuntime;
 
 /// <summary>
-/// First concrete causal-LM binding for the Optimum legacy decoder-with-past
-/// tensor convention, using CPU FP32 KV/logits buffers and greedy sampling.
+/// Concrete causal-LM binding for the Optimum legacy decoder-with-past tensor
+/// convention, using CPU FP32 KV/logits buffers and greedy sampling.
 ///
-/// Prefill is executed by supplying zero-length past KV tensors. Therefore the
-/// bound ONNX graph must accept an empty past sequence on its with-past path.
-/// Graphs that require a distinct no-past prefill session need a dual-session
-/// binding and are intentionally outside this first implementation.
-///
-/// Decode batches are grouped by decoder position. Every same-position cohort is
-/// packed into one [B, ...] ONNX Runtime invocation, then the batched present-KV
-/// outputs are split into independently owned immutable DecoderOrtState objects.
+/// Prefill supplies zero-length past KV tensors, so the bound graph must accept
+/// an empty past sequence on its with-past path. Decode batches are grouped by
+/// decoder position; every same-position cohort is packed into one [B, ...] ORT
+/// invocation. Present-KV rows are exposed to the resulting immutable states as
+/// independently pinned Memory&lt;float&gt; slices over the batched output buffers,
+/// avoiding the previous per-row split memcpy.
 /// </summary>
 public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBinding
 {
@@ -56,7 +54,7 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
             (profile.Contract.AdditionalOutputs?.Count ?? 0) != 0)
         {
             throw new ArgumentException(
-                "Additional model-specific tensors are not supported by the first Optimum FP32 binding.",
+                "Additional model-specific tensors are not supported by the Optimum FP32 binding.",
                 nameof(profile));
         }
 
@@ -176,7 +174,7 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
         }
 
         var results = new DecoderOrtStepResult[items.Count];
-        var producedStates = new List<DecoderOrtState>(items.Count);
+        var committedStates = new List<DecoderOrtState>(items.Count);
         try
         {
             foreach (var cohort in cohorts.Values)
@@ -193,7 +191,7 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
                 {
                     var itemIndex = cohort[cohortIndex];
                     results[itemIndex] = produced[cohortIndex];
-                    producedStates.Add(produced[cohortIndex].State);
+                    committedStates.Add(produced[cohortIndex].State);
                 }
             }
 
@@ -201,9 +199,9 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
         }
         catch
         {
-            for (var index = producedStates.Count - 1; index >= 0; index--)
+            for (var index = committedStates.Count - 1; index >= 0; index--)
             {
-                producedStates[index].Dispose();
+                committedStates[index].Dispose();
             }
 
             throw;
@@ -406,20 +404,15 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
                     for (var layer = 0; layer < geometry.NumHiddenLayers; layer++)
                     {
                         var offset = checked(row * perSequencePresentLength);
-                        var keyBuffer = new float[perSequencePresentLength];
-                        var valueBuffer = new float[perSequencePresentLength];
-                        presentKeyBuffers[layer]
-                            .AsSpan(offset, perSequencePresentLength)
-                            .CopyTo(keyBuffer);
-                        presentValueBuffers[layer]
-                            .AsSpan(offset, perSequencePresentLength)
-                            .CopyTo(valueBuffer);
-
-                        var key = OrtValue.CreateTensorValueFromMemory(
-                            keyBuffer,
+                        var key = CreateTensorSlice(
+                            presentKeyBuffers[layer],
+                            offset,
+                            perSequencePresentLength,
                             perSequencePresentShape);
-                        var value = OrtValue.CreateTensorValueFromMemory(
-                            valueBuffer,
+                        var value = CreateTensorSlice(
+                            presentValueBuffers[layer],
+                            offset,
+                            perSequencePresentLength,
                             perSequencePresentShape);
                         rowOwnedValues.Add(key);
                         rowOwnedValues.Add(value);
@@ -476,6 +469,18 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
                 ownedInputs[index].Dispose();
             }
         }
+    }
+
+    private static OrtValue CreateTensorSlice(
+        float[] buffer,
+        int offset,
+        int length,
+        long[] shape)
+    {
+        return OrtValue.CreateTensorValueFromMemory(
+            OrtMemoryInfo.DefaultInstance,
+            buffer.AsMemory(offset, length),
+            shape);
     }
 
     private int ValidateDecodeState(
@@ -590,11 +595,11 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
                 }
             }
 
-            var logits = new float[CheckedTensorLength(
-                geometry.GetLogitsShape(batchSize: 1, sequenceLength))];
+            var logitsShape = geometry.GetLogitsShape(batchSize: 1, sequenceLength);
+            var logits = new float[CheckedTensorLength(logitsShape)];
             var logitsValue = OrtValue.CreateTensorValueFromMemory(
                 logits,
-                geometry.GetLogitsShape(batchSize: 1, sequenceLength));
+                logitsShape);
             ownedOutputs.Add(logitsValue);
             outputNames.Add(contract.Logits);
             outputValues.Add(logitsValue);
@@ -655,11 +660,7 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
             // Logits are step-local; KV outputs have transferred into state.
             logitsValue.Dispose();
             ownedOutputs.Remove(logitsValue);
-            for (var index = ownedOutputs.Count - 1; index >= 0; index--)
-            {
-                // Every remaining output is now owned by DecoderOrtState.
-                ownedOutputs.RemoveAt(index);
-            }
+            ownedOutputs.Clear();
 
             return new DecoderOrtStepResult(
                 tokenId,
