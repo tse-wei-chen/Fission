@@ -14,7 +14,8 @@ module Scheduler =
           DeferredRev: DeferredSequence list
           SelectedCount: int
           UsedTokens: int
-          UsedKvPages: int }
+          UsedKvPages: int
+          UsedKvBytes: int64 }
 
     let private isRunnable (sequence: ReadySequence) =
         sequence.Phase = Prefilling || sequence.Phase = Decoding
@@ -84,6 +85,15 @@ module Scheduler =
         let writable = max 0L (capacityTokens - int64 sequence.Position)
         if writable > int64 Int32.MaxValue then Int32.MaxValue else int writable
 
+    let private tokensWritableWithKvBytes (sequence: ReadySequence) (availableBytes: int64) =
+        if sequence.KvBytesPerToken = 0L then
+            Int32.MaxValue
+        elif availableBytes <= 0L then
+            0
+        else
+            let writable = availableBytes / sequence.KvBytesPerToken
+            if writable > int64 Int32.MaxValue then Int32.MaxValue else int writable
+
     let private classifyAdmission (sequence: ReadySequence) =
         if not (isRunnable sequence) then
             DeferredAdmission { Sequence = sequence; Reason = NotRunnable }
@@ -93,6 +103,8 @@ module Scheduler =
             RejectedAdmission { Sequence = sequence; Reason = InvalidPosition }
         elif sequence.TokensPerKvPage <= 0 then
             RejectedAdmission { Sequence = sequence; Reason = InvalidKvPageSize }
+        elif sequence.KvBytesPerToken < 0L then
+            RejectedAdmission { Sequence = sequence; Reason = InvalidKvBytesPerToken }
         elif sequence.Phase = Decoding && sequence.TokenDemand <> 1 then
             RejectedAdmission { Sequence = sequence; Reason = InvalidDecodeQuantum }
         else
@@ -123,23 +135,33 @@ module Scheduler =
 
                 let availableKvPages = budget.AvailableKvPages - state.UsedKvPages
                 let kvTokenCapacity = tokensWritableWithKvPages sequence availableKvPages
-                let tokenGrant = min desiredTokens (min availableTokens kvTokenCapacity)
+                let availableKvBytes = budget.AvailableKvBytes - state.UsedKvBytes
+                let kvByteTokenCapacity = tokensWritableWithKvBytes sequence availableKvBytes
+                let tokenGrant =
+                    min desiredTokens (min availableTokens (min kvTokenCapacity kvByteTokenCapacity))
 
                 if tokenGrant <= 0 then
+                    let reason =
+                        if kvTokenCapacity <= 0 then KvBudget
+                        elif kvByteTokenCapacity <= 0 then KvByteBudget
+                        else TokenBudget
                     { state with
-                        DeferredRev = { Sequence = sequence; Reason = KvBudget } :: state.DeferredRev },
+                        DeferredRev = { Sequence = sequence; Reason = reason } :: state.DeferredRev },
                     false
                 else
                     let kvPageGrant = kvPagesForGrant sequence tokenGrant
+                    let kvByteGrant = int64 tokenGrant * sequence.KvBytesPerToken
                     { state with
                         SelectedRev =
                             { Sequence = sequence
                               TokenGrant = tokenGrant
-                              KvPageGrant = kvPageGrant }
+                              KvPageGrant = kvPageGrant
+                              KvByteGrant = kvByteGrant }
                             :: state.SelectedRev
                         SelectedCount = state.SelectedCount + 1
                         UsedTokens = state.UsedTokens + tokenGrant
-                        UsedKvPages = state.UsedKvPages + kvPageGrant },
+                        UsedKvPages = state.UsedKvPages + kvPageGrant
+                        UsedKvBytes = state.UsedKvBytes + kvByteGrant },
                     true
 
     let private reserveDecodeTokens
@@ -171,6 +193,7 @@ module Scheduler =
         if budget.MaxBatchTokens < 0 then invalidArg "MaxBatchTokens" "MaxBatchTokens cannot be negative."
         if budget.AvailableKvPages < 0 then invalidArg "AvailableKvPages" "AvailableKvPages cannot be negative."
         if budget.MaxBatchSequences < 0 then invalidArg "MaxBatchSequences" "MaxBatchSequences cannot be negative."
+        if budget.AvailableKvBytes < 0L then invalidArg "AvailableKvBytes" "AvailableKvBytes cannot be negative."
         if policy.DecodeTokenReserve < 0 then invalidArg "DecodeTokenReserve" "DecodeTokenReserve cannot be negative."
         if policy.MaxPrefillChunkTokens <= 0 then invalidArg "MaxPrefillChunkTokens" "MaxPrefillChunkTokens must be positive."
         if policy.DeadlineUrgencyWindow < TimeSpan.Zero then invalidArg "DeadlineUrgencyWindow" "DeadlineUrgencyWindow cannot be negative."
@@ -200,7 +223,8 @@ module Scheduler =
               DeferredRev = []
               SelectedCount = 0
               UsedTokens = 0
-              UsedKvPages = 0 }
+              UsedKvPages = 0
+              UsedKvBytes = 0L }
 
         let afterReserve, remainingDecodes =
             reserveDecodeTokens budget policy orderedDecodes initialState
@@ -217,7 +241,8 @@ module Scheduler =
           Deferred = initiallyDeferred @ List.rev finalState.DeferredRev
           Rejected = rejected
           ConsumedTokens = finalState.UsedTokens
-          ConsumedKvPages = finalState.UsedKvPages }
+          ConsumedKvPages = finalState.UsedKvPages
+          ConsumedKvBytes = finalState.UsedKvBytes }
 
     let schedule (budget: ResourceBudget) (policy: SchedulingPolicy) (sequences: ReadySequence list) =
         scheduleAt DateTimeOffset.UtcNow budget policy sequences
