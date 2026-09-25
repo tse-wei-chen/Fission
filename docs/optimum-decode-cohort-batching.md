@@ -69,7 +69,7 @@ Step-local tensors have a different lifetime from retained KV and therefore use 
 - logits, and
 - packed past-key/value buffers used only when stable arena reuse is unavailable.
 
-`ArrayPoolLease<T>` keeps the physical rental private and exposes only the requested `Memory<T>` / `Span<T>` length. A larger physical pool array therefore cannot leak spare capacity into an ONNX tensor shape.
+`PooledArrayLease<T>` keeps the physical rental private and exposes only the requested `Memory<T>` / `Span<T>` length. A larger physical pool array therefore cannot leak spare capacity into an ONNX tensor shape.
 
 Scratch lifetime is deliberately shorter than arena lifetime. At the end of one model step the binding disposes full ORT output handles, then input handles, then returns every scratch lease, and only then releases retained arena execution/builder references. Stable cohorts therefore rent three `long` scratch buffers and one FP32 logits buffer per physical model run; fork/partial fallback additionally rents two FP32 packed-past buffers per decoder layer. `ScratchLongRentCount` and `ScratchFloatRentCount` expose this physical behavior for diagnostics.
 
