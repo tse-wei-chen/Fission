@@ -21,6 +21,11 @@ public readonly record struct SchedulingCandidate(
     int Priority,
     long KvBytesPerToken = 0);
 
+/// <summary>
+/// Physical KV byte slack is used by two independent scheduler constraints:
+/// retained incremental growth and temporary immutable successor-frontier peak.
+/// Both are checked against the same currently available device-memory slack.
+/// </summary>
 public readonly record struct SchedulingBudget(
     int MaxBatchTokens,
     int AvailableKvPages,
@@ -38,6 +43,7 @@ public enum SchedulingDeferralReason
     TokenBudget,
     KvBudget,
     KvByteBudget,
+    TransientKvByteBudget,
     BatchSequenceBudget
 }
 

@@ -15,7 +15,8 @@ module Scheduler =
           SelectedCount: int
           UsedTokens: int
           UsedKvPages: int
-          UsedKvBytes: int64 }
+          UsedKvBytes: int64
+          UsedTransientKvBytes: int64 }
 
     let private isRunnable (sequence: ReadySequence) =
         sequence.Phase = Prefilling || sequence.Phase = Decoding
@@ -85,6 +86,8 @@ module Scheduler =
         let writable = max 0L (capacityTokens - int64 sequence.Position)
         if writable > int64 Int32.MaxValue then Int32.MaxValue else int writable
 
+    // Retained KV accounting only charges the incremental tokens that survive the
+    // step after the immutable prior state is released.
     let private tokensWritableWithKvBytes (sequence: ReadySequence) (availableBytes: int64) =
         if sequence.KvBytesPerToken = 0L then
             Int32.MaxValue
@@ -93,6 +96,26 @@ module Scheduler =
         else
             let writable = availableBytes / sequence.KvBytesPerToken
             if writable > int64 Int32.MaxValue then Int32.MaxValue else int writable
+
+    // Dense immutable decoder execution temporarily owns both the prior frontier
+    // (already included in retained device usage) and the full successor frontier.
+    // The successor therefore has to fit entirely inside the remaining physical
+    // byte slack. This is deliberately conservative for future paged/COW backends.
+    let private tokensWritableWithTransientKvBytes (sequence: ReadySequence) (availableBytes: int64) =
+        if sequence.KvBytesPerToken = 0L then
+            Int32.MaxValue
+        elif availableBytes <= 0L then
+            0
+        else
+            let successorTokenCapacity = availableBytes / sequence.KvBytesPerToken
+            let writable = max 0L (successorTokenCapacity - int64 sequence.Position)
+            if writable > int64 Int32.MaxValue then Int32.MaxValue else int writable
+
+    let private transientKvBytesForGrant (sequence: ReadySequence) tokenGrant =
+        if sequence.KvBytesPerToken = 0L then
+            0L
+        else
+            (int64 sequence.Position + int64 tokenGrant) * sequence.KvBytesPerToken
 
     let private classifyAdmission (sequence: ReadySequence) =
         if not (isRunnable sequence) then
@@ -137,13 +160,21 @@ module Scheduler =
                 let kvTokenCapacity = tokensWritableWithKvPages sequence availableKvPages
                 let availableKvBytes = budget.AvailableKvBytes - state.UsedKvBytes
                 let kvByteTokenCapacity = tokensWritableWithKvBytes sequence availableKvBytes
+                let availableTransientKvBytes = budget.AvailableKvBytes - state.UsedTransientKvBytes
+                let transientKvByteTokenCapacity =
+                    tokensWritableWithTransientKvBytes sequence availableTransientKvBytes
                 let tokenGrant =
-                    min desiredTokens (min availableTokens (min kvTokenCapacity kvByteTokenCapacity))
+                    min
+                        desiredTokens
+                        (min
+                            availableTokens
+                            (min kvTokenCapacity (min kvByteTokenCapacity transientKvByteTokenCapacity)))
 
                 if tokenGrant <= 0 then
                     let reason =
                         if kvTokenCapacity <= 0 then KvBudget
                         elif kvByteTokenCapacity <= 0 then KvByteBudget
+                        elif transientKvByteTokenCapacity <= 0 then TransientKvByteBudget
                         else TokenBudget
                     { state with
                         DeferredRev = { Sequence = sequence; Reason = reason } :: state.DeferredRev },
@@ -151,17 +182,20 @@ module Scheduler =
                 else
                     let kvPageGrant = kvPagesForGrant sequence tokenGrant
                     let kvByteGrant = int64 tokenGrant * sequence.KvBytesPerToken
+                    let transientKvByteGrant = transientKvBytesForGrant sequence tokenGrant
                     { state with
                         SelectedRev =
                             { Sequence = sequence
                               TokenGrant = tokenGrant
                               KvPageGrant = kvPageGrant
-                              KvByteGrant = kvByteGrant }
+                              KvByteGrant = kvByteGrant
+                              TransientKvByteGrant = transientKvByteGrant }
                             :: state.SelectedRev
                         SelectedCount = state.SelectedCount + 1
                         UsedTokens = state.UsedTokens + tokenGrant
                         UsedKvPages = state.UsedKvPages + kvPageGrant
-                        UsedKvBytes = state.UsedKvBytes + kvByteGrant },
+                        UsedKvBytes = state.UsedKvBytes + kvByteGrant
+                        UsedTransientKvBytes = state.UsedTransientKvBytes + transientKvByteGrant },
                     true
 
     let private reserveDecodeTokens
@@ -224,7 +258,8 @@ module Scheduler =
               SelectedCount = 0
               UsedTokens = 0
               UsedKvPages = 0
-              UsedKvBytes = 0L }
+              UsedKvBytes = 0L
+              UsedTransientKvBytes = 0L }
 
         let afterReserve, remainingDecodes =
             reserveDecodeTokens budget policy orderedDecodes initialState
@@ -242,7 +277,8 @@ module Scheduler =
           Rejected = rejected
           ConsumedTokens = finalState.UsedTokens
           ConsumedKvPages = finalState.UsedKvPages
-          ConsumedKvBytes = finalState.UsedKvBytes }
+          ConsumedKvBytes = finalState.UsedKvBytes
+          ConsumedTransientKvBytes = finalState.UsedTransientKvBytes }
 
     let schedule (budget: ResourceBudget) (policy: SchedulingPolicy) (sequences: ReadySequence list) =
         scheduleAt DateTimeOffset.UtcNow budget policy sequences

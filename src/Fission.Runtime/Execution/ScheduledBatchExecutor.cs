@@ -113,12 +113,16 @@ public sealed class ScheduledBatchExecutor
         var sequences = new HashSet<SequenceId>();
         var consumedTokens = 0;
         var consumedKvPages = 0;
+        var consumedKvBytes = 0L;
+        var consumedTransientKvBytes = 0L;
 
         for (var index = 0; index < batch.Items.Count; index++)
         {
             var item = batch.Items[index];
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(item.TokenGrant);
             ArgumentOutOfRangeException.ThrowIfNegative(item.KvPageGrant);
+            ArgumentOutOfRangeException.ThrowIfNegative(item.KvByteGrant);
+            ArgumentOutOfRangeException.ThrowIfNegative(item.TransientKvByteGrant);
 
             if (!sequences.Add(item.SequenceId))
             {
@@ -139,6 +143,9 @@ public sealed class ScheduledBatchExecutor
 
             consumedTokens = checked(consumedTokens + item.TokenGrant);
             consumedKvPages = checked(consumedKvPages + item.KvPageGrant);
+            consumedKvBytes = checked(consumedKvBytes + item.KvByteGrant);
+            consumedTransientKvBytes = checked(
+                consumedTransientKvBytes + item.TransientKvByteGrant);
 
             ExecutionStep step;
             ExecutionBindings executionBindings;
@@ -207,6 +214,20 @@ public sealed class ScheduledBatchExecutor
             throw new InvalidOperationException(
                 $"Scheduled batch {batch.ScheduleId} reports {batch.ConsumedKvPages} consumed KV pages, " +
                 $"but its work items sum to {consumedKvPages}.");
+        }
+
+        if (consumedKvBytes != batch.ConsumedKvBytes)
+        {
+            throw new InvalidOperationException(
+                $"Scheduled batch {batch.ScheduleId} reports {batch.ConsumedKvBytes} retained KV bytes, " +
+                $"but its work items sum to {consumedKvBytes}.");
+        }
+
+        if (consumedTransientKvBytes != batch.ConsumedTransientKvBytes)
+        {
+            throw new InvalidOperationException(
+                $"Scheduled batch {batch.ScheduleId} reports {batch.ConsumedTransientKvBytes} transient KV bytes, " +
+                $"but its work items sum to {consumedTransientKvBytes}.");
         }
 
         if (consumedKvPages > _runtime.KvPages.AvailablePages)
