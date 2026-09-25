@@ -119,45 +119,27 @@ public sealed class DecoderOnlyOnnxExecutionAdapter :
             }
         }
 
+        var batchPrefillBinding = _binding as IDecoderOrtBatchPrefillModelBinding;
         var chunkedBinding = _binding as IDecoderOrtChunkedPrefillModelBinding;
-        if (needsContinuationCapability && chunkedBinding is null)
+        if (needsContinuationCapability && batchPrefillBinding is null && chunkedBinding is null)
         {
             throw new NotSupportedException(
                 $"Decoder binding '{_binding.Name}' does not support chunked prefill continuation.");
         }
 
-        var pending = new DecoderOrtStepResult[batch.Items.Count];
-        var produced = 0;
-        try
-        {
-            for (var index = 0; index < normalizedItems.Length; index++)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var item = normalizedItems[index];
-                var prior = priorStates[index];
-                var step = prior is null
-                    ? _binding.ExecutePrefill(session, item, cancellationToken)
-                    : chunkedBinding!.ExecutePrefillChunk(
-                        session,
-                        item,
-                        prior,
-                        cancellationToken);
-
-                ValidateStepResult(
-                    step,
-                    expectedPosition: checked(item.Position!.Value + item.Tokens.Length),
-                    priorState: prior);
-                pending[index] = step;
-                produced++;
-            }
-
-            ValidateDistinctStateOwnership(pending);
-        }
-        catch
-        {
-            DisposeProducedStates(pending, produced);
-            throw;
-        }
+        var pending = batchPrefillBinding is not null
+            ? ExecuteBatchedPrefill(
+                batchPrefillBinding,
+                session,
+                normalizedItems,
+                priorStates,
+                cancellationToken)
+            : ExecuteScalarPrefill(
+                session,
+                normalizedItems,
+                priorStates,
+                chunkedBinding,
+                cancellationToken);
 
         // All model work and state-shape validation has completed. Calls are
         // serialized by the device actor, so the prevalidated sequence set cannot
@@ -192,6 +174,91 @@ public sealed class DecoderOnlyOnnxExecutionAdapter :
 
         return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(
             ToBackendResults(batch.Items, pending));
+    }
+
+    private DecoderOrtStepResult[] ExecuteBatchedPrefill(
+        IDecoderOrtBatchPrefillModelBinding batchBinding,
+        InferenceSession session,
+        IReadOnlyList<PrefillItem> items,
+        IReadOnlyList<DecoderOrtState?> priorStates,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var produced = batchBinding.ExecutePrefillBatch(
+            session,
+            items,
+            priorStates,
+            cancellationToken) ?? throw new InvalidOperationException(
+                "Decoder prefill batch binding returned a null result collection.");
+
+        if (produced.Count != items.Count)
+        {
+            DisposeProducedStates(produced);
+            throw new InvalidOperationException(
+                $"Decoder prefill batch binding returned {produced.Count} results for {items.Count} prefill items.");
+        }
+
+        var pending = produced.ToArray();
+        try
+        {
+            for (var index = 0; index < pending.Length; index++)
+            {
+                ValidateStepResult(
+                    pending[index],
+                    expectedPosition: checked(items[index].Position!.Value + items[index].Tokens.Length),
+                    priorStates[index]);
+            }
+
+            ValidateDistinctStateOwnership(pending);
+            return pending;
+        }
+        catch
+        {
+            DisposeProducedStates(pending);
+            throw;
+        }
+    }
+
+    private DecoderOrtStepResult[] ExecuteScalarPrefill(
+        InferenceSession session,
+        IReadOnlyList<PrefillItem> items,
+        IReadOnlyList<DecoderOrtState?> priorStates,
+        IDecoderOrtChunkedPrefillModelBinding? chunkedBinding,
+        CancellationToken cancellationToken)
+    {
+        var pending = new DecoderOrtStepResult[items.Count];
+        var produced = 0;
+        try
+        {
+            for (var index = 0; index < items.Count; index++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var item = items[index];
+                var prior = priorStates[index];
+                var step = prior is null
+                    ? _binding.ExecutePrefill(session, item, cancellationToken)
+                    : chunkedBinding!.ExecutePrefillChunk(
+                        session,
+                        item,
+                        prior,
+                        cancellationToken);
+
+                ValidateStepResult(
+                    step,
+                    expectedPosition: checked(item.Position!.Value + item.Tokens.Length),
+                    priorState: prior);
+                pending[index] = step;
+                produced++;
+            }
+
+            ValidateDistinctStateOwnership(pending);
+            return pending;
+        }
+        catch
+        {
+            DisposeProducedStates(pending, produced);
+            throw;
+        }
     }
 
     public ValueTask<IReadOnlyList<BackendStepResult>> DecodeAsync(
