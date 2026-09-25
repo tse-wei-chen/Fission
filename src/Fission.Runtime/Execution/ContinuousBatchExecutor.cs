@@ -255,8 +255,11 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         {
             throw new AggregateException(
                 "Device actor and backend disposal both failed.",
-                pumpFailure.SourceException,
-                backendDisposeFailure.SourceException);
+                new[]
+                {
+                    pumpFailure.SourceException,
+                    backendDisposeFailure.SourceException
+                });
         }
 
         if (pumpFailure is not null)
