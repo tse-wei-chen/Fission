@@ -17,5 +17,6 @@
   <Project Path="tests/Fission.OnnxRuntime.Decoder.Specs/Fission.OnnxRuntime.Decoder.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.Geometry.Specs/Fission.OnnxRuntime.Geometry.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.Optimum.Specs/Fission.OnnxRuntime.Optimum.Specs.csproj" />
+  <Project Path="tests/Fission.OnnxRuntime.Batch.Specs/Fission.OnnxRuntime.Batch.Specs.csproj" />
   <Project Path="tests/Fission.BackendTransactions.Specs/Fission.BackendTransactions.Specs.csproj" />
 </Solution>

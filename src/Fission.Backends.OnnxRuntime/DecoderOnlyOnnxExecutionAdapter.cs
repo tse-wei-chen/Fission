@@ -99,6 +99,8 @@ public sealed class DecoderOnlyOnnxExecutionAdapter :
                 pending[index] = step;
                 produced++;
             }
+
+            ValidateDistinctStateOwnership(pending);
         }
         catch
         {
@@ -131,16 +133,8 @@ public sealed class DecoderOnlyOnnxExecutionAdapter :
             throw;
         }
 
-        var results = new BackendStepResult[batch.Items.Count];
-        for (var index = 0; index < results.Length; index++)
-        {
-            results[index] = new BackendStepResult(
-                batch.Items[index].SequenceId,
-                pending[index].TokenId,
-                pending[index].IsFinished);
-        }
-
-        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(results);
+        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(
+            ToBackendResults(batch.Items, pending));
     }
 
     public ValueTask<IReadOnlyList<BackendStepResult>> DecodeAsync(
@@ -187,31 +181,23 @@ public sealed class DecoderOnlyOnnxExecutionAdapter :
             priorStates[index] = prior;
         }
 
-        var pending = new DecoderOrtStepResult[batch.Items.Count];
-        var produced = 0;
-        try
+        DecoderOrtStepResult[] pending;
+        if (_binding is IDecoderOrtBatchModelBinding batchBinding)
         {
-            for (var index = 0; index < batch.Items.Count; index++)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var item = batch.Items[index];
-                var step = _binding.ExecuteDecode(
-                    session,
-                    item,
-                    priorStates[index],
-                    cancellationToken);
-                ValidateStepResult(
-                    step,
-                    expectedPosition: checked(item.Position + 1),
-                    priorStates[index]);
-                pending[index] = step;
-                produced++;
-            }
+            pending = ExecuteBatchedDecode(
+                batchBinding,
+                session,
+                batch.Items,
+                priorStates,
+                cancellationToken);
         }
-        catch
+        else
         {
-            DisposeProducedStates(pending, produced);
-            throw;
+            pending = ExecuteScalarDecode(
+                session,
+                batch.Items,
+                priorStates,
+                cancellationToken);
         }
 
         // All failure-prone model work has completed. Calls are serialized by the
@@ -224,16 +210,87 @@ public sealed class DecoderOnlyOnnxExecutionAdapter :
                 pending[index].State);
         }
 
-        var results = new BackendStepResult[batch.Items.Count];
-        for (var index = 0; index < results.Length; index++)
+        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(
+            ToBackendResults(batch.Items, pending));
+    }
+
+    private DecoderOrtStepResult[] ExecuteBatchedDecode(
+        IDecoderOrtBatchModelBinding batchBinding,
+        InferenceSession session,
+        IReadOnlyList<DecodeItem> items,
+        IReadOnlyList<DecoderOrtState> priorStates,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var produced = batchBinding.ExecuteDecodeBatch(
+            session,
+            items,
+            priorStates,
+            cancellationToken) ?? throw new InvalidOperationException(
+                "Decoder batch binding returned a null result collection.");
+
+        if (produced.Count != items.Count)
         {
-            results[index] = new BackendStepResult(
-                batch.Items[index].SequenceId,
-                pending[index].TokenId,
-                pending[index].IsFinished);
+            DisposeProducedStates(produced);
+            throw new InvalidOperationException(
+                $"Decoder batch binding returned {produced.Count} results for {items.Count} decode items.");
         }
 
-        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(results);
+        var pending = produced.ToArray();
+        try
+        {
+            for (var index = 0; index < pending.Length; index++)
+            {
+                ValidateStepResult(
+                    pending[index],
+                    expectedPosition: checked(items[index].Position + 1),
+                    priorStates[index]);
+            }
+
+            ValidateDistinctStateOwnership(pending);
+            return pending;
+        }
+        catch
+        {
+            DisposeProducedStates(pending);
+            throw;
+        }
+    }
+
+    private DecoderOrtStepResult[] ExecuteScalarDecode(
+        InferenceSession session,
+        IReadOnlyList<DecodeItem> items,
+        IReadOnlyList<DecoderOrtState> priorStates,
+        CancellationToken cancellationToken)
+    {
+        var pending = new DecoderOrtStepResult[items.Count];
+        var produced = 0;
+        try
+        {
+            for (var index = 0; index < items.Count; index++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var step = _binding.ExecuteDecode(
+                    session,
+                    items[index],
+                    priorStates[index],
+                    cancellationToken);
+                ValidateStepResult(
+                    step,
+                    expectedPosition: checked(items[index].Position + 1),
+                    priorStates[index]);
+                pending[index] = step;
+                produced++;
+            }
+
+            ValidateDistinctStateOwnership(pending);
+            return pending;
+        }
+        catch
+        {
+            DisposeProducedStates(pending, produced);
+            throw;
+        }
     }
 
     public ValueTask SnapshotSequenceAsync(
@@ -299,6 +356,31 @@ public sealed class DecoderOnlyOnnxExecutionAdapter :
         return ValueTask.CompletedTask;
     }
 
+    private static BackendStepResult[] ToBackendResults<TItem>(
+        IReadOnlyList<TItem> items,
+        IReadOnlyList<DecoderOrtStepResult> pending)
+        where TItem : struct
+    {
+        var results = new BackendStepResult[pending.Count];
+        for (var index = 0; index < results.Length; index++)
+        {
+            var sequenceId = items[index] switch
+            {
+                PrefillItem item => item.SequenceId,
+                DecodeItem item => item.SequenceId,
+                _ => throw new InvalidOperationException(
+                    $"Unsupported decoder work item type {typeof(TItem).Name}.")
+            };
+
+            results[index] = new BackendStepResult(
+                sequenceId,
+                pending[index].TokenId,
+                pending[index].IsFinished);
+        }
+
+        return results;
+    }
+
     private static void ValidateStepResult(
         DecoderOrtStepResult step,
         int expectedPosition,
@@ -340,13 +422,46 @@ public sealed class DecoderOnlyOnnxExecutionAdapter :
         }
     }
 
+    private static void ValidateDistinctStateOwnership(
+        IReadOnlyList<DecoderOrtStepResult> steps)
+    {
+        var owned = new HashSet<DecoderOrtState>(ReferenceEqualityComparer.Instance);
+        foreach (var step in steps)
+        {
+            if (!owned.Add(step.State))
+            {
+                throw new InvalidOperationException(
+                    "Decoder batch returned the same physical state instance for multiple sequences.");
+            }
+        }
+    }
+
     private static void DisposeProducedStates(
         DecoderOrtStepResult[] steps,
         int count)
     {
+        var disposed = new HashSet<DecoderOrtState>(ReferenceEqualityComparer.Instance);
         for (var index = count - 1; index >= 0; index--)
         {
-            steps[index].State.Dispose();
+            var state = steps[index]?.State;
+            if (state is not null && disposed.Add(state))
+            {
+                state.Dispose();
+            }
+        }
+    }
+
+    private static void DisposeProducedStates(
+        IReadOnlyList<DecoderOrtStepResult> steps)
+    {
+        var disposed = new HashSet<DecoderOrtState>(ReferenceEqualityComparer.Instance);
+        for (var index = steps.Count - 1; index >= 0; index--)
+        {
+            var state = steps[index]?.State;
+            if (state is not null && disposed.Add(state))
+            {
+                state.Dispose();
+            }
         }
     }
 
