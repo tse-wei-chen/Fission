@@ -10,12 +10,12 @@ namespace Fission.Backends.OnnxRuntime;
 /// Dispose returns the physical array exactly once; no Memory/Span may be used
 /// after disposal.
 /// </summary>
-internal sealed class ArrayPoolLease<T> : IDisposable
+internal sealed class PooledArrayLease<T> : IDisposable
 {
     private readonly ArrayPool<T> _pool;
     private T[]? _buffer;
 
-    public ArrayPoolLease(ArrayPool<T> pool, int length)
+    public PooledArrayLease(ArrayPool<T> pool, int length)
     {
         ArgumentNullException.ThrowIfNull(pool);
         if (length < 1)
@@ -36,7 +36,7 @@ internal sealed class ArrayPoolLease<T> : IDisposable
         get
         {
             var buffer = Volatile.Read(ref _buffer)
-                ?? throw new ObjectDisposedException(nameof(ArrayPoolLease<T>));
+                ?? throw new ObjectDisposedException(nameof(PooledArrayLease<T>));
             return buffer.AsMemory(0, Length);
         }
     }
@@ -46,7 +46,7 @@ internal sealed class ArrayPoolLease<T> : IDisposable
         get
         {
             var buffer = Volatile.Read(ref _buffer)
-                ?? throw new ObjectDisposedException(nameof(ArrayPoolLease<T>));
+                ?? throw new ObjectDisposedException(nameof(PooledArrayLease<T>));
             return buffer.AsSpan(0, Length);
         }
     }
