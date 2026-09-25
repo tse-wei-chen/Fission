@@ -3,6 +3,7 @@
     <OutputType>Exe</OutputType>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="../../src/Fission.Abstractions/Fission.Abstractions.csproj" />
     <ProjectReference Include="../../src/Fission.Backends.OnnxRuntime/Fission.Backends.OnnxRuntime.csproj" />
   </ItemGroup>
 </Project>
