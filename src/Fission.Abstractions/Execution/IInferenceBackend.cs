@@ -1,9 +1,16 @@
 namespace Fission.Abstractions.Execution;
 
+/// <summary>
+/// One prefill chunk. Position, when supplied, is the number of tokens already
+/// committed for the sequence before Tokens begin. A null Position lets a
+/// stateful backend infer the continuation point from its current immutable state;
+/// stateless backends may ignore it.
+/// </summary>
 public readonly record struct PrefillItem(
     SequenceId SequenceId,
     ModelId ModelId,
-    ReadOnlyMemory<int> Tokens);
+    ReadOnlyMemory<int> Tokens,
+    int? Position = null);
 
 public readonly record struct DecodeItem(
     SequenceId SequenceId,

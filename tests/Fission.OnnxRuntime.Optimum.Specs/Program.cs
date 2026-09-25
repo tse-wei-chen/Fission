@@ -86,24 +86,18 @@ Require(!prefill.IsFinished, "Token 0 is not configured as EOS.");
 await executor.SnapshotSequenceAsync(parent, snapshot);
 await executor.ForkSequenceAsync(parent, new[] { branch });
 
-// The first branch decode must consume state.NextTokenId=0, not derive a token
-// from position. The fixture maps 0 -> 1.
 var firstBranchDecode = await executor.SubmitDecodeAsync(
     new DecodeItem(branch, modelId, Position: 1));
 Require(
     firstBranchDecode.TokenId == 1,
     "First decode must consume the sampled token frontier 0 and produce token 1.");
 
-// The next immutable state carries NextTokenId=1, so the following step maps
-// 1 -> 2 and grows present KV from length 2 to length 3.
 var secondBranchDecode = await executor.SubmitDecodeAsync(
     new DecodeItem(branch, modelId, Position: 2));
 Require(
     secondBranchDecode.TokenId == 2,
     "Second decode must consume the updated token frontier 1 and produce token 2.");
 
-// Restore must rewind both KV and the sampled token frontier to the state directly
-// after prefill. Decoding again from position 1 must therefore reproduce 0 -> 1.
 await executor.RestoreSequenceAsync(branch, snapshot);
 var restoredDecode = await executor.SubmitDecodeAsync(
     new DecodeItem(branch, modelId, Position: 1));
@@ -111,8 +105,6 @@ Require(
     restoredDecode.TokenId == 1,
     "Restore must rewind token frontier together with KV state.");
 
-// Continue 1 -> 2 -> 3. Token 3 is configured as EOS and must flow through the
-// generic BackendStepResult termination flag.
 var afterRestoreSecond = await executor.SubmitDecodeAsync(
     new DecodeItem(branch, modelId, Position: 2));
 Require(afterRestoreSecond.TokenId == 2, "Restored chain must advance 1 -> 2.");
@@ -127,8 +119,38 @@ await executor.ReleaseSnapshotAsync(snapshot);
 await executor.ReleaseSequenceAsync(parent);
 await executor.ReleaseSequenceAsync(branch);
 
-// Greedy sampler must inspect only the final sequence position, matching causal
-// generation semantics for prefill outputs shaped [B, S, V].
+// Stateful chunked prefill must append prompt tokens to the existing immutable KV
+// frontier. The second PrefillItem intentionally omits Position, matching the
+// current runtime/engine call path; the backend must infer position 1 from state.
+// The tiny fixture is scalar-sequence shaped, so each prompt chunk contains one
+// token; this still proves the second prefill does not restart from empty past KV.
+var chunked = SequenceId.New();
+var firstChunk = await executor.SubmitPrefillAsync(
+    new PrefillItem(
+        chunked,
+        modelId,
+        new ReadOnlyMemory<int>(new[] { 3 })));
+Require(firstChunk.TokenId == 0, "First prompt chunk must establish the 3 -> 0 frontier.");
+
+var secondChunk = await executor.SubmitPrefillAsync(
+    new PrefillItem(
+        chunked,
+        modelId,
+        new ReadOnlyMemory<int>(new[] { 1 })));
+Require(
+    secondChunk.TokenId == 2,
+    "Second prompt chunk must append token 1 to prior KV and establish frontier 2.");
+Require(
+    !secondChunk.IsFinished,
+    "Chunked prompt continuation ending at token 1 must not report EOS.");
+
+var afterChunkedPrefill = await executor.SubmitDecodeAsync(
+    new DecodeItem(chunked, modelId, Position: 2));
+Require(
+    afterChunkedPrefill.TokenId == 3 && afterChunkedPrefill.IsFinished,
+    "Decode after chunked prefill must consume frontier 2 and produce configured EOS token 3.");
+await executor.ReleaseSequenceAsync(chunked);
+
 var sampled = OptimumLegacyFloatDecoderBinding.GreedySampleLastPosition(
     new float[]
     {
@@ -143,4 +165,5 @@ Console.WriteLine(
     $"Fission Optimum decoder specs passed: prefill={prefill.TokenId}, " +
     $"branch={firstBranchDecode.TokenId}->{secondBranchDecode.TokenId}, " +
     $"restored={restoredDecode.TokenId}->{afterRestoreSecond.TokenId}->{eosStep.TokenId}, " +
+    $"chunked={firstChunk.TokenId}->{secondChunk.TokenId}->{afterChunkedPrefill.TokenId}, " +
     $"eos={eosStep.IsFinished}.");

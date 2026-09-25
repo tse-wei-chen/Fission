@@ -64,38 +64,89 @@ public sealed class DecoderOnlyOnnxExecutionAdapter :
                 Array.Empty<BackendStepResult>());
         }
 
+        var priorStates = new DecoderOrtState?[batch.Items.Count];
+        var normalizedItems = new PrefillItem[batch.Items.Count];
         var seen = new HashSet<SequenceId>();
-        foreach (var item in batch.Items)
+        var needsContinuationCapability = false;
+
+        for (var index = 0; index < batch.Items.Count; index++)
         {
+            var item = batch.Items[index];
             if (!seen.Add(item.SequenceId))
             {
                 throw new InvalidOperationException(
                     $"Prefill batch contains duplicate sequence {item.SequenceId}.");
             }
 
-            if (_states.TryGetSequence(item.SequenceId, out _))
+            if (item.Tokens.Length == 0)
             {
                 throw new InvalidOperationException(
-                    $"Decoder state already exists for prefill sequence {item.SequenceId}.");
+                    $"Prefill sequence {item.SequenceId} contains an empty token chunk.");
             }
+
+            if (item.Position is < 0)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(batch),
+                    $"Prefill sequence {item.SequenceId} has negative position {item.Position}.");
+            }
+
+            if (_states.TryGetSequence(item.SequenceId, out var prior))
+            {
+                var expectedPosition = item.Position ?? prior!.Position;
+                if (prior!.Position != expectedPosition)
+                {
+                    throw new InvalidOperationException(
+                        $"Prefill position mismatch for sequence {item.SequenceId}: " +
+                        $"runtime requested {expectedPosition}, backend state is {prior.Position}.");
+                }
+
+                priorStates[index] = prior;
+                normalizedItems[index] = item with { Position = expectedPosition };
+                needsContinuationCapability = true;
+            }
+            else
+            {
+                var expectedPosition = item.Position ?? 0;
+                if (expectedPosition != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Prefill sequence {item.SequenceId} requested continuation at position " +
+                        $"{expectedPosition}, but no backend decoder state exists.");
+                }
+
+                normalizedItems[index] = item with { Position = 0 };
+            }
+        }
+
+        var chunkedBinding = _binding as IDecoderOrtChunkedPrefillModelBinding;
+        if (needsContinuationCapability && chunkedBinding is null)
+        {
+            throw new NotSupportedException(
+                $"Decoder binding '{_binding.Name}' does not support chunked prefill continuation.");
         }
 
         var pending = new DecoderOrtStepResult[batch.Items.Count];
         var produced = 0;
         try
         {
-            for (var index = 0; index < batch.Items.Count; index++)
+            for (var index = 0; index < normalizedItems.Length; index++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var item = batch.Items[index];
-                var step = _binding.ExecutePrefill(
-                    session,
-                    item,
-                    cancellationToken);
+                var item = normalizedItems[index];
+                var prior = priorStates[index];
+                var step = prior is null
+                    ? _binding.ExecutePrefill(session, item, cancellationToken)
+                    : chunkedBinding!.ExecutePrefillChunk(
+                        session,
+                        item,
+                        prior,
+                        cancellationToken);
+
                 ValidateStepResult(
                     step,
-                    expectedPosition: item.Tokens.Length,
-                    priorState: null);
+                    expectedPosition: checked(item.Position!.Value + item.Tokens.Length),
+                    priorState: prior);
                 pending[index] = step;
                 produced++;
             }
@@ -108,23 +159,29 @@ public sealed class DecoderOnlyOnnxExecutionAdapter :
             throw;
         }
 
+        // All model work and state-shape validation has completed. Calls are
+        // serialized by the device actor, so the prevalidated sequence set cannot
+        // change between this point and commit.
         var committed = 0;
         try
         {
-            for (; committed < batch.Items.Count; committed++)
+            for (; committed < normalizedItems.Length; committed++)
             {
-                _states.AddSequence(
-                    batch.Items[committed].SequenceId,
-                    pending[committed].State);
+                var sequenceId = normalizedItems[committed].SequenceId;
+                if (priorStates[committed] is null)
+                {
+                    _states.AddSequence(sequenceId, pending[committed].State);
+                }
+                else
+                {
+                    _states.ReplaceSequence(sequenceId, pending[committed].State);
+                }
             }
         }
         catch
         {
-            for (var index = 0; index < committed; index++)
-            {
-                _states.ReleaseSequence(batch.Items[index].SequenceId);
-            }
-
+            // Successfully committed states are store-owned. Any state at or after
+            // the failing slot has not transferred ownership and must be released.
             for (var index = committed; index < pending.Length; index++)
             {
                 pending[index].State.Dispose();
@@ -418,7 +475,7 @@ public sealed class DecoderOnlyOnnxExecutionAdapter :
         if (priorState is not null && ReferenceEquals(step.State, priorState))
         {
             throw new InvalidOperationException(
-                "Decoder binding must return a new immutable state version for decode.");
+                "Decoder binding must return a new immutable state version for decode/prefill continuation.");
         }
     }
 
