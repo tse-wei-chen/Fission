@@ -43,3 +43,18 @@ public interface IDecoderOrtModelBinding : IDisposable
         DecoderOrtState priorState,
         CancellationToken cancellationToken = default);
 }
+
+/// <summary>
+/// Optional capability for a stateful decoder export that can append a later
+/// prompt chunk onto an existing immutable decoder state. The supplied item starts
+/// exactly at priorState.Position and must return a new state whose position is
+/// advanced by item.Tokens.Length.
+/// </summary>
+public interface IDecoderOrtChunkedPrefillModelBinding : IDecoderOrtModelBinding
+{
+    DecoderOrtStepResult ExecutePrefillChunk(
+        InferenceSession session,
+        PrefillItem item,
+        DecoderOrtState priorState,
+        CancellationToken cancellationToken = default);
+}
