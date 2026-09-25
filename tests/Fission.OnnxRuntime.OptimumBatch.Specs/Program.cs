@@ -30,9 +30,6 @@ static DecoderOrtState CreateState(
         nextTokenId: nextToken);
 }
 
-// Verify the exact ORT primitive used by cohort state splitting. Each OrtValue
-// pins only its Memory<T> slice; it must observe backing-array mutations without a
-// copy, and disposing one slice handle must not invalidate a sibling slice.
 var sliceBacking = new[] { 1f, 2f, 3f, 4f };
 using var rightSlice = OrtValue.CreateTensorValueFromMemory(
     OrtMemoryInfo.DefaultInstance,
@@ -52,11 +49,6 @@ Require(
     rightSlice.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 3f, 4f }),
     "Disposing one Memory-backed OrtValue slice must not invalidate a sibling slice.");
 
-// Batch=2 variant of the tiny decoder-shaped Optimum legacy fixture. The graph
-// appends the current token to each row's KV and maps 0->1->2->3->0 through its
-// logits table. Every graph input/output has a fixed batch dimension of two so a
-// successful run proves the concrete binding is issuing one physical batched ORT
-// invocation rather than looping over scalar sessions.
 const string BatchTwoDecoderBase64 =
     "CAcSB0Zpc3Npb246hQgKRQoMbG9naXRzX3RhYmxlCglpbnB1dF9pZHMSBmxvZ2l0cxoNZ2F0aGVyX2xvZ2l0cyIG" +
     "R2F0aGVyKgsKBGF4aXMYAKABAgoyCglpbnB1dF9pZHMSCHRva2VuXzJkGgpjYXN0X3Rva2VuIgRDYXN0KgkKAnRv" +
@@ -96,16 +88,8 @@ profile.SessionContract.Validate(session);
 var modelId = new ModelId("tiny-optimum-batch2");
 var firstId = SequenceId.New();
 var secondId = SequenceId.New();
-using var firstPrior = CreateState(
-    position: 1,
-    nextToken: 0,
-    keySeed: 30f,
-    valueSeed: 31f);
-using var secondPrior = CreateState(
-    position: 1,
-    nextToken: 1,
-    keySeed: 40f,
-    valueSeed: 41f);
+using var firstPrior = CreateState(1, 0, 30f, 31f);
+using var secondPrior = CreateState(1, 1, 40f, 41f);
 
 var decoded = binding.ExecuteDecodeBatch(
     session,
@@ -117,29 +101,50 @@ var decoded = binding.ExecuteDecodeBatch(
     new[] { firstPrior, secondPrior });
 
 Require(decoded.Count == 2, "A two-sequence cohort must return two decoder results.");
-Require(binding.OrtRunCount == 1, "A same-position two-sequence cohort must execute exactly one ORT run.");
-Require(decoded[0].TokenId == 1, "First sequence must map token frontier 0 -> 1.");
-Require(decoded[1].TokenId == 2, "Second sequence must map token frontier 1 -> 2.");
-Require(decoded[0].State.Position == 2 && decoded[1].State.Position == 2, "Both states must advance one decode position.");
-Require(decoded[0].State.NextTokenId == 1 && decoded[1].State.NextTokenId == 2, "Split states must retain their own sampled token frontiers.");
+Require(binding.OrtRunCount == 1, "A two-sequence cohort must execute one ORT run.");
+Require(binding.PastKvPackCount == 1, "External row states must be packed once to establish a cohort arena.");
+Require(binding.PastKvArenaReuseCount == 0, "The first external cohort has no reusable arena yet.");
+Require(binding.PastKvCopiedElementCount == 4, "The first 2x1x1x1 key/value frontier should copy four FP32 elements.");
+Require(decoded[0].TokenId == 1 && decoded[1].TokenId == 2, "First decode tokens must preserve row identity.");
+Require(decoded[0].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 30f, 0f }), "First row KV is incorrect.");
+Require(decoded[1].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 40f, 1f }), "Second row KV is incorrect.");
 
-var firstKey = decoded[0].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().ToArray();
-var secondKey = decoded[1].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().ToArray();
-Require(firstKey.SequenceEqual(new[] { 30f, 0f }), "First row must preserve its own past KV and append token 0.");
-Require(secondKey.SequenceEqual(new[] { 40f, 1f }), "Second row must preserve its own past KV and append token 1.");
+var decodedAgain = binding.ExecuteDecodeBatch(
+    session,
+    new[]
+    {
+        new DecodeItem(secondId, modelId, Position: 2),
+        new DecodeItem(firstId, modelId, Position: 2)
+    },
+    new[] { decoded[1].State, decoded[0].State });
 
-// Row states use independent OrtValue handles over non-overlapping slices of the
-// same batched managed output arrays. Releasing one handle must not unpin or
-// invalidate the sibling row.
-decoded[0].State.Dispose();
-Require(decoded[0].State.IsDisposed, "Disposed first split state must report terminal ownership.");
-Require(!decoded[1].State.IsDisposed, "Disposing one split state must not dispose its sibling.");
+Require(binding.OrtRunCount == 2, "Two cohort steps must execute exactly two ORT runs.");
+Require(binding.PastKvPackCount == 1, "A complete stable arena must not trigger a second past-KV pack.");
+Require(binding.PastKvArenaReuseCount == 1, "The second cohort step must reuse the complete prior arena.");
+Require(binding.PastKvCopiedElementCount == 4, "Arena reuse must not copy additional past-KV elements.");
+Require(decodedAgain[0].TokenId == 3, "Reversed request row for the second sequence must map token 2 -> 3.");
+Require(decodedAgain[1].TokenId == 2, "Reversed request row for the first sequence must map token 1 -> 2.");
 Require(
-    decoded[1].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 40f, 1f }),
-    "Second split state must remain readable after the first state is disposed.");
+    decodedAgain[0].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 40f, 1f, 2f }),
+    "Second sequence must retain stable physical row history across arena reuse.");
+Require(
+    decodedAgain[1].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 30f, 0f, 1f }),
+    "First sequence must retain stable physical row history across arena reuse.");
+
+decoded[0].State.Dispose();
 decoded[1].State.Dispose();
+Require(
+    decodedAgain[0].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 40f, 1f, 2f }),
+    "Releasing the prior arena must not invalidate the next frontier.");
+
+decodedAgain[0].State.Dispose();
+Require(!decodedAgain[1].State.IsDisposed, "Sibling row handles in the new arena must remain independently disposable.");
+Require(
+    decodedAgain[1].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 30f, 0f, 1f }),
+    "Disposing one new-arena row must not invalidate its sibling.");
+decodedAgain[1].State.Dispose();
 
 Console.WriteLine(
-    $"Fission zero-copy Optimum cohort specs passed: ortRuns={binding.OrtRunCount}, " +
-    $"tokens={decoded[0].TokenId},{decoded[1].TokenId}, " +
-    $"positions={decoded[0].State.Position},{decoded[1].State.Position}.");
+    $"Fission persistent Optimum cohort specs passed: ortRuns={binding.OrtRunCount}, " +
+    $"packs={binding.PastKvPackCount}, reuses={binding.PastKvArenaReuseCount}, " +
+    $"copiedElements={binding.PastKvCopiedElementCount}.");

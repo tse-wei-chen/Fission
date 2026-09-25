@@ -23,12 +23,31 @@ public readonly record struct DecoderOrtLayerState(
 public sealed class DecoderOrtState : IDisposable
 {
     private readonly DecoderOrtLayerState[] _layers;
+    private DecoderOrtCohortSlice? _cohortSlice;
     private int _disposed;
 
     public DecoderOrtState(
         int position,
         IReadOnlyList<DecoderOrtLayerState> layers,
         int? nextTokenId = null)
+        : this(position, layers, nextTokenId, cohortSlice: null)
+    {
+    }
+
+    internal DecoderOrtState(
+        int position,
+        IReadOnlyList<DecoderOrtLayerState> layers,
+        int? nextTokenId,
+        DecoderOrtCohortSlice cohortSlice)
+        : this(position, layers, nextTokenId, (DecoderOrtCohortSlice?)cohortSlice)
+    {
+    }
+
+    private DecoderOrtState(
+        int position,
+        IReadOnlyList<DecoderOrtLayerState> layers,
+        int? nextTokenId,
+        DecoderOrtCohortSlice? cohortSlice)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(position);
         if (nextTokenId is < 0)
@@ -84,9 +103,35 @@ public sealed class DecoderOrtState : IDisposable
             validated[index] = layer;
         }
 
+        if (cohortSlice is { } slice)
+        {
+            ArgumentNullException.ThrowIfNull(slice.Arena);
+            if (slice.Arena.Position != position)
+            {
+                throw new ArgumentException(
+                    "Decoder cohort arena position must match the state position.",
+                    nameof(cohortSlice));
+            }
+
+            if (slice.Arena.LayerCount != layers.Count)
+            {
+                throw new ArgumentException(
+                    "Decoder cohort arena layer count must match the state payload.",
+                    nameof(cohortSlice));
+            }
+
+            if (slice.Row < 0 || slice.Row >= slice.Arena.BatchSize)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(cohortSlice),
+                    "Decoder cohort row is outside the arena batch.");
+            }
+        }
+
         Position = position;
         NextTokenId = nextTokenId;
         _layers = validated;
+        _cohortSlice = cohortSlice;
     }
 
     public int Position { get; }
@@ -113,6 +158,18 @@ public sealed class DecoderOrtState : IDisposable
         return _layers[layer];
     }
 
+    internal bool TryGetCohortSlice(out DecoderOrtCohortSlice slice)
+    {
+        if (!IsDisposed && _cohortSlice is { } current)
+        {
+            slice = current;
+            return true;
+        }
+
+        slice = default;
+        return false;
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -120,13 +177,14 @@ public sealed class DecoderOrtState : IDisposable
             return;
         }
 
-        // Dispose in reverse ownership order, mirroring ORT's disposable output
-        // collection behavior and preserving dependencies if a provider ever
-        // layers value resources internally.
         for (var index = _layers.Length - 1; index >= 0; index--)
         {
             _layers[index].Value.Dispose();
             _layers[index].Key.Dispose();
         }
+
+        // A disposed state should not keep an otherwise-dead cohort arena (and
+        // therefore all sibling row backing arrays) alive until this object is GC'd.
+        _cohortSlice = null;
     }
 }
