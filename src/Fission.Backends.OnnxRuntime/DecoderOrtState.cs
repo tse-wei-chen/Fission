@@ -126,6 +126,11 @@ public sealed class DecoderOrtState : IDisposable
                     nameof(cohortSlice),
                     "Decoder cohort row is outside the arena batch.");
             }
+
+            // The arena starts with a builder reference. A state obtains its own
+            // reference only after the complete payload and slice metadata validate.
+            // From this point onward Dispose is responsible for releasing it.
+            slice.Arena.Retain();
         }
 
         Position = position;
@@ -183,8 +188,13 @@ public sealed class DecoderOrtState : IDisposable
             _layers[index].Key.Dispose();
         }
 
-        // A disposed state should not keep an otherwise-dead cohort arena (and
-        // therefore all sibling row backing arrays) alive until this object is GC'd.
-        _cohortSlice = null;
+        // OrtValue slices must be gone before the arena can possibly return its
+        // backing arrays to the pool. The final row release is the only path that
+        // transfers those arrays back to ArrayPool.
+        if (_cohortSlice is { } slice)
+        {
+            _cohortSlice = null;
+            slice.Arena.Release();
+        }
     }
 }

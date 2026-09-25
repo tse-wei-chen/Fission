@@ -1,3 +1,4 @@
+using System.Buffers;
 using Fission.Abstractions.Execution;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -11,15 +12,21 @@ namespace Fission.Backends.OnnxRuntime;
 /// Prefill supplies zero-length past KV tensors, so the bound graph must accept
 /// an empty past sequence on its with-past path. Decode batches are grouped by
 /// decoder position; every same-position cohort is executed as one [B, ...] ORT
-/// invocation. Present-KV rows become independently disposable Memory<float>
+/// invocation. Present-KV rows become independently disposable Memory&lt;float&gt;
 /// slices over a shared cohort arena. When the next decode batch contains every
 /// row from that arena exactly once, its dense past KV is reused directly instead
 /// of being gathered and copied again.
+///
+/// Batched present-KV backing buffers are rented from a binding-private ArrayPool
+/// by default. The arena returns them only after its builder reference and every
+/// row state release ownership, so a buffer is never returned while an OrtValue
+/// slice can still access it.
 /// </summary>
 public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBinding
 {
     private readonly OptimumLegacyDecoderProfile _profile;
     private readonly HashSet<int> _eosTokenIds;
+    private readonly ArrayPool<float> _cohortBufferPool;
     private int _ortRunCount;
     private int _pastKvPackCount;
     private int _pastKvArenaReuseCount;
@@ -28,7 +35,8 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
 
     public OptimumLegacyFloatDecoderBinding(
         OptimumLegacyDecoderProfile profile,
-        IEnumerable<int>? eosTokenIds = null)
+        IEnumerable<int>? eosTokenIds = null,
+        ArrayPool<float>? cohortBufferPool = null)
     {
         ArgumentNullException.ThrowIfNull(profile);
         if (profile.Geometry.KvElementType != TensorElementType.Float)
@@ -66,6 +74,7 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
         _eosTokenIds = eosTokenIds is null
             ? new HashSet<int>()
             : new HashSet<int>(eosTokenIds);
+        _cohortBufferPool = cohortBufferPool ?? ArrayPool<float>.Create();
 
         if (_eosTokenIds.Any(static token => token < 0))
         {
@@ -244,6 +253,8 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
         var outputValues = new List<OrtValue>(outputNames.Capacity);
         var ownedOutputs = new List<OrtValue>(outputNames.Capacity);
         var producedStates = new List<DecoderOrtState>(batchSize);
+        DecoderOrtCohortArena? retainedInputArena = null;
+        DecoderOrtCohortArena? nextArena = null;
 
         try
         {
@@ -303,6 +314,18 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
 
             if (execution.ReusableArena is { } reusableArena)
             {
+                // Keep an execution reference independent of row-state lifetime so
+                // even an unexpected concurrent state release cannot return the
+                // backing arrays while ORT input handles are live.
+                reusableArena.Retain();
+                retainedInputArena = reusableArena;
+
+                if (reusableArena.LogicalBufferLength != batchedPastLength)
+                {
+                    throw new InvalidOperationException(
+                        "Reusable cohort arena does not match the configured decoder geometry.");
+                }
+
                 for (var layer = 0; layer < geometry.NumHiddenLayers; layer++)
                 {
                     inputNames.Add(DecoderOnlyOnnxContract.ExpandLayerName(
@@ -312,20 +335,13 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
                         contract.PastValueNames!,
                         layer));
 
-                    var keyBuffer = reusableArena.GetKeyBuffer(layer);
-                    var valueBuffer = reusableArena.GetValueBuffer(layer);
-                    if (keyBuffer.Length != batchedPastLength ||
-                        valueBuffer.Length != batchedPastLength)
-                    {
-                        throw new InvalidOperationException(
-                            $"Reusable cohort arena layer {layer} does not match the configured decoder geometry.");
-                    }
-
                     var keyValue = OrtValue.CreateTensorValueFromMemory(
-                        keyBuffer,
+                        OrtMemoryInfo.DefaultInstance,
+                        reusableArena.GetKeyMemory(layer),
                         batchedPastShape);
                     var valueValue = OrtValue.CreateTensorValueFromMemory(
-                        valueBuffer,
+                        OrtMemoryInfo.DefaultInstance,
+                        reusableArena.GetValueMemory(layer),
                         batchedPastShape);
                     ownedInputs.Add(keyValue);
                     ownedInputs.Add(valueValue);
@@ -394,26 +410,28 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
             outputNames.Add(contract.Logits);
             outputValues.Add(logitsValue);
 
+            var nextPosition = checked(pastSequenceLength + sequenceLength);
             var presentShape = geometry.GetPresentKvShape(
                 batchSize,
                 pastSequenceLength,
                 sequenceLength);
             var presentLength = CheckedTensorLength(presentShape);
-            var presentKeyBuffers = new float[geometry.NumHiddenLayers][];
-            var presentValueBuffers = new float[geometry.NumHiddenLayers][];
+            nextArena = new DecoderOrtCohortArena(
+                nextPosition,
+                batchSize,
+                geometry.NumHiddenLayers,
+                presentLength,
+                _cohortBufferPool);
 
             for (var layer = 0; layer < geometry.NumHiddenLayers; layer++)
             {
-                var keyBuffer = new float[presentLength];
-                var valueBuffer = new float[presentLength];
-                presentKeyBuffers[layer] = keyBuffer;
-                presentValueBuffers[layer] = valueBuffer;
-
                 var key = OrtValue.CreateTensorValueFromMemory(
-                    keyBuffer,
+                    OrtMemoryInfo.DefaultInstance,
+                    nextArena.GetKeyMemory(layer),
                     presentShape);
                 var value = OrtValue.CreateTensorValueFromMemory(
-                    valueBuffer,
+                    OrtMemoryInfo.DefaultInstance,
+                    nextArena.GetValueMemory(layer),
                     presentShape);
                 ownedOutputs.Add(key);
                 ownedOutputs.Add(value);
@@ -440,12 +458,6 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
             }
             Interlocked.Increment(ref _ortRunCount);
 
-            var nextPosition = checked(pastSequenceLength + sequenceLength);
-            var nextArena = new DecoderOrtCohortArena(
-                nextPosition,
-                batchSize,
-                presentKeyBuffers,
-                presentValueBuffers);
             var perSequencePresentShape = geometry.GetPresentKvShape(
                 batchSize: 1,
                 pastSequenceLength,
@@ -466,12 +478,12 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
                     {
                         var offset = checked(row * perSequencePresentLength);
                         var key = CreateTensorSlice(
-                            presentKeyBuffers[layer],
+                            nextArena.GetKeyMemory(layer),
                             offset,
                             perSequencePresentLength,
                             perSequencePresentShape);
                         var value = CreateTensorSlice(
-                            presentValueBuffers[layer],
+                            nextArena.GetValueMemory(layer),
                             offset,
                             perSequencePresentLength,
                             perSequencePresentShape);
@@ -521,6 +533,9 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
         }
         finally
         {
+            // Full-batch output/input handles pin the same memory as the arena row
+            // slices. Dispose those handles before releasing execution/builder refs;
+            // a final Release may immediately return the underlying array to pool.
             for (var index = ownedOutputs.Count - 1; index >= 0; index--)
             {
                 ownedOutputs[index].Dispose();
@@ -530,6 +545,9 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
             {
                 ownedInputs[index].Dispose();
             }
+
+            retainedInputArena?.Release();
+            nextArena?.Release();
         }
     }
 
@@ -593,14 +611,14 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
     }
 
     private static OrtValue CreateTensorSlice(
-        float[] buffer,
+        Memory<float> buffer,
         int offset,
         int length,
         long[] shape)
     {
         return OrtValue.CreateTensorValueFromMemory(
             OrtMemoryInfo.DefaultInstance,
-            buffer.AsMemory(offset, length),
+            buffer.Slice(offset, length),
             shape);
     }
 

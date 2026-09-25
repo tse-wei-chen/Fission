@@ -28,7 +28,7 @@ For a reusable cohort frontier:
 
 1. next-token frontiers are placed into stable physical row order,
 2. `[B, 1]` `input_ids`, position ids, and the attention mask are prepared,
-3. prior arena key/value arrays are wrapped directly as batched ORT input tensors,
+3. prior arena key/value memory is wrapped directly as batched ORT input tensors,
 4. one caller-owned `InferenceSession.Run` executes the cohort,
 5. logits are sampled per physical row,
 6. a new output arena becomes the next frontier, and
@@ -38,12 +38,33 @@ The first batch formed from independent states still performs one gather/pack in
 
 `PastKvPackCount`, `PastKvArenaReuseCount`, and `PastKvCopiedElementCount` are diagnostic counters used by executable specs to keep this physical invariant testable.
 
+## Pooled output buffers
+
+Batched present-KV arrays are not allocated with `new float[...]` on every decode step. `OptimumLegacyFloatDecoderBinding` owns a private `ArrayPool<float>` by default and each new `DecoderOrtCohortArena` rents one key and one value buffer per decoder layer.
+
+`ArrayPool.Rent` may return an array whose capacity is larger than requested. The arena therefore records the logical tensor length separately, and ORT only receives `Memory<float>` covering the logical `[B, H, present, D]` element range. Physical pool capacity never changes tensor shape.
+
+The pool is binding-private rather than `ArrayPool<float>.Shared` so retained model KV is not intentionally mixed into a process-wide shared pool. Buffers are returned with `clearArray: false`; reuse stays inside the binding-owned pool. A caller may inject another `ArrayPool<float>` when it needs a different allocation/security policy or deterministic diagnostics.
+
+Pooling follows a strict lifetime rule:
+
+- a new arena starts with one builder reference,
+- every row `DecoderOrtState` retains the arena after its `OrtValue` payload validates,
+- a reusable prior arena takes a temporary execution reference while its full-batch ORT input handles exist,
+- state disposal destroys row `OrtValue` handles before releasing the arena,
+- full-batch ORT handles are destroyed before builder/execution references are released, and
+- only the final arena release returns all rented arrays to the pool.
+
+This prevents a pooled buffer from being returned while any `OrtValue` can still read or write it. Error paths follow the same rule: partial row states are disposed first, full ORT handles next, and the builder reference last.
+
+The executable Optimum batch spec injects a deterministic pool and verifies that two simultaneously live frontiers require distinct physical buffers, the last sibling row release returns an arena exactly once, and a later frontier can rent those returned arrays without another physical allocation.
+
 ## Ownership
 
-Prior states remain immutable. Row states have independent `OrtValue` handles even though their managed backing arrays are shared. Disposing one row does not invalidate sibling rows. Disposing a state also drops its arena reference so dead frontiers do not keep full cohort arrays alive unnecessarily.
+Prior states remain immutable. Row states have independent `OrtValue` handles even though their managed backing arrays are shared. Disposing one row does not invalidate sibling rows. `DecoderStateStore` may additionally share a complete `DecoderOrtState` across snapshots or forked branches; in that case the state object itself is disposed only after its final store owner releases it, so its arena reference remains valid for the complete transactional lifetime.
 
-A newly produced frontier uses new output buffers, so the complete prior arena may be released immediately after the model step once the runtime commits the new states.
+A newly produced frontier uses a different checked-out arena while the prior frontier is still an input. Once the runtime commits the new states and releases the prior states, that prior arena's buffers become eligible for pool reuse by a later decode frontier.
 
 ## Current scope
 
-This optimization targets the legacy dense Optimum decoder-with-past FP32 binding. It is not paged KV and it does not make partial cohorts zero-copy. Paged caches, recurrent/linear-attention state, mixed cache layouts, and exporter-specific tensors remain separate binding concerns.
+This optimization targets the legacy dense Optimum decoder-with-past FP32 binding. It is not paged KV and it does not make partial/fork fallback gathers zero-copy. Scalar decode outputs, step-local logits, input ids, masks, and fallback pack buffers still use ordinary managed allocations. Paged caches, recurrent/linear-attention state, mixed cache layouts, exporter-specific tensors, and device-native allocator reuse remain separate binding concerns.
