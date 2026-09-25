@@ -127,6 +127,36 @@ await executor.ReleaseSnapshotAsync(snapshot);
 await executor.ReleaseSequenceAsync(parent);
 await executor.ReleaseSequenceAsync(branch);
 
+// Stateful chunked prefill must append prompt tokens to the existing immutable KV
+// frontier. The second PrefillItem intentionally omits Position, matching the
+// current runtime/engine call path; the backend must infer position 1 from state.
+var chunked = SequenceId.New();
+var firstChunk = await executor.SubmitPrefillAsync(
+    new PrefillItem(
+        chunked,
+        modelId,
+        new ReadOnlyMemory<int>(new[] { 3 })));
+Require(firstChunk.TokenId == 0, "First prompt chunk must establish the 3 -> 0 frontier.");
+
+var secondChunk = await executor.SubmitPrefillAsync(
+    new PrefillItem(
+        chunked,
+        modelId,
+        new ReadOnlyMemory<int>(new[] { 0, 1 })));
+Require(
+    secondChunk.TokenId == 2,
+    "Second prompt chunk must append to prior KV and sample from its final prompt token 1.");
+Require(
+    !secondChunk.IsFinished,
+    "Chunked prompt continuation ending at token 1 must not report EOS.");
+
+var afterChunkedPrefill = await executor.SubmitDecodeAsync(
+    new DecodeItem(chunked, modelId, Position: 3));
+Require(
+    afterChunkedPrefill.TokenId == 3 && afterChunkedPrefill.IsFinished,
+    "Decode after chunked prefill must consume frontier 2 and produce configured EOS token 3.");
+await executor.ReleaseSequenceAsync(chunked);
+
 // Greedy sampler must inspect only the final sequence position, matching causal
 // generation semantics for prefill outputs shaped [B, S, V].
 var sampled = OptimumLegacyFloatDecoderBinding.GreedySampleLastPosition(
@@ -143,4 +173,5 @@ Console.WriteLine(
     $"Fission Optimum decoder specs passed: prefill={prefill.TokenId}, " +
     $"branch={firstBranchDecode.TokenId}->{secondBranchDecode.TokenId}, " +
     $"restored={restoredDecode.TokenId}->{afterRestoreSecond.TokenId}->{eosStep.TokenId}, " +
+    $"chunked={firstChunk.TokenId}->{secondChunk.TokenId}->{afterChunkedPrefill.TokenId}, " +
     $"eos={eosStep.IsFinished}.");
