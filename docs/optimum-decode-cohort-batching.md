@@ -18,17 +18,23 @@ For one cohort the binding:
 4. packs each sequence's past key/value tensors into `[B, H, past, D]`,
 5. performs one caller-owned `InferenceSession.Run`,
 6. samples each row's logits independently, and
-7. splits batched present-KV back into independently owned immutable sequence states.
+7. exposes each present-KV row as independently owned `OrtValue` handles over non-overlapping `Memory<float>` slices of the batched output buffers.
 
 `OrtRunCount` is a diagnostic counter used by executable specs to prove that one cohort maps to one physical ORT run.
 
-## Ownership invariant
+## Zero-copy output ownership
 
-Prior states are immutable. Batched output buffers are temporary owners only. Before returning, every sequence receives its own `OrtValue` key/value handles; disposing one returned state must not invalidate any sibling state.
+Prior states remain immutable. ONNX Runtime writes present-KV into one managed batched array per layer/key/value. After the run, Fission does **not** copy each row into a new managed array. Instead, every sequence receives its own tensor handles created over the corresponding `Memory<float>` slice of the shared backing array.
 
-The current implementation is correctness-first and copies each row from the batched present-KV buffers into per-sequence managed buffers. This avoids shared-handle lifetime ambiguity and preserves the transactional snapshot/fork/restore model.
+Each slice `OrtValue` pins its own memory region for its lifetime. The temporary full-batch output handles can therefore be disposed after state construction while the row handles remain valid. Disposing one returned state releases only that state's tensor handles; sibling rows remain readable and independently disposable.
 
-A future performance pass may replace the split copy with a ref-counted batch arena and/or ONNX Runtime I/O binding. That optimization must preserve the same independent logical ownership semantics.
+The executable Optimum batch spec validates both properties directly: mutations of a managed backing array are immediately visible through a Memory-backed `OrtValue`, and disposing one slice handle does not invalidate another slice.
+
+## Remaining copy boundary
+
+Present-KV splitting is now zero-copy, but **past-KV packing still copies**. Before each dense cohort run, independently owned prior sequence states are gathered into contiguous `[B, H, past, D]` input buffers.
+
+Eliminating that gather requires a longer-lived cohort/batch arena, stable row placement, paged/indirect KV addressing, or a backend-specific device-memory strategy. That is deliberately separate from logical snapshot/fork/restore ownership semantics.
 
 ## Current scope
 

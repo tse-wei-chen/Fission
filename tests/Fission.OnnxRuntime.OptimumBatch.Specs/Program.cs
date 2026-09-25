@@ -30,6 +30,28 @@ static DecoderOrtState CreateState(
         nextTokenId: nextToken);
 }
 
+// Verify the exact ORT primitive used by cohort state splitting. Each OrtValue
+// pins only its Memory<T> slice; it must observe backing-array mutations without a
+// copy, and disposing one slice handle must not invalidate a sibling slice.
+var sliceBacking = new[] { 1f, 2f, 3f, 4f };
+using var rightSlice = OrtValue.CreateTensorValueFromMemory(
+    OrtMemoryInfo.DefaultInstance,
+    sliceBacking.AsMemory(2, 2),
+    new long[] { 1, 1, 2, 1 });
+using (var leftSlice = OrtValue.CreateTensorValueFromMemory(
+    OrtMemoryInfo.DefaultInstance,
+    sliceBacking.AsMemory(0, 2),
+    new long[] { 1, 1, 2, 1 }))
+{
+    sliceBacking[1] = 20f;
+    Require(
+        leftSlice.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 1f, 20f }),
+        "Memory-backed OrtValue slices must observe backing-array mutations without a copy.");
+}
+Require(
+    rightSlice.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 3f, 4f }),
+    "Disposing one Memory-backed OrtValue slice must not invalidate a sibling slice.");
+
 // Batch=2 variant of the tiny decoder-shaped Optimum legacy fixture. The graph
 // appends the current token to each row's KV and maps 0->1->2->3->0 through its
 // logits table. Every graph input/output has a fixed batch dimension of two so a
@@ -106,8 +128,9 @@ var secondKey = decoded[1].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().To
 Require(firstKey.SequenceEqual(new[] { 30f, 0f }), "First row must preserve its own past KV and append token 0.");
 Require(secondKey.SequenceEqual(new[] { 40f, 1f }), "Second row must preserve its own past KV and append token 1.");
 
-// Split ownership is intentional in the first implementation: disposing one row's
-// state must not invalidate the other row's OrtValue handles.
+// Row states use independent OrtValue handles over non-overlapping slices of the
+// same batched managed output arrays. Releasing one handle must not unpin or
+// invalidate the sibling row.
 decoded[0].State.Dispose();
 Require(decoded[0].State.IsDisposed, "Disposed first split state must report terminal ownership.");
 Require(!decoded[1].State.IsDisposed, "Disposing one split state must not dispose its sibling.");
@@ -117,6 +140,6 @@ Require(
 decoded[1].State.Dispose();
 
 Console.WriteLine(
-    $"Fission Optimum cohort specs passed: ortRuns={binding.OrtRunCount}, " +
+    $"Fission zero-copy Optimum cohort specs passed: ortRuns={binding.OrtRunCount}, " +
     $"tokens={decoded[0].TokenId},{decoded[1].TokenId}, " +
     $"positions={decoded[0].State.Position},{decoded[1].State.Position}.");
