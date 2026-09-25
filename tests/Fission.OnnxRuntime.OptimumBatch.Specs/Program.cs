@@ -131,6 +131,37 @@ Require(
     decodedAgain[1].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 30f, 0f, 1f }),
     "First sequence must retain stable physical row history across arena reuse.");
 
+// Simulate a fork: two logical sequences reference the same immutable prior
+// state, so both requests carry the same arena row. Reusing the whole arena would
+// incorrectly substitute the missing sibling row. The binding must instead pack
+// both logical branches and establish a fresh two-row arena for their outputs.
+var forked = binding.ExecuteDecodeBatch(
+    session,
+    new[]
+    {
+        new DecodeItem(SequenceId.New(), modelId, Position: 3),
+        new DecodeItem(SequenceId.New(), modelId, Position: 3)
+    },
+    new[] { decodedAgain[1].State, decodedAgain[1].State });
+
+Require(binding.OrtRunCount == 3, "Fork fallback must still execute one physical ORT run.");
+Require(binding.PastKvPackCount == 2, "Duplicate arena rows must force a gather/pack fallback.");
+Require(binding.PastKvArenaReuseCount == 1, "Duplicate arena rows must not count as an arena reuse.");
+Require(binding.PastKvCopiedElementCount == 16, "Fork fallback should copy two three-token key/value rows exactly once.");
+Require(forked[0].TokenId == 3 && forked[1].TokenId == 3, "Forked branches must preserve the shared token frontier independently.");
+Require(!ReferenceEquals(forked[0].State, forked[1].State), "Fork fallback outputs must own distinct decoder state objects.");
+Require(
+    forked[0].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 30f, 0f, 1f, 2f }) &&
+    forked[1].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 30f, 0f, 1f, 2f }),
+    "Fork fallback must materialize both logical branches from the shared prior row.");
+
+forked[0].State.Dispose();
+Require(!forked[1].State.IsDisposed, "Fork fallback outputs must remain independently disposable.");
+Require(
+    forked[1].State.GetLayer(0).Key.GetTensorDataAsSpan<float>().SequenceEqual(new[] { 30f, 0f, 1f, 2f }),
+    "Disposing one fork output must not invalidate its sibling branch.");
+forked[1].State.Dispose();
+
 decoded[0].State.Dispose();
 decoded[1].State.Dispose();
 Require(
