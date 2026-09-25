@@ -175,7 +175,9 @@ using (var reader = new StreamReader(cancelledBody))
 cancelledResponse.Dispose();
 
 await WaitUntilAsync(
-    () => runtime.SequenceCount == 0 && kvPool.AllocatedPages == 0,
+    () => runtime.SequenceCount == 0 &&
+          kvPool.AllocatedPages == 0 &&
+          engine.ActiveRequestCount == 0,
     TimeSpan.FromSeconds(5));
 Require(engine.ActiveRequestCount == 0, "Client disconnect must cancel the engine request.");
 
