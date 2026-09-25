@@ -19,12 +19,14 @@ type ReadySequence =
       TokenDemand: int
       Position: int
       TokensPerKvPage: int
-      Priority: int }
+      Priority: int
+      KvBytesPerToken: int64 }
 
 type ResourceBudget =
     { MaxBatchTokens: int
       AvailableKvPages: int
-      MaxBatchSequences: int }
+      MaxBatchSequences: int
+      AvailableKvBytes: int64 }
 
 type SchedulingPolicy =
     { DecodeTokenReserve: int
@@ -37,6 +39,7 @@ type AdmissionRejectionReason =
     | InvalidKvPageSize
     | InvalidDecodeQuantum
     | InvalidKvPageDemand
+    | InvalidKvBytesPerToken
     | TokenDemandExceedsBatchCapacity
     | KvDemandExceedsCapacity
 
@@ -44,12 +47,14 @@ type DeferredReason =
     | NotRunnable
     | TokenBudget
     | KvBudget
+    | KvByteBudget
     | BatchSequenceBudget
 
 type ScheduledSequence =
     { Sequence: ReadySequence
       TokenGrant: int
-      KvPageGrant: int }
+      KvPageGrant: int
+      KvByteGrant: int64 }
 
 type DeferredSequence =
     { Sequence: ReadySequence
@@ -64,4 +69,5 @@ type SchedulingDecision =
       Deferred: DeferredSequence list
       Rejected: RejectedSequence list
       ConsumedTokens: int
-      ConsumedKvPages: int }
+      ConsumedKvPages: int
+      ConsumedKvBytes: int64 }

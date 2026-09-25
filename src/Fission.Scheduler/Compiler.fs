@@ -23,14 +23,16 @@ module ScheduleCompiler =
                     selected.TokenGrant,
                     selected.KvPageGrant,
                     selected.Sequence.Priority,
-                    completesPrefill))
+                    completesPrefill,
+                    selected.KvByteGrant))
             |> List.toArray
 
         ScheduledBatch(
             scheduleId,
             items,
             decision.ConsumedTokens,
-            decision.ConsumedKvPages)
+            decision.ConsumedKvPages,
+            decision.ConsumedKvBytes)
 
     let compileNew (decision: SchedulingDecision) =
         compile (Guid.NewGuid()) decision

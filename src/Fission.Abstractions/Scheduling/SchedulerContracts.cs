@@ -18,12 +18,14 @@ public readonly record struct SchedulingCandidate(
     int TokenDemand,
     int Position,
     int TokensPerKvPage,
-    int Priority);
+    int Priority,
+    long KvBytesPerToken = 0);
 
 public readonly record struct SchedulingBudget(
     int MaxBatchTokens,
     int AvailableKvPages,
-    int MaxBatchSequences);
+    int MaxBatchSequences,
+    long AvailableKvBytes = long.MaxValue);
 
 public readonly record struct SchedulingPolicyOptions(
     int DecodeTokenReserve,
@@ -35,6 +37,7 @@ public enum SchedulingDeferralReason
     NotRunnable,
     TokenBudget,
     KvBudget,
+    KvByteBudget,
     BatchSequenceBudget
 }
 
@@ -45,6 +48,7 @@ public enum SchedulingRejectionReason
     InvalidKvPageSize,
     InvalidDecodeQuantum,
     InvalidKvPageDemand,
+    InvalidKvBytesPerToken,
     TokenDemandExceedsBatchCapacity,
     KvDemandExceedsCapacity
 }

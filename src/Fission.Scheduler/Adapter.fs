@@ -27,13 +27,15 @@ type SchedulingKernel() =
           TokenDemand = candidate.TokenDemand
           Position = candidate.Position
           TokensPerKvPage = candidate.TokensPerKvPage
-          Priority = candidate.Priority }
+          Priority = candidate.Priority
+          KvBytesPerToken = candidate.KvBytesPerToken }
 
     let toDeferralReason reason =
         match reason with
         | NotRunnable -> SchedulingDeferralReason.NotRunnable
         | TokenBudget -> SchedulingDeferralReason.TokenBudget
         | KvBudget -> SchedulingDeferralReason.KvBudget
+        | KvByteBudget -> SchedulingDeferralReason.KvByteBudget
         | BatchSequenceBudget -> SchedulingDeferralReason.BatchSequenceBudget
 
     let toRejectionReason reason =
@@ -43,6 +45,7 @@ type SchedulingKernel() =
         | InvalidKvPageSize -> SchedulingRejectionReason.InvalidKvPageSize
         | InvalidDecodeQuantum -> SchedulingRejectionReason.InvalidDecodeQuantum
         | InvalidKvPageDemand -> SchedulingRejectionReason.InvalidKvPageDemand
+        | InvalidKvBytesPerToken -> SchedulingRejectionReason.InvalidKvBytesPerToken
         | TokenDemandExceedsBatchCapacity -> SchedulingRejectionReason.TokenDemandExceedsBatchCapacity
         | KvDemandExceedsCapacity -> SchedulingRejectionReason.KvDemandExceedsCapacity
 
@@ -51,7 +54,8 @@ type SchedulingKernel() =
             let resourceBudget : ResourceBudget =
                 { MaxBatchTokens = budget.MaxBatchTokens
                   AvailableKvPages = budget.AvailableKvPages
-                  MaxBatchSequences = budget.MaxBatchSequences }
+                  MaxBatchSequences = budget.MaxBatchSequences
+                  AvailableKvBytes = budget.AvailableKvBytes }
 
             let schedulingPolicy : SchedulingPolicy =
                 { DecodeTokenReserve = policy.DecodeTokenReserve
