@@ -36,6 +36,7 @@ type SchedulingKernel() =
         | TokenBudget -> SchedulingDeferralReason.TokenBudget
         | KvBudget -> SchedulingDeferralReason.KvBudget
         | KvByteBudget -> SchedulingDeferralReason.KvByteBudget
+        | TransientKvByteBudget -> SchedulingDeferralReason.TransientKvByteBudget
         | BatchSequenceBudget -> SchedulingDeferralReason.BatchSequenceBudget
 
     let toRejectionReason reason =
