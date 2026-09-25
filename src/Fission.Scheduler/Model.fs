@@ -48,13 +48,15 @@ type DeferredReason =
     | TokenBudget
     | KvBudget
     | KvByteBudget
+    | TransientKvByteBudget
     | BatchSequenceBudget
 
 type ScheduledSequence =
     { Sequence: ReadySequence
       TokenGrant: int
       KvPageGrant: int
-      KvByteGrant: int64 }
+      KvByteGrant: int64
+      TransientKvByteGrant: int64 }
 
 type DeferredSequence =
     { Sequence: ReadySequence
@@ -70,4 +72,5 @@ type SchedulingDecision =
       Rejected: RejectedSequence list
       ConsumedTokens: int
       ConsumedKvPages: int
-      ConsumedKvBytes: int64 }
+      ConsumedKvBytes: int64
+      ConsumedTransientKvBytes: int64 }
