@@ -8,21 +8,10 @@ namespace Fission.Backends.OnnxRuntime;
 /// <summary>
 /// Concrete causal-LM binding for the Optimum legacy decoder-with-past tensor
 /// convention, using CPU FP32 KV/logits buffers and greedy sampling.
-///
-/// Prefill supplies zero-length past KV tensors, so the bound graph must accept
-/// an empty past sequence on its with-past path. Decode batches are grouped by
-/// decoder position; every same-position cohort is executed as one [B, ...] ORT
-/// invocation. Present-KV rows become independently disposable Memory&lt;float&gt;
-/// slices over a shared cohort arena. When the next decode batch contains every
-/// row from that arena exactly once, its dense past KV is reused directly instead
-/// of being gathered and copied again.
-///
-/// Retained cohort KV and step-local scratch intentionally use separate pools.
-/// Cohort buffers follow arena ref-count ownership; transient input ids, position
-/// ids, masks, logits, and fallback packed past KV return immediately after their
-/// ORT handles are disposed at the end of the model step.
 /// </summary>
-public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBinding
+public sealed class OptimumLegacyFloatDecoderBinding :
+    IDecoderOrtBatchModelBinding,
+    IDecoderOrtChunkedPrefillModelBinding
 {
     private readonly OptimumLegacyDecoderProfile _profile;
     private readonly HashSet<int> _eosTokenIds;
@@ -111,33 +100,63 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
         ArgumentNullException.ThrowIfNull(session);
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (item.Tokens.Length == 0)
+        var startPosition = item.Position ?? 0;
+        if (startPosition != 0)
         {
             throw new InvalidOperationException(
-                "Decoder prefill requires at least one prompt token.");
+                $"Initial decoder prefill must start at position 0, not {startPosition}.");
         }
 
-        var inputIds = Array.ConvertAll(
-            item.Tokens.Span.ToArray(),
-            static token => (long)token);
-        if (inputIds.Any(static token => token < 0))
-        {
-            throw new InvalidOperationException(
-                "Decoder input token ids cannot be negative.");
-        }
-
-        var positions = new long[inputIds.Length];
-        for (var index = 0; index < positions.Length; index++)
-        {
-            positions[index] = index;
-        }
-
+        var inputIds = ConvertPromptTokens(item.Tokens);
+        var positions = CreatePositions(startPosition, inputIds.Length);
         return ExecuteStep(
             session,
             inputIds,
             positions,
             priorState: null,
             pastSequenceLength: 0,
+            cancellationToken);
+    }
+
+    public DecoderOrtStepResult ExecutePrefillChunk(
+        InferenceSession session,
+        PrefillItem item,
+        DecoderOrtState priorState,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(priorState);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (priorState.IsDisposed)
+        {
+            throw new ObjectDisposedException(
+                nameof(priorState),
+                "Prefill continuation cannot consume a disposed decoder state.");
+        }
+
+        if (priorState.LayerCount != Geometry.NumHiddenLayers)
+        {
+            throw new InvalidOperationException(
+                $"Decoder state has {priorState.LayerCount} KV layers; geometry requires {Geometry.NumHiddenLayers}.");
+        }
+
+        var startPosition = item.Position ?? priorState.Position;
+        if (startPosition != priorState.Position)
+        {
+            throw new InvalidOperationException(
+                $"Decoder prefill continuation position {startPosition} does not match prior state position {priorState.Position}.");
+        }
+
+        var inputIds = ConvertPromptTokens(item.Tokens);
+        var positions = CreatePositions(startPosition, inputIds.Length);
+        return ExecuteStep(
+            session,
+            inputIds,
+            positions,
+            priorState,
+            startPosition,
             cancellationToken);
     }
 
@@ -694,6 +713,44 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBind
         }
 
         return nextInputToken;
+    }
+
+    private static long[] ConvertPromptTokens(ReadOnlyMemory<int> tokens)
+    {
+        if (tokens.Length == 0)
+        {
+            throw new InvalidOperationException(
+                "Decoder prefill requires at least one prompt token.");
+        }
+
+        var inputIds = new long[tokens.Length];
+        var source = tokens.Span;
+        for (var index = 0; index < source.Length; index++)
+        {
+            if (source[index] < 0)
+            {
+                throw new InvalidOperationException(
+                    "Decoder input token ids cannot be negative.");
+            }
+
+            inputIds[index] = source[index];
+        }
+
+        return inputIds;
+    }
+
+    private static long[] CreatePositions(int startPosition, int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(startPosition);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(count);
+
+        var positions = new long[count];
+        for (var index = 0; index < positions.Length; index++)
+        {
+            positions[index] = checked(startPosition + index);
+        }
+
+        return positions;
     }
 
     private DecoderOrtStepResult ExecuteStep(
