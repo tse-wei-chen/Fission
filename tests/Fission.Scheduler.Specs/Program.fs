@@ -21,7 +21,8 @@ let mk sequenceId phase priority deadline enqueuedAt tokenDemand position tokens
       TokenDemand = tokenDemand
       Position = position
       TokensPerKvPage = tokensPerKvPage
-      Priority = priority }
+      Priority = priority
+      KvBytesPerToken = 0L }
 
 let policy =
     { DecodeTokenReserve = 2
@@ -31,7 +32,8 @@ let policy =
 let budget =
     { MaxBatchTokens = 8
       AvailableKvPages = 2
-      MaxBatchSequences = 3 }
+      MaxBatchSequences = 3
+      AvailableKvBytes = Int64.MaxValue }
 
 let decodeA =
     mk
@@ -94,6 +96,7 @@ require (mixedDecision.Selected[2].TokenGrant = 4) "Long prefill must be chunked
 require (mixedDecision.Selected[2].KvPageGrant = 1) "Four prefill tokens at block size four must reserve one page."
 require (mixedDecision.ConsumedTokens = 6) "Mixed scheduling token accounting is incorrect."
 require (mixedDecision.ConsumedKvPages = 2) "Mixed scheduling KV accounting is incorrect."
+require (mixedDecision.ConsumedKvBytes = 0L) "Unknown physical KV cost must not invent byte consumption."
 require (mixedDecision.Deferred.Length = 1) "Expected one deferred prefill after batch sequence capacity is reached."
 require
     (mixedDecision.Deferred.Head.Sequence.SequenceId = highPriorityPrefill.SequenceId
@@ -107,6 +110,7 @@ require (compiledBatch.ScheduleId = scheduleId) "Compiled schedule id must be pr
 require (compiledBatch.Items.Count = mixedDecision.Selected.Length) "Compiled work item count must match the selected decision."
 require (compiledBatch.ConsumedTokens = mixedDecision.ConsumedTokens) "Compiled token accounting must match the decision."
 require (compiledBatch.ConsumedKvPages = mixedDecision.ConsumedKvPages) "Compiled KV accounting must match the decision."
+require (compiledBatch.ConsumedKvBytes = mixedDecision.ConsumedKvBytes) "Compiled KV byte accounting must match the decision."
 require (compiledBatch.Items[0].Kind = ScheduledWorkKind.Decode) "First reserved decode must compile as decode work."
 require (compiledBatch.Items[1].Kind = ScheduledWorkKind.Decode) "Second reserved decode must compile as decode work."
 require (compiledBatch.Items[2].Kind = ScheduledWorkKind.Prefill) "Urgent prefill must compile as prefill work."
@@ -130,6 +134,10 @@ let invalidPageSize =
 let invalidDecodeQuantum =
     mk (sid "00000000-0000-0000-0000-000000000013") Decoding 0 None now 2 0 blockSize
 
+let invalidByteCost =
+    { mk (sid "00000000-0000-0000-0000-000000000019") Prefilling 0 None now 1 0 blockSize with
+        KvBytesPerToken = -1L }
+
 let waiting =
     mk (sid "00000000-0000-0000-0000-000000000014") Waiting 0 None now 1 0 blockSize
 
@@ -138,12 +146,15 @@ let admissionDecision =
         now
         budget
         admissionPolicy
-        [ invalidToken; invalidPosition; invalidPageSize; invalidDecodeQuantum; waiting ]
+        [ invalidToken; invalidPosition; invalidPageSize; invalidDecodeQuantum; invalidByteCost; waiting ]
 
 require admissionDecision.Selected.IsEmpty "Invalid/non-runnable work must not be selected."
-require (admissionDecision.Rejected.Length = 4) "Expected four admission rejections."
+require (admissionDecision.Rejected.Length = 5) "Expected five admission rejections."
 require (admissionDecision.Deferred.Length = 1) "Expected one non-runnable deferral."
 require (admissionDecision.Deferred.Head.Reason = NotRunnable) "Waiting work must be deferred as non-runnable."
+require
+    (admissionDecision.Rejected |> List.exists (fun item -> item.Reason = InvalidKvBytesPerToken))
+    "Negative physical KV byte cost must be rejected."
 
 let longPrefill =
     mk (sid "00000000-0000-0000-0000-000000000015") Prefilling 0 None now 100 0 blockSize
@@ -160,7 +171,8 @@ let pressurePolicy =
 let pressureBudget =
     { MaxBatchTokens = 16
       AvailableKvPages = 1
-      MaxBatchSequences = 1 }
+      MaxBatchSequences = 1
+      AvailableKvBytes = Int64.MaxValue }
 
 let pressurePrefill =
     mk (sid "00000000-0000-0000-0000-000000000016") Prefilling 0 None now 16 0 blockSize
@@ -171,10 +183,39 @@ let pressureDecision =
 require (pressureDecision.Selected.Head.TokenGrant = 4) "KV pressure must shrink a large prefill chunk to one writable page."
 require (pressureDecision.Selected.Head.KvPageGrant = 1) "KV-pressure-limited chunk must account for one page."
 
+let bytePressurePrefill =
+    { mk (sid "00000000-0000-0000-0000-000000000023") Prefilling 0 None now 16 0 blockSize with
+        KvBytesPerToken = 128L }
+
+let bytePressureBudget =
+    { MaxBatchTokens = 16
+      AvailableKvPages = 16
+      MaxBatchSequences = 1
+      AvailableKvBytes = 512L }
+
+let bytePressureDecision =
+    Scheduler.scheduleAt now bytePressureBudget pressurePolicy [ bytePressurePrefill ]
+
+require (bytePressureDecision.Selected.Head.TokenGrant = 4) "Physical KV bytes must shrink prefill to the writable token count."
+require (bytePressureDecision.Selected.Head.KvByteGrant = 512L) "Selected work must carry its admitted physical KV byte grant."
+require (bytePressureDecision.ConsumedKvBytes = 512L) "Decision must account consumed physical KV bytes."
+let bytePressureCompiled = ScheduleCompiler.compileNew bytePressureDecision
+require (bytePressureCompiled.Items[0].KvByteGrant = 512L) "Compiled work must preserve the physical KV byte grant."
+require (bytePressureCompiled.ConsumedKvBytes = 512L) "Compiled batch must preserve physical KV byte accounting."
+
+let noByteBudget =
+    { bytePressureBudget with AvailableKvBytes = 0L }
+let byteBlockedDecision =
+    Scheduler.scheduleAt now noByteBudget pressurePolicy [ bytePressurePrefill ]
+require
+    (byteBlockedDecision.Selected.IsEmpty && byteBlockedDecision.Deferred.Head.Reason = KvByteBudget)
+    "A modeled decoder must defer on physical KV byte exhaustion even when page capacity remains."
+
 let noPageBudget =
     { MaxBatchTokens = 4
       AvailableKvPages = 0
-      MaxBatchSequences = 1 }
+      MaxBatchSequences = 1
+      AvailableKvBytes = Int64.MaxValue }
 
 let decodeInsidePage =
     mk (sid "00000000-0000-0000-0000-000000000017") Decoding 0 None now 1 3 blockSize
@@ -190,7 +231,8 @@ require (boundaryDecision.Selected.IsEmpty && boundaryDecision.Deferred.Head.Rea
 let oneSlotBudget =
     { MaxBatchTokens = 4
       AvailableKvPages = 1
-      MaxBatchSequences = 1 }
+      MaxBatchSequences = 1
+      AvailableKvBytes = Int64.MaxValue }
 
 let urgentLowPriority =
     mk
@@ -262,10 +304,10 @@ require
     "Stable sequence-id tie breaking must make scheduling independent of input order."
 
 printfn
-    "Fission scheduler specs passed: selected=%d tokens=%d kv=%d rejected=%d compiled=%d pressureGrant=%d"
+    "Fission scheduler specs passed: selected=%d tokens=%d kvPages=%d kvBytes=%d rejected=%d bytePressureGrant=%d"
     mixedDecision.Selected.Length
     mixedDecision.ConsumedTokens
     mixedDecision.ConsumedKvPages
+    bytePressureDecision.ConsumedKvBytes
     admissionDecision.Rejected.Length
-    compiledBatch.Items.Count
-    pressureDecision.Selected.Head.TokenGrant
+    bytePressureDecision.Selected.Head.TokenGrant
