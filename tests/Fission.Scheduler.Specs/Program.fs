@@ -96,7 +96,8 @@ require (mixedDecision.Selected[2].TokenGrant = 4) "Long prefill must be chunked
 require (mixedDecision.Selected[2].KvPageGrant = 1) "Four prefill tokens at block size four must reserve one page."
 require (mixedDecision.ConsumedTokens = 6) "Mixed scheduling token accounting is incorrect."
 require (mixedDecision.ConsumedKvPages = 2) "Mixed scheduling KV accounting is incorrect."
-require (mixedDecision.ConsumedKvBytes = 0L) "Unknown physical KV cost must not invent byte consumption."
+require (mixedDecision.ConsumedKvBytes = 0L) "Unknown physical KV cost must not invent retained byte consumption."
+require (mixedDecision.ConsumedTransientKvBytes = 0L) "Unknown physical KV cost must not invent transient byte consumption."
 require (mixedDecision.Deferred.Length = 1) "Expected one deferred prefill after batch sequence capacity is reached."
 require
     (mixedDecision.Deferred.Head.Sequence.SequenceId = highPriorityPrefill.SequenceId
@@ -110,7 +111,8 @@ require (compiledBatch.ScheduleId = scheduleId) "Compiled schedule id must be pr
 require (compiledBatch.Items.Count = mixedDecision.Selected.Length) "Compiled work item count must match the selected decision."
 require (compiledBatch.ConsumedTokens = mixedDecision.ConsumedTokens) "Compiled token accounting must match the decision."
 require (compiledBatch.ConsumedKvPages = mixedDecision.ConsumedKvPages) "Compiled KV accounting must match the decision."
-require (compiledBatch.ConsumedKvBytes = mixedDecision.ConsumedKvBytes) "Compiled KV byte accounting must match the decision."
+require (compiledBatch.ConsumedKvBytes = mixedDecision.ConsumedKvBytes) "Compiled retained KV byte accounting must match the decision."
+require (compiledBatch.ConsumedTransientKvBytes = mixedDecision.ConsumedTransientKvBytes) "Compiled transient KV byte accounting must match the decision."
 require (compiledBatch.Items[0].Kind = ScheduledWorkKind.Decode) "First reserved decode must compile as decode work."
 require (compiledBatch.Items[1].Kind = ScheduledWorkKind.Decode) "Second reserved decode must compile as decode work."
 require (compiledBatch.Items[2].Kind = ScheduledWorkKind.Prefill) "Urgent prefill must compile as prefill work."
@@ -197,11 +199,15 @@ let bytePressureDecision =
     Scheduler.scheduleAt now bytePressureBudget pressurePolicy [ bytePressurePrefill ]
 
 require (bytePressureDecision.Selected.Head.TokenGrant = 4) "Physical KV bytes must shrink prefill to the writable token count."
-require (bytePressureDecision.Selected.Head.KvByteGrant = 512L) "Selected work must carry its admitted physical KV byte grant."
-require (bytePressureDecision.ConsumedKvBytes = 512L) "Decision must account consumed physical KV bytes."
+require (bytePressureDecision.Selected.Head.KvByteGrant = 512L) "Selected work must carry its retained physical KV byte grant."
+require (bytePressureDecision.Selected.Head.TransientKvByteGrant = 512L) "Initial prefill successor frontier should reserve the same 512 bytes."
+require (bytePressureDecision.ConsumedKvBytes = 512L) "Decision must account consumed retained physical KV bytes."
+require (bytePressureDecision.ConsumedTransientKvBytes = 512L) "Decision must account consumed transient successor bytes."
 let bytePressureCompiled = ScheduleCompiler.compileNew bytePressureDecision
-require (bytePressureCompiled.Items[0].KvByteGrant = 512L) "Compiled work must preserve the physical KV byte grant."
-require (bytePressureCompiled.ConsumedKvBytes = 512L) "Compiled batch must preserve physical KV byte accounting."
+require (bytePressureCompiled.Items[0].KvByteGrant = 512L) "Compiled work must preserve the retained physical KV byte grant."
+require (bytePressureCompiled.Items[0].TransientKvByteGrant = 512L) "Compiled work must preserve transient successor byte grant."
+require (bytePressureCompiled.ConsumedKvBytes = 512L) "Compiled batch must preserve retained physical KV byte accounting."
+require (bytePressureCompiled.ConsumedTransientKvBytes = 512L) "Compiled batch must preserve transient physical KV byte accounting."
 
 let noByteBudget =
     { bytePressureBudget with AvailableKvBytes = 0L }
@@ -209,7 +215,37 @@ let byteBlockedDecision =
     Scheduler.scheduleAt now noByteBudget pressurePolicy [ bytePressurePrefill ]
 require
     (byteBlockedDecision.Selected.IsEmpty && byteBlockedDecision.Deferred.Head.Reason = KvByteBudget)
-    "A modeled decoder must defer on physical KV byte exhaustion even when page capacity remains."
+    "A modeled decoder must defer on retained KV byte exhaustion even when page capacity remains."
+
+// Immutable-state overlap: incremental retained growth can fit while the complete
+// successor frontier cannot coexist with the prior state. Position 3 plus one new
+// token produces a 4-token successor (512 bytes) and is admissible. Position 4
+// would produce a 5-token successor (640 bytes) and must defer despite requiring
+// only 128 retained bytes after the old state is released.
+let transientFits =
+    { mk (sid "00000000-0000-0000-0000-000000000024") Decoding 0 None now 1 3 blockSize with
+        KvBytesPerToken = 128L }
+let transientBlocked =
+    { mk (sid "00000000-0000-0000-0000-000000000025") Decoding 0 None now 1 4 blockSize with
+        KvBytesPerToken = 128L }
+let transientBudget =
+    { MaxBatchTokens = 1
+      AvailableKvPages = 16
+      MaxBatchSequences = 1
+      AvailableKvBytes = 512L }
+
+let transientFitsDecision =
+    Scheduler.scheduleAt now transientBudget admissionPolicy [ transientFits ]
+require (transientFitsDecision.Selected.Length = 1) "A successor frontier equal to physical byte slack must be admitted."
+require (transientFitsDecision.Selected.Head.KvByteGrant = 128L) "Decode retained growth should remain one token."
+require (transientFitsDecision.Selected.Head.TransientKvByteGrant = 512L) "Decode must reserve the complete four-token successor frontier."
+
+let transientBlockedDecision =
+    Scheduler.scheduleAt now transientBudget admissionPolicy [ transientBlocked ]
+require transientBlockedDecision.Selected.IsEmpty "A successor frontier larger than physical byte slack must not be selected."
+require
+    (transientBlockedDecision.Deferred.Head.Reason = TransientKvByteBudget)
+    "Immutable successor overlap must report TransientKvByteBudget rather than incremental retained pressure."
 
 let noPageBudget =
     { MaxBatchTokens = 4
@@ -304,10 +340,11 @@ require
     "Stable sequence-id tie breaking must make scheduling independent of input order."
 
 printfn
-    "Fission scheduler specs passed: selected=%d tokens=%d kvPages=%d kvBytes=%d rejected=%d bytePressureGrant=%d"
+    "Fission scheduler specs passed: selected=%d tokens=%d kvPages=%d kvBytes=%d transientKvBytes=%d rejected=%d bytePressureGrant=%d"
     mixedDecision.Selected.Length
     mixedDecision.ConsumedTokens
     mixedDecision.ConsumedKvPages
     bytePressureDecision.ConsumedKvBytes
+    transientFitsDecision.ConsumedTransientKvBytes
     admissionDecision.Rejected.Length
     bytePressureDecision.Selected.Head.TokenGrant
