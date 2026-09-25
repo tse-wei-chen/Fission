@@ -1,3 +1,4 @@
+using System.Buffers;
 using Fission.Abstractions;
 using Fission.Abstractions.Execution;
 using Fission.Backends.OnnxRuntime;
@@ -62,7 +63,7 @@ const string BatchTwoDecoderBase64 =
     "bGUqHQgBCAEIAQgBEAEiBAAAQEBCC3ZhbHVlX3NjYWxlWhsKCWlucHV0X2lkcxIOCgwIBxIICgIIAgoCCAFaNQoO" +
     "YXR0ZW50aW9uX21hc2sSIwohCAcSHQoCCAIKFxIVdG90YWxfc2VxdWVuY2VfbGVuZ3RoWh4KDHBvc2l0aW9uX2lk" +
     "cxIOCgwIBxIICgIIAgoCCAFaQwoVcGFzdF9rZXlfdmFsdWVzLjAua2V5EioKKAgBEiQKAggCCgIIAQoWEhRwYXN0" +
-    "X3NlcXVlbmNlX2xlbmd0aAoCCAFaRQoXcGFzdF9rZXlfdmFsdWVzLjAudmFsdWUSKgooCAESJAoCCAIKAggBChYS" +
+    "X3NlcXVlbmNlX2xlbmd0aAoCCAFaRQoXcGFzdF9rZXlfdmFsdWUSKgooCAESJAoCCAIKAggBChYS" +
     "FHBhc3Rfc2VxdWVuY2VfbGVuZ3RoCgIIAWIcCgZsb2dpdHMSEgoQCAESDAoCCAIKAggBCgIIBGI+Cg1wcmVzZW50" +
     "LjAua2V5Ei0KKwgBEicKAggCCgIIAQoZEhdwcmVzZW50X3NlcXVlbmNlX2xlbmd0aAoCCAFiQAoPcHJlc2VudC4w" +
     "LnZhbHVlEi0KKwgBEicKAggCCgIIAQoZEhdwcmVzZW50X3NlcXVlbmNlX2xlbmd0aAoCCAFCBAoAEAs=";
@@ -175,7 +176,140 @@ Require(
     "Disposing one new-arena row must not invalidate its sibling.");
 decodedAgain[1].State.Dispose();
 
+// Verify pooled output ownership independently from the semantic cohort tests.
+// The pool deliberately returns 64-element arrays for every tiny KV request so a
+// frontier returned after step two can satisfy the larger logical tensor needed by
+// step three. Exact Memory<T> slicing in the binding keeps ORT shapes independent
+// from rented array capacity.
+var bufferPool = new ReusingFloatPool(bufferLength: 64);
+using var pooledBinding = new OptimumLegacyFloatDecoderBinding(
+    profile,
+    cohortBufferPool: bufferPool);
+using var pooledFirstPrior = CreateState(1, 0, 50f, 51f);
+using var pooledSecondPrior = CreateState(1, 1, 60f, 61f);
+var pooledFirstId = SequenceId.New();
+var pooledSecondId = SequenceId.New();
+
+var pooledFirst = pooledBinding.ExecuteDecodeBatch(
+    session,
+    new[]
+    {
+        new DecodeItem(pooledFirstId, modelId, Position: 1),
+        new DecodeItem(pooledSecondId, modelId, Position: 1)
+    },
+    new[] { pooledFirstPrior, pooledSecondPrior });
+Require(bufferPool.RentCount == 2 && bufferPool.AllocationCount == 2, "First pooled frontier must rent two newly allocated key/value buffers.");
+Require(bufferPool.ReturnCount == 0, "Live pooled row states must keep their arena buffers rented.");
+
+var pooledSecond = pooledBinding.ExecuteDecodeBatch(
+    session,
+    new[]
+    {
+        new DecodeItem(pooledFirstId, modelId, Position: 2),
+        new DecodeItem(pooledSecondId, modelId, Position: 2)
+    },
+    new[] { pooledFirst[0].State, pooledFirst[1].State });
+Require(bufferPool.RentCount == 4 && bufferPool.AllocationCount == 4, "Second frontier must rent another pair while the first frontier is still live.");
+Require(bufferPool.ReturnCount == 0, "Prior arena buffers cannot return while row states still own them.");
+
+pooledFirst[0].State.Dispose();
+Require(bufferPool.ReturnCount == 0, "One live sibling row must retain the complete pooled arena.");
+pooledFirst[1].State.Dispose();
+Require(bufferPool.ReturnCount == 2, "The final row release must return both layer buffers exactly once.");
+
+var pooledThird = pooledBinding.ExecuteDecodeBatch(
+    session,
+    new[]
+    {
+        new DecodeItem(pooledFirstId, modelId, Position: 3),
+        new DecodeItem(pooledSecondId, modelId, Position: 3)
+    },
+    new[] { pooledSecond[0].State, pooledSecond[1].State });
+Require(bufferPool.RentCount == 6, "Three cohort frontiers must perform six key/value rents for one layer.");
+Require(bufferPool.AllocationCount == 4, "Third frontier must reuse the two buffers returned by the first frontier.");
+Require(bufferPool.ReuseCount == 2, "Third frontier must observe two physical buffer reuses.");
+Require(pooledBinding.OrtRunCount == 3, "Pooled backing storage must not change physical ORT run count.");
+Require(pooledThird[0].State.Position == 4 && pooledThird[1].State.Position == 4, "Pooled frontier states must advance normally.");
+
+pooledSecond[0].State.Dispose();
+pooledSecond[1].State.Dispose();
+Require(bufferPool.ReturnCount == 4, "Releasing the second frontier must return its two buffers.");
+pooledThird[0].State.Dispose();
+Require(bufferPool.ReturnCount == 4, "One third-frontier sibling must keep reused buffers checked out.");
+pooledThird[1].State.Dispose();
+Require(bufferPool.ReturnCount == 6, "All three pooled frontiers must balance six rents with six returns.");
+
 Console.WriteLine(
     $"Fission persistent Optimum cohort specs passed: ortRuns={binding.OrtRunCount}, " +
     $"packs={binding.PastKvPackCount}, reuses={binding.PastKvArenaReuseCount}, " +
-    $"copiedElements={binding.PastKvCopiedElementCount}.");
+    $"copiedElements={binding.PastKvCopiedElementCount}, " +
+    $"poolAllocations={bufferPool.AllocationCount}, poolReuses={bufferPool.ReuseCount}.");
+
+sealed class ReusingFloatPool : ArrayPool<float>
+{
+    private readonly object _gate = new();
+    private readonly Stack<float[]> _available = new();
+    private readonly HashSet<float[]> _availableSet = new(ReferenceEqualityComparer.Instance);
+    private readonly int _bufferLength;
+
+    public ReusingFloatPool(int bufferLength)
+    {
+        if (bufferLength < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(bufferLength));
+        }
+
+        _bufferLength = bufferLength;
+    }
+
+    public int RentCount { get; private set; }
+    public int ReturnCount { get; private set; }
+    public int AllocationCount { get; private set; }
+    public int ReuseCount { get; private set; }
+
+    public override float[] Rent(int minimumLength)
+    {
+        if (minimumLength < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(minimumLength));
+        }
+
+        lock (_gate)
+        {
+            RentCount++;
+            if (_available.Count > 0)
+            {
+                var reused = _available.Pop();
+                _availableSet.Remove(reused);
+                if (reused.Length >= minimumLength)
+                {
+                    ReuseCount++;
+                    return reused;
+                }
+            }
+
+            AllocationCount++;
+            return new float[Math.Max(_bufferLength, minimumLength)];
+        }
+    }
+
+    public override void Return(float[] array, bool clearArray = false)
+    {
+        ArgumentNullException.ThrowIfNull(array);
+        lock (_gate)
+        {
+            if (!_availableSet.Add(array))
+            {
+                throw new InvalidOperationException("The same pooled buffer was returned more than once.");
+            }
+
+            if (clearArray)
+            {
+                Array.Clear(array);
+            }
+
+            ReturnCount++;
+            _available.Push(array);
+        }
+    }
+}
