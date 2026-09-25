@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using System.Threading.Channels;
 using Fission.Abstractions;
 using Fission.Abstractions.Execution;
@@ -228,8 +229,48 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         }
 
         _queue.Writer.TryComplete();
-        await _pump.ConfigureAwait(false);
-        await _backend.DisposeAsync().ConfigureAwait(false);
+
+        ExceptionDispatchInfo? pumpFailure = null;
+        ExceptionDispatchInfo? backendDisposeFailure = null;
+
+        try
+        {
+            await _pump.ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            pumpFailure = ExceptionDispatchInfo.Capture(exception);
+        }
+
+        try
+        {
+            await _backend.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            backendDisposeFailure = ExceptionDispatchInfo.Capture(exception);
+        }
+
+        if (pumpFailure is not null && backendDisposeFailure is not null)
+        {
+            throw new AggregateException(
+                "Device actor and backend disposal both failed.",
+                new[]
+                {
+                    pumpFailure.SourceException,
+                    backendDisposeFailure.SourceException
+                });
+        }
+
+        if (pumpFailure is not null)
+        {
+            pumpFailure.Throw();
+        }
+
+        if (backendDisposeFailure is not null)
+        {
+            backendDisposeFailure.Throw();
+        }
     }
 
     private abstract class PendingWork
