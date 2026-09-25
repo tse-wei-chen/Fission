@@ -12,11 +12,16 @@ namespace Fission.Backends.OnnxRuntime;
 /// bound ONNX graph must accept an empty past sequence on its with-past path.
 /// Graphs that require a distinct no-past prefill session need a dual-session
 /// binding and are intentionally outside this first implementation.
+///
+/// Decode batches are grouped by decoder position. Every same-position cohort is
+/// packed into one [B, ...] ONNX Runtime invocation, then the batched present-KV
+/// outputs are split into independently owned immutable DecoderOrtState objects.
 /// </summary>
-public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtModelBinding
+public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtBatchModelBinding
 {
     private readonly OptimumLegacyDecoderProfile _profile;
     private readonly HashSet<int> _eosTokenIds;
+    private int _ortRunCount;
     private int _disposed;
 
     public OptimumLegacyFloatDecoderBinding(
@@ -71,6 +76,7 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtModelBinding
     public string Name => "optimum-legacy-fp32-greedy";
     public OnnxSessionContract SessionContract => _profile.SessionContract;
     public DecoderOrtGeometry Geometry => _profile.Geometry;
+    public int OrtRunCount => Volatile.Read(ref _ortRunCount);
 
     public DecoderOrtStepResult ExecutePrefill(
         InferenceSession session,
@@ -122,6 +128,360 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtModelBinding
         ArgumentNullException.ThrowIfNull(priorState);
         cancellationToken.ThrowIfCancellationRequested();
 
+        var nextInputToken = ValidateDecodeState(item, priorState);
+        return ExecuteStep(
+            session,
+            new long[] { nextInputToken },
+            new long[] { item.Position },
+            priorState,
+            item.Position,
+            cancellationToken);
+    }
+
+    public IReadOnlyList<DecoderOrtStepResult> ExecuteDecodeBatch(
+        InferenceSession session,
+        IReadOnlyList<DecodeItem> items,
+        IReadOnlyList<DecoderOrtState> priorStates,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(items);
+        ArgumentNullException.ThrowIfNull(priorStates);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (items.Count != priorStates.Count)
+        {
+            throw new ArgumentException(
+                $"Decode batch contains {items.Count} items but {priorStates.Count} prior states.",
+                nameof(priorStates));
+        }
+
+        if (items.Count == 0)
+        {
+            return Array.Empty<DecoderOrtStepResult>();
+        }
+
+        var cohorts = new SortedDictionary<int, List<int>>();
+        for (var index = 0; index < items.Count; index++)
+        {
+            _ = ValidateDecodeState(items[index], priorStates[index]);
+            if (!cohorts.TryGetValue(items[index].Position, out var indices))
+            {
+                indices = new List<int>();
+                cohorts.Add(items[index].Position, indices);
+            }
+
+            indices.Add(index);
+        }
+
+        var results = new DecoderOrtStepResult[items.Count];
+        var producedStates = new List<DecoderOrtState>(items.Count);
+        try
+        {
+            foreach (var cohort in cohorts.Values)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var produced = ExecuteDecodeCohort(
+                    session,
+                    items,
+                    priorStates,
+                    cohort,
+                    cancellationToken);
+
+                for (var cohortIndex = 0; cohortIndex < cohort.Count; cohortIndex++)
+                {
+                    var itemIndex = cohort[cohortIndex];
+                    results[itemIndex] = produced[cohortIndex];
+                    producedStates.Add(produced[cohortIndex].State);
+                }
+            }
+
+            return results;
+        }
+        catch
+        {
+            for (var index = producedStates.Count - 1; index >= 0; index--)
+            {
+                producedStates[index].Dispose();
+            }
+
+            throw;
+        }
+    }
+
+    private DecoderOrtStepResult[] ExecuteDecodeCohort(
+        InferenceSession session,
+        IReadOnlyList<DecodeItem> items,
+        IReadOnlyList<DecoderOrtState> priorStates,
+        IReadOnlyList<int> cohort,
+        CancellationToken cancellationToken)
+    {
+        if (cohort.Count == 0)
+        {
+            return Array.Empty<DecoderOrtStepResult>();
+        }
+
+        var geometry = Geometry;
+        var contract = _profile.Contract;
+        var batchSize = cohort.Count;
+        const int sequenceLength = 1;
+        var pastSequenceLength = items[cohort[0]].Position;
+        var inputNames = new List<string>(3 + geometry.NumHiddenLayers * 2);
+        var inputValues = new List<OrtValue>(inputNames.Capacity);
+        var ownedInputs = new List<OrtValue>();
+        var outputNames = new List<string>(1 + geometry.NumHiddenLayers * 2);
+        var outputValues = new List<OrtValue>(outputNames.Capacity);
+        var ownedOutputs = new List<OrtValue>(outputNames.Capacity);
+        var producedStates = new List<DecoderOrtState>(batchSize);
+
+        try
+        {
+            var inputIds = new long[batchSize];
+            var positionIds = new long[batchSize];
+            for (var row = 0; row < batchSize; row++)
+            {
+                var itemIndex = cohort[row];
+                var item = items[itemIndex];
+                var priorState = priorStates[itemIndex];
+                if (item.Position != pastSequenceLength)
+                {
+                    throw new InvalidOperationException(
+                        "Decode cohort contains more than one past sequence length.");
+                }
+
+                inputIds[row] = ValidateDecodeState(item, priorState);
+                positionIds[row] = item.Position;
+            }
+
+            var inputIdsShape = geometry.GetInputIdsShape(batchSize, sequenceLength);
+            var inputIdsValue = OrtValue.CreateTensorValueFromMemory(
+                inputIds,
+                inputIdsShape);
+            ownedInputs.Add(inputIdsValue);
+            inputNames.Add(contract.InputIds);
+            inputValues.Add(inputIdsValue);
+
+            var attentionMaskShape = geometry.GetAttentionMaskShape(
+                batchSize,
+                pastSequenceLength,
+                sequenceLength);
+            var attentionMask = new long[CheckedTensorLength(attentionMaskShape)];
+            Array.Fill(attentionMask, 1L);
+            var attentionMaskValue = OrtValue.CreateTensorValueFromMemory(
+                attentionMask,
+                attentionMaskShape);
+            ownedInputs.Add(attentionMaskValue);
+            inputNames.Add(contract.AttentionMask!);
+            inputValues.Add(attentionMaskValue);
+
+            var positionIdsValue = OrtValue.CreateTensorValueFromMemory(
+                positionIds,
+                geometry.GetPositionIdsShape(batchSize, sequenceLength));
+            ownedInputs.Add(positionIdsValue);
+            inputNames.Add(contract.PositionIds!);
+            inputValues.Add(positionIdsValue);
+
+            var perSequencePastShape = geometry.GetPastKvShape(
+                batchSize: 1,
+                pastSequenceLength);
+            var perSequencePastLength = CheckedTensorLength(perSequencePastShape);
+
+            for (var layer = 0; layer < geometry.NumHiddenLayers; layer++)
+            {
+                inputNames.Add(DecoderOnlyOnnxContract.ExpandLayerName(
+                    contract.PastKeyNames!,
+                    layer));
+                inputNames.Add(DecoderOnlyOnnxContract.ExpandLayerName(
+                    contract.PastValueNames!,
+                    layer));
+
+                var batchedPastShape = geometry.GetPastKvShape(
+                    batchSize,
+                    pastSequenceLength);
+                var keyBuffer = new float[CheckedTensorLength(batchedPastShape)];
+                var valueBuffer = new float[keyBuffer.Length];
+
+                for (var row = 0; row < batchSize; row++)
+                {
+                    var priorLayer = priorStates[cohort[row]].GetLayer(layer);
+                    var priorKey = priorLayer.Key.GetTensorDataAsSpan<float>();
+                    var priorValue = priorLayer.Value.GetTensorDataAsSpan<float>();
+                    if (priorKey.Length != perSequencePastLength ||
+                        priorValue.Length != perSequencePastLength)
+                    {
+                        throw new InvalidOperationException(
+                            $"Decoder state layer {layer} has a KV payload size that does not match " +
+                            $"position {pastSequenceLength} and the configured geometry.");
+                    }
+
+                    var offset = checked(row * perSequencePastLength);
+                    priorKey.CopyTo(keyBuffer.AsSpan(offset, perSequencePastLength));
+                    priorValue.CopyTo(valueBuffer.AsSpan(offset, perSequencePastLength));
+                }
+
+                var keyValue = OrtValue.CreateTensorValueFromMemory(
+                    keyBuffer,
+                    batchedPastShape);
+                var valueValue = OrtValue.CreateTensorValueFromMemory(
+                    valueBuffer,
+                    batchedPastShape);
+                ownedInputs.Add(keyValue);
+                ownedInputs.Add(valueValue);
+                inputValues.Add(keyValue);
+                inputValues.Add(valueValue);
+            }
+
+            var logitsShape = geometry.GetLogitsShape(batchSize, sequenceLength);
+            var logits = new float[CheckedTensorLength(logitsShape)];
+            var logitsValue = OrtValue.CreateTensorValueFromMemory(
+                logits,
+                logitsShape);
+            ownedOutputs.Add(logitsValue);
+            outputNames.Add(contract.Logits);
+            outputValues.Add(logitsValue);
+
+            var presentShape = geometry.GetPresentKvShape(
+                batchSize,
+                pastSequenceLength,
+                sequenceLength);
+            var presentLength = CheckedTensorLength(presentShape);
+            var presentKeyBuffers = new float[geometry.NumHiddenLayers][];
+            var presentValueBuffers = new float[geometry.NumHiddenLayers][];
+
+            for (var layer = 0; layer < geometry.NumHiddenLayers; layer++)
+            {
+                var keyBuffer = new float[presentLength];
+                var valueBuffer = new float[presentLength];
+                presentKeyBuffers[layer] = keyBuffer;
+                presentValueBuffers[layer] = valueBuffer;
+
+                var key = OrtValue.CreateTensorValueFromMemory(
+                    keyBuffer,
+                    presentShape);
+                var value = OrtValue.CreateTensorValueFromMemory(
+                    valueBuffer,
+                    presentShape);
+                ownedOutputs.Add(key);
+                ownedOutputs.Add(value);
+                outputNames.Add(DecoderOnlyOnnxContract.ExpandLayerName(
+                    contract.PresentKeyNames!,
+                    layer));
+                outputNames.Add(DecoderOnlyOnnxContract.ExpandLayerName(
+                    contract.PresentValueNames!,
+                    layer));
+                outputValues.Add(key);
+                outputValues.Add(value);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            using (var runOptions = new RunOptions())
+            {
+                CallerOwnedOrtRun.Execute(
+                    session,
+                    runOptions,
+                    inputNames,
+                    inputValues,
+                    outputNames,
+                    outputValues);
+            }
+            Interlocked.Increment(ref _ortRunCount);
+
+            var perSequencePresentShape = geometry.GetPresentKvShape(
+                batchSize: 1,
+                pastSequenceLength,
+                sequenceLength);
+            var perSequencePresentLength = CheckedTensorLength(perSequencePresentShape);
+            var perSequenceLogitsLength = CheckedTensorLength(
+                geometry.GetLogitsShape(batchSize: 1, sequenceLength));
+            var results = new DecoderOrtStepResult[batchSize];
+
+            for (var row = 0; row < batchSize; row++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var rowOwnedValues = new List<OrtValue>(geometry.NumHiddenLayers * 2);
+                try
+                {
+                    var nextLayers = new DecoderOrtLayerState[geometry.NumHiddenLayers];
+                    for (var layer = 0; layer < geometry.NumHiddenLayers; layer++)
+                    {
+                        var offset = checked(row * perSequencePresentLength);
+                        var keyBuffer = new float[perSequencePresentLength];
+                        var valueBuffer = new float[perSequencePresentLength];
+                        presentKeyBuffers[layer]
+                            .AsSpan(offset, perSequencePresentLength)
+                            .CopyTo(keyBuffer);
+                        presentValueBuffers[layer]
+                            .AsSpan(offset, perSequencePresentLength)
+                            .CopyTo(valueBuffer);
+
+                        var key = OrtValue.CreateTensorValueFromMemory(
+                            keyBuffer,
+                            perSequencePresentShape);
+                        var value = OrtValue.CreateTensorValueFromMemory(
+                            valueBuffer,
+                            perSequencePresentShape);
+                        rowOwnedValues.Add(key);
+                        rowOwnedValues.Add(value);
+                        nextLayers[layer] = new DecoderOrtLayerState(key, value);
+                    }
+
+                    var logitsOffset = checked(row * perSequenceLogitsLength);
+                    var tokenId = GreedySampleLastPosition(
+                        logits.AsSpan(logitsOffset, perSequenceLogitsLength),
+                        sequenceLength,
+                        geometry.VocabularySize);
+                    var state = new DecoderOrtState(
+                        checked(pastSequenceLength + sequenceLength),
+                        nextLayers,
+                        nextTokenId: tokenId);
+                    rowOwnedValues.Clear();
+                    producedStates.Add(state);
+                    results[row] = new DecoderOrtStepResult(
+                        tokenId,
+                        state,
+                        _eosTokenIds.Contains(tokenId));
+                }
+                catch
+                {
+                    for (var index = rowOwnedValues.Count - 1; index >= 0; index--)
+                    {
+                        rowOwnedValues[index].Dispose();
+                    }
+
+                    throw;
+                }
+            }
+
+            return results;
+        }
+        catch
+        {
+            for (var index = producedStates.Count - 1; index >= 0; index--)
+            {
+                producedStates[index].Dispose();
+            }
+
+            throw;
+        }
+        finally
+        {
+            for (var index = ownedOutputs.Count - 1; index >= 0; index--)
+            {
+                ownedOutputs[index].Dispose();
+            }
+
+            for (var index = ownedInputs.Count - 1; index >= 0; index--)
+            {
+                ownedInputs[index].Dispose();
+            }
+        }
+    }
+
+    private int ValidateDecodeState(
+        DecodeItem item,
+        DecoderOrtState priorState)
+    {
         if (priorState.IsDisposed)
         {
             throw new ObjectDisposedException(
@@ -147,13 +507,7 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtModelBinding
                 "Decoder state is missing its next-token frontier.");
         }
 
-        return ExecuteStep(
-            session,
-            new long[] { nextInputToken },
-            new long[] { item.Position },
-            priorState,
-            item.Position,
-            cancellationToken);
+        return nextInputToken;
     }
 
     private DecoderOrtStepResult ExecuteStep(
@@ -286,6 +640,7 @@ public sealed class OptimumLegacyFloatDecoderBinding : IDecoderOrtModelBinding
                     outputNames,
                     outputValues);
             }
+            Interlocked.Increment(ref _ortRunCount);
 
             var tokenId = GreedySampleLastPosition(
                 logits,
