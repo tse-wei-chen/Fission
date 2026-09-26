@@ -16,6 +16,9 @@ namespace Fission.Runtime.Execution;
 /// one logical scheduling batch reaches the actor with deterministic membership.
 /// Inference capacity is accounted by item credits rather than channel entries,
 /// so an N-item envelope consumes the same bounded capacity as N scalar submits.
+/// Caller cancellation may withdraw work only before queue acceptance; once a
+/// device operation is accepted, its terminal result is observed so runtime and
+/// backend state advance at the same transaction boundary.
 /// </summary>
 public sealed class ContinuousBatchExecutor : IAsyncDisposable
 {
@@ -142,7 +145,7 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
             }
         }
 
-        return await work.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return await work.Completion.Task.ConfigureAwait(false);
     }
 
     private async ValueTask SubmitControlAsync(
@@ -151,7 +154,7 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
-        await work.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await work.Completion.Task.ConfigureAwait(false);
     }
 
     private async Task PumpAsync()
