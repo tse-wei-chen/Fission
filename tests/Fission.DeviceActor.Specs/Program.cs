@@ -232,10 +232,61 @@ await using (var atomicDevice = await ContinuousBatchExecutor.CreateAsync(
         "Mixed scheduled envelope must preserve the final decode after the prefill segment.");
 }
 
+// Oversized scheduler envelopes are rejected before any one-step runtime plan is
+// launched. This keeps runtime metadata/KV/backend state untouched when the
+// scheduler/device capacity contract is misconfigured.
+var preflightBackend = new RecordingBackend(new DeviceId("cpu:capacity-preflight"));
+await using (var preflightDevice = await ContinuousBatchExecutor.CreateAsync(
+    preflightBackend,
+    capacity: 2,
+    maxBatchSize: 16))
+{
+    var preflightKv = new KvPagePool(capacity: 8, tokensPerPage: 4);
+    using var preflightRuntime = new ExecutionPlanExecutor(
+        preflightDevice,
+        kvPagePool: preflightKv);
+    var preflightScheduled = new ScheduledBatchExecutor(preflightRuntime);
+
+    var ids = new[] { SequenceId.New(), SequenceId.New(), SequenceId.New() };
+    var oversized = new ScheduledBatch(
+        Guid.NewGuid(),
+        ids.Select((id, index) => new ScheduledWorkItem(
+            id,
+            ScheduledWorkKind.Prefill,
+            TokenGrant: 1,
+            KvPageGrant: 1,
+            Priority: 3 - index,
+            CompletesPrefill: true)).ToArray(),
+        ConsumedTokens: 3,
+        ConsumedKvPages: 3);
+    var oversizedBindings = new ScheduledExecutionBindings(
+        ids.ToDictionary(
+            static id => id,
+            static (_, index) => new ScheduledPrefillBinding(
+                model,
+                new ReadOnlyMemory<int>(new[] { 30 + index }))));
+
+    var preflightRejected = false;
+    try
+    {
+        await preflightScheduled.ExecuteAsync(oversized, oversizedBindings);
+    }
+    catch (InvalidOperationException exception) when (
+        exception.Message.Contains("device actor capacity is 2", StringComparison.Ordinal))
+    {
+        preflightRejected = true;
+    }
+
+    Require(preflightRejected, "An atomic envelope larger than device inference capacity must fail before execution starts.");
+    Require(preflightRuntime.SequenceCount == 0, "Oversized envelope rejection must not create runtime sequences.");
+    Require(preflightKv.AllocatedPages == 0, "Oversized envelope rejection must not allocate metadata KV pages.");
+    Require(preflightBackend.Events.Count == 0, "Oversized envelope rejection must not reach the backend.");
+}
+
 Console.WriteLine(
     $"Fission device actor specs passed: cleanDisposes={cleanDisposeBackend.DisposeCount}, " +
     $"aggregateDisposes={doubleFailureBackend.DisposeCount}, errors={aggregateFailure.InnerExceptions.Count}, " +
-    $"mixedOrder={string.Join("->", orderedKinds)}, atomicPrefill=3, atomicMixed=decode->prefill(2)->decode.");
+    $"mixedOrder={string.Join("->", orderedKinds)}, atomicPrefill=3, atomicMixed=decode->prefill(2)->decode, capacityPreflight=ok.");
 
 sealed class FailingBackend : IInferenceBackend
 {
