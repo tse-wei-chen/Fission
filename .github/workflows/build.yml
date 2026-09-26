@@ -22,6 +22,7 @@ jobs:
       - run: dotnet run --project tests/Fission.DeviceActor.Specs/Fission.DeviceActor.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.Scheduler.Specs/Fission.Scheduler.Specs.fsproj -c Release --no-build
       - run: dotnet run --project tests/Fission.Engine.Specs/Fission.Engine.Specs.csproj -c Release --no-build
+      - run: dotnet run --project tests/Fission.Engine.Capacity.Specs/Fission.Engine.Capacity.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.Server.Specs/Fission.Server.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.OnnxRuntime.Specs/Fission.OnnxRuntime.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.OnnxRuntime.State.Specs/Fission.OnnxRuntime.State.Specs.csproj -c Release --no-build
