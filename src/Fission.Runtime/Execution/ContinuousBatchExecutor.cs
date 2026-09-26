@@ -14,6 +14,8 @@ namespace Fission.Runtime.Execution;
 /// only contiguous work of the same kind is coalesced into one backend batch.
 /// Scheduler-selected work may additionally use an atomic submission envelope so
 /// one logical scheduling batch reaches the actor with deterministic membership.
+/// Inference capacity is accounted by item credits rather than channel entries,
+/// so an N-item envelope consumes the same bounded capacity as N scalar submits.
 /// </summary>
 public sealed class ContinuousBatchExecutor : IAsyncDisposable
 {
@@ -21,6 +23,7 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
 
     private readonly IInferenceBackend _backend;
     private readonly Channel<PendingWork> _queue;
+    private readonly InferenceCreditGate _inferenceCredits;
     private readonly int _maxBatchSize;
     private readonly Task _pump;
     private int _disposed;
@@ -32,6 +35,7 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
     {
         _backend = backend;
         _maxBatchSize = maxBatchSize;
+        _inferenceCredits = new InferenceCreditGate(capacity);
         _queue = Channel.CreateBounded<PendingWork>(new BoundedChannelOptions(capacity)
         {
             SingleReader = true,
@@ -43,6 +47,7 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
 
     public DeviceId Device => _backend.Device;
     public string BackendName => _backend.Name;
+    internal int InferenceCapacity => _inferenceCredits.Capacity;
 
     public static async ValueTask<ContinuousBatchExecutor> CreateAsync(
         IInferenceBackend backend,
@@ -122,7 +127,19 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         }
         else
         {
-            await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
+            var credits = await _inferenceCredits.AcquireAsync(1, cancellationToken)
+                .ConfigureAwait(false);
+            work.AttachCredits(credits);
+
+            try
+            {
+                await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                work.ReleaseCredits();
+                throw;
+            }
         }
 
         return await work.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -196,7 +213,14 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
             switch (work)
             {
                 case PendingInferenceEnvelope envelope:
-                    await ExecuteInferenceSegmentAsync(envelope.Items).ConfigureAwait(false);
+                    try
+                    {
+                        await ExecuteInferenceSegmentAsync(envelope.Items).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        envelope.ReleaseCredits();
+                    }
                     break;
 
                 case PendingControl control:
@@ -295,7 +319,7 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
 
         for (var i = 0; i < work.Count; i++)
         {
-            work[i].Completion.TrySetResult(results[i]);
+            work[i].Complete(results[i]);
         }
     }
 
@@ -426,7 +450,6 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
                     }
 
                     envelope = new PendingInferenceEnvelope(items);
-                    _enqueued = true;
                 }
             }
 
@@ -437,11 +460,33 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
 
             try
             {
+                var credits = await executor._inferenceCredits
+                    .AcquireAsync(_slots.Length, cancellationToken)
+                    .ConfigureAwait(false);
+
+                lock (_gate)
+                {
+                    if (_failure is not null)
+                    {
+                        credits.Dispose();
+                        throw new InvalidOperationException(
+                            "Atomic inference submission was aborted while waiting for device credits.",
+                            _failure);
+                    }
+                }
+
+                envelope.AttachCredits(credits);
                 await executor._queue.Writer.WriteAsync(envelope, cancellationToken)
                     .ConfigureAwait(false);
+
+                lock (_gate)
+                {
+                    _enqueued = true;
+                }
             }
             catch (Exception exception)
             {
+                envelope.ReleaseCredits();
                 Abort(exception);
                 throw;
             }
@@ -506,6 +551,21 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
 
     internal abstract class PendingWork
     {
+        private InferenceCreditGate.Lease? _credits;
+
+        internal void AttachCredits(InferenceCreditGate.Lease credits)
+        {
+            ArgumentNullException.ThrowIfNull(credits);
+            if (Interlocked.CompareExchange(ref _credits, credits, null) is not null)
+            {
+                credits.Dispose();
+                throw new InvalidOperationException("Device work already owns inference credits.");
+            }
+        }
+
+        internal void ReleaseCredits() =>
+            Interlocked.Exchange(ref _credits, null)?.Dispose();
+
         public abstract void Fail(Exception exception);
     }
 
@@ -519,8 +579,17 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
 
         public TaskCompletionSource<BackendStepResult> Completion { get; }
 
-        public override void Fail(Exception exception) =>
+        internal void Complete(BackendStepResult result)
+        {
+            Completion.TrySetResult(result);
+            ReleaseCredits();
+        }
+
+        public override void Fail(Exception exception)
+        {
             Completion.TrySetException(exception);
+            ReleaseCredits();
+        }
     }
 
     private sealed class PendingPrefill(PrefillItem item) : PendingInference
@@ -543,6 +612,8 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
             {
                 item.Fail(exception);
             }
+
+            ReleaseCredits();
         }
     }
 
@@ -557,8 +628,11 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         public TaskCompletionSource<bool> Completion { get; }
         public abstract ValueTask ExecuteAsync(IInferenceBackend backend);
 
-        public override void Fail(Exception exception) =>
+        public override void Fail(Exception exception)
+        {
             Completion.TrySetException(exception);
+            ReleaseCredits();
+        }
     }
 
     private sealed class PendingSnapshot(
