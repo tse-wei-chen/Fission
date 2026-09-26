@@ -63,8 +63,10 @@ public sealed record ScheduledBatchResult(
 
 /// <summary>
 /// Bridges the F# scheduling policy and the C# stateful runtime. The whole
-/// scheduled batch is validated first; only then are independent one-step
-/// plans launched concurrently so ContinuousBatchExecutor can coalesce them.
+/// scheduled batch is validated first; only then are independent one-step plans
+/// launched concurrently. Their device submissions are registered into fixed
+/// scheduler-order slots and written to ContinuousBatchExecutor as one ordered
+/// envelope, so physical batch membership is not decided by producer timing.
 /// </summary>
 public sealed class ScheduledBatchExecutor
 {
@@ -92,17 +94,33 @@ public sealed class ScheduledBatchExecutor
             return new ScheduledBatchResult(batch.ScheduleId, Array.Empty<ExecutionPlanResult>());
         }
 
+        using var submission = ContinuousBatchExecutor.BeginAtomicSubmission(prepared.Length);
         var pending = new Task<ExecutionPlanResult>[prepared.Length];
         for (var index = 0; index < prepared.Length; index++)
         {
-            pending[index] = _runtime.ExecuteAsync(
-                prepared[index].Plan,
-                prepared[index].Bindings,
-                cancellationToken).AsTask();
+            pending[index] = ExecutePreparedAsync(index);
         }
 
         var results = await Task.WhenAll(pending).ConfigureAwait(false);
         return new ScheduledBatchResult(batch.ScheduleId, results);
+
+        async Task<ExecutionPlanResult> ExecutePreparedAsync(int index)
+        {
+            using var slot = submission.EnterSlot(index);
+            try
+            {
+                return await _runtime.ExecuteAsync(
+                        prepared[index].Plan,
+                        prepared[index].Bindings,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                submission.Abort(exception);
+                throw;
+            }
+        }
     }
 
     private PreparedItem[] Prepare(
