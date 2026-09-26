@@ -12,9 +12,13 @@ namespace Fission.Runtime.Execution;
 /// inference before a control is flushed first, the control executes, then later
 /// inference may proceed. Mixed prefill/decode inference preserves queue order;
 /// only contiguous work of the same kind is coalesced into one backend batch.
+/// Scheduler-selected work may additionally use an atomic submission envelope so
+/// one logical scheduling batch reaches the actor with deterministic membership.
 /// </summary>
 public sealed class ContinuousBatchExecutor : IAsyncDisposable
 {
+    private static readonly AsyncLocal<AtomicSubmissionSlot?> AmbientAtomicSlot = new();
+
     private readonly IInferenceBackend _backend;
     private readonly Channel<PendingWork> _queue;
     private readonly int _maxBatchSize;
@@ -52,6 +56,9 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         await backend.InitializeAsync(cancellationToken).ConfigureAwait(false);
         return new ContinuousBatchExecutor(backend, capacity, maxBatchSize);
     }
+
+    internal static AtomicSubmissionBatch BeginAtomicSubmission(int itemCount) =>
+        new(itemCount);
 
     public ValueTask<BackendStepResult> SubmitPrefillAsync(
         PrefillItem item,
@@ -103,7 +110,21 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         where TWork : PendingInference
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
+
+        if (AmbientAtomicSlot.Value is { } slot)
+        {
+            await slot.Batch.RegisterAsync(
+                    slot.Index,
+                    this,
+                    work,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
+        }
+
         return await work.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -172,9 +193,21 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
             await ExecuteInferenceSegmentAsync(inferenceSegment).ConfigureAwait(false);
             inferenceSegment.Clear();
 
-            var control = (PendingControl)work;
-            await control.ExecuteAsync(_backend).ConfigureAwait(false);
-            control.Completion.TrySetResult(true);
+            switch (work)
+            {
+                case PendingInferenceEnvelope envelope:
+                    await ExecuteInferenceSegmentAsync(envelope.Items).ConfigureAwait(false);
+                    break;
+
+                case PendingControl control:
+                    await control.ExecuteAsync(_backend).ConfigureAwait(false);
+                    control.Completion.TrySetResult(true);
+                    break;
+
+                default:
+                    throw new InvalidOperationException(
+                        $"Unsupported device work type {work.GetType().Name}.");
+            }
         }
 
         await ExecuteInferenceSegmentAsync(inferenceSegment).ConfigureAwait(false);
@@ -191,7 +224,9 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
                 case PendingPrefill:
                 {
                     var end = index + 1;
-                    while (end < segment.Count && segment[end] is PendingPrefill)
+                    while (end < segment.Count &&
+                           end - index < _maxBatchSize &&
+                           segment[end] is PendingPrefill)
                     {
                         end++;
                     }
@@ -216,7 +251,9 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
                 case PendingDecode:
                 {
                     var end = index + 1;
-                    while (end < segment.Count && segment[end] is PendingDecode)
+                    while (end < segment.Count &&
+                           end - index < _maxBatchSize &&
+                           segment[end] is PendingDecode)
                     {
                         end++;
                     }
@@ -314,12 +351,165 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         }
     }
 
-    private abstract class PendingWork
+    internal sealed class AtomicSubmissionBatch : IDisposable
+    {
+        private readonly object _gate = new();
+        private readonly PendingInference?[] _slots;
+        private ContinuousBatchExecutor? _executor;
+        private Exception? _failure;
+        private bool _enqueued;
+        private int _disposed;
+
+        internal AtomicSubmissionBatch(int itemCount)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(itemCount);
+            _slots = new PendingInference[itemCount];
+        }
+
+        internal IDisposable EnterSlot(int index)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            ArgumentOutOfRangeException.ThrowIfNegative(index);
+            if (index >= _slots.Length)
+            {
+                throw new ArgumentOutOfRangeException(nameof(index));
+            }
+
+            var previous = AmbientAtomicSlot.Value;
+            AmbientAtomicSlot.Value = new AtomicSubmissionSlot(this, index);
+            return new AtomicSlotLease(previous);
+        }
+
+        internal async ValueTask RegisterAsync(
+            int index,
+            ContinuousBatchExecutor executor,
+            PendingInference work,
+            CancellationToken cancellationToken)
+        {
+            PendingInferenceEnvelope? envelope = null;
+
+            lock (_gate)
+            {
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+                if (_failure is not null)
+                {
+                    throw new InvalidOperationException(
+                        "Atomic inference submission was already aborted.",
+                        _failure);
+                }
+
+                if (_slots[index] is not null)
+                {
+                    throw new InvalidOperationException(
+                        $"Atomic inference slot {index} was registered more than once.");
+                }
+
+                if (_executor is null)
+                {
+                    _executor = executor;
+                }
+                else if (!ReferenceEquals(_executor, executor))
+                {
+                    var mismatch = new InvalidOperationException(
+                        "One atomic inference submission cannot target more than one device actor.");
+                    Abort(mismatch);
+                    throw mismatch;
+                }
+
+                _slots[index] = work;
+                if (_slots.All(static item => item is not null))
+                {
+                    var items = new PendingInference[_slots.Length];
+                    for (var slot = 0; slot < _slots.Length; slot++)
+                    {
+                        items[slot] = _slots[slot]!;
+                    }
+
+                    envelope = new PendingInferenceEnvelope(items);
+                    _enqueued = true;
+                }
+            }
+
+            if (envelope is null)
+            {
+                return;
+            }
+
+            try
+            {
+                await executor._queue.Writer.WriteAsync(envelope, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                Abort(exception);
+                throw;
+            }
+        }
+
+        internal void Abort(Exception exception)
+        {
+            ArgumentNullException.ThrowIfNull(exception);
+            PendingInference[] registered;
+
+            lock (_gate)
+            {
+                if (_failure is not null)
+                {
+                    return;
+                }
+
+                _failure = exception;
+                registered = _slots
+                    .Where(static item => item is not null)
+                    .Select(static item => item!)
+                    .ToArray();
+            }
+
+            foreach (var work in registered)
+            {
+                work.Fail(exception);
+            }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            if (!_enqueued && _failure is null)
+            {
+                Abort(new InvalidOperationException(
+                    "Atomic inference submission ended before every slot registered work."));
+            }
+        }
+    }
+
+    private sealed class AtomicSlotLease(AtomicSubmissionSlot? previous) : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                AmbientAtomicSlot.Value = previous;
+            }
+        }
+    }
+
+    private sealed record AtomicSubmissionSlot(
+        AtomicSubmissionBatch Batch,
+        int Index);
+
+    internal abstract class PendingWork
     {
         public abstract void Fail(Exception exception);
     }
 
-    private abstract class PendingInference : PendingWork
+    internal abstract class PendingInference : PendingWork
     {
         protected PendingInference()
         {
@@ -341,6 +531,19 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
     private sealed class PendingDecode(DecodeItem item) : PendingInference
     {
         public DecodeItem Item { get; } = item;
+    }
+
+    private sealed class PendingInferenceEnvelope(PendingInference[] items) : PendingWork
+    {
+        public IReadOnlyList<PendingInference> Items { get; } = items;
+
+        public override void Fail(Exception exception)
+        {
+            foreach (var item in Items)
+            {
+                item.Fail(exception);
+            }
+        }
     }
 
     private abstract class PendingControl : PendingWork

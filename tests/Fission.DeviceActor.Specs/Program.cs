@@ -1,6 +1,8 @@
 using Fission.Abstractions;
 using Fission.Abstractions.Execution;
+using Fission.Abstractions.Scheduling;
 using Fission.Runtime.Execution;
+using Fission.Runtime.Kv;
 
 static void Require(bool condition, string message)
 {
@@ -143,10 +145,98 @@ Require(
     orderingBackend.Events[2].SequenceIds.Count == 1,
     "Kind switches must form separate contiguous backend batches.");
 
+// ScheduledBatchExecutor validates all work first, then registers each one-step
+// runtime plan into a fixed scheduler-order slot. A channel with capacity one
+// makes this invariant observable: without an atomic envelope, the first producer
+// would fill the queue and the actor would execute it before later producers could
+// enqueue. With the envelope, all three prefills reach the backend in one call.
+var atomicBackend = new RecordingBackend(new DeviceId("cpu:atomic-schedule"));
+await using (var atomicDevice = await ContinuousBatchExecutor.CreateAsync(
+    atomicBackend,
+    capacity: 1,
+    maxBatchSize: 16))
+{
+    var kvPool = new KvPagePool(capacity: 16, tokensPerPage: 4);
+    using var atomicRuntime = new ExecutionPlanExecutor(
+        atomicDevice,
+        kvPagePool: kvPool);
+    var scheduled = new ScheduledBatchExecutor(atomicRuntime);
+
+    var first = SequenceId.New();
+    var second = SequenceId.New();
+    var third = SequenceId.New();
+    var initial = new ScheduledBatch(
+        Guid.NewGuid(),
+        new ScheduledWorkItem[]
+        {
+            new(first, ScheduledWorkKind.Prefill, 1, 1, 10, CompletesPrefill: true),
+            new(second, ScheduledWorkKind.Prefill, 1, 1, 9, CompletesPrefill: true),
+            new(third, ScheduledWorkKind.Prefill, 1, 1, 8, CompletesPrefill: true)
+        },
+        ConsumedTokens: 3,
+        ConsumedKvPages: 3);
+    var initialBindings = new ScheduledExecutionBindings(
+        new Dictionary<SequenceId, ScheduledPrefillBinding>
+        {
+            [first] = new(model, new ReadOnlyMemory<int>(new[] { 11 })),
+            [second] = new(model, new ReadOnlyMemory<int>(new[] { 12 })),
+            [third] = new(model, new ReadOnlyMemory<int>(new[] { 13 }))
+        });
+
+    var initialResult = await scheduled.ExecuteAsync(initial, initialBindings)
+        .AsTask()
+        .WaitAsync(TimeSpan.FromSeconds(5));
+    Require(initialResult.ItemResults.Count == 3, "Atomic scheduled prefill must return one runtime result per item.");
+    Require(atomicBackend.Events.Count == 1, "Three scheduled prefills must reach the backend as one physical call.");
+    Require(
+        atomicBackend.Events[0].Kind == "prefill" &&
+        atomicBackend.Events[0].SequenceIds.SequenceEqual(new[] { first, second, third }),
+        "Atomic scheduled prefill must preserve scheduler order and batch membership.");
+
+    atomicBackend.Events.Clear();
+    var fourth = SequenceId.New();
+    var fifth = SequenceId.New();
+    var mixed = new ScheduledBatch(
+        Guid.NewGuid(),
+        new ScheduledWorkItem[]
+        {
+            new(first, ScheduledWorkKind.Decode, 1, 0, 10, CompletesPrefill: false),
+            new(fourth, ScheduledWorkKind.Prefill, 1, 1, 7, CompletesPrefill: true),
+            new(fifth, ScheduledWorkKind.Prefill, 1, 1, 6, CompletesPrefill: true),
+            new(second, ScheduledWorkKind.Decode, 1, 0, 5, CompletesPrefill: false)
+        },
+        ConsumedTokens: 4,
+        ConsumedKvPages: 2);
+    var mixedBindings = new ScheduledExecutionBindings(
+        new Dictionary<SequenceId, ScheduledPrefillBinding>
+        {
+            [fourth] = new(model, new ReadOnlyMemory<int>(new[] { 21 })),
+            [fifth] = new(model, new ReadOnlyMemory<int>(new[] { 22 }))
+        });
+
+    await scheduled.ExecuteAsync(mixed, mixedBindings)
+        .AsTask()
+        .WaitAsync(TimeSpan.FromSeconds(5));
+
+    Require(atomicBackend.Events.Count == 3, "Mixed scheduled envelope must execute exactly three contiguous kind segments.");
+    Require(
+        atomicBackend.Events[0].Kind == "decode" &&
+        atomicBackend.Events[0].SequenceIds.SequenceEqual(new[] { first }),
+        "Mixed scheduled envelope must start with the first reserved decode.");
+    Require(
+        atomicBackend.Events[1].Kind == "prefill" &&
+        atomicBackend.Events[1].SequenceIds.SequenceEqual(new[] { fourth, fifth }),
+        "Adjacent scheduled prefills must remain one physical backend batch inside the envelope.");
+    Require(
+        atomicBackend.Events[2].Kind == "decode" &&
+        atomicBackend.Events[2].SequenceIds.SequenceEqual(new[] { second }),
+        "Mixed scheduled envelope must preserve the final decode after the prefill segment.");
+}
+
 Console.WriteLine(
     $"Fission device actor specs passed: cleanDisposes={cleanDisposeBackend.DisposeCount}, " +
     $"aggregateDisposes={doubleFailureBackend.DisposeCount}, errors={aggregateFailure.InnerExceptions.Count}, " +
-    $"mixedOrder={string.Join("->", orderedKinds)}.");
+    $"mixedOrder={string.Join("->", orderedKinds)}, atomicPrefill=3, atomicMixed=decode->prefill(2)->decode.");
 
 sealed class FailingBackend : IInferenceBackend
 {
