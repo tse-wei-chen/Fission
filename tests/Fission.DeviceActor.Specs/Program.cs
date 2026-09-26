@@ -65,8 +65,6 @@ Require(pumpFailurePropagated, "Disposal must preserve the original device-pump 
 Require(cleanDisposeBackend.DisposeCount == 1, "Backend cleanup must run even after the device pump faults.");
 Require(cleanDisposeBackend.IsDisposed, "Backend cleanup must complete before DisposeAsync returns the pump failure.");
 
-// DisposeAsync is idempotent even when its first invocation reported the pump
-// failure; backend resources must not be released twice.
 await cleanDisposeExecutor.DisposeAsync();
 Require(cleanDisposeBackend.DisposeCount == 1, "Repeated executor disposal must not invoke backend cleanup twice.");
 
@@ -105,9 +103,6 @@ Require(doubleFailureBackend.IsDisposed, "Backend must record the cleanup attemp
 await doubleFailureExecutor.DisposeAsync();
 Require(doubleFailureBackend.DisposeCount == 1, "Repeated disposal after an aggregate failure must remain idempotent.");
 
-// Scheduler-selected mixed work reaches the actor in queue order. The actor may
-// coalesce adjacent work of one kind, but it must not move a later prefill in
-// front of an earlier decode just to form a larger homogeneous batch.
 var orderingBackend = new RecordingBackend(new DeviceId("cpu:ordering"));
 await using (var orderingExecutor = await ContinuousBatchExecutor.CreateAsync(
     orderingBackend,
@@ -145,10 +140,6 @@ Require(
     orderingBackend.Events[2].SequenceIds.Count == 1,
     "Kind switches must form separate contiguous backend batches.");
 
-// ScheduledBatchExecutor validates all work first, then registers each one-step
-// runtime plan into a fixed scheduler-order slot. Device capacity is now measured
-// in inference-item credits, so this executor grants enough credits for the full
-// scheduled envelope while still proving deterministic batch membership/order.
 var atomicBackend = new RecordingBackend(new DeviceId("cpu:atomic-schedule"));
 await using (var atomicDevice = await ContinuousBatchExecutor.CreateAsync(
     atomicBackend,
@@ -232,10 +223,63 @@ await using (var atomicDevice = await ContinuousBatchExecutor.CreateAsync(
         "Mixed scheduled envelope must preserve the final decode after the prefill segment.");
 }
 
+var preflightBackend = new RecordingBackend(new DeviceId("cpu:capacity-preflight"));
+await using (var preflightDevice = await ContinuousBatchExecutor.CreateAsync(
+    preflightBackend,
+    capacity: 2,
+    maxBatchSize: 16))
+{
+    var preflightKv = new KvPagePool(capacity: 8, tokensPerPage: 4);
+    using var preflightRuntime = new ExecutionPlanExecutor(
+        preflightDevice,
+        kvPagePool: preflightKv);
+    var preflightScheduled = new ScheduledBatchExecutor(preflightRuntime);
+
+    var ids = new[] { SequenceId.New(), SequenceId.New(), SequenceId.New() };
+    var oversized = new ScheduledBatch(
+        Guid.NewGuid(),
+        ids.Select((id, index) => new ScheduledWorkItem(
+            id,
+            ScheduledWorkKind.Prefill,
+            TokenGrant: 1,
+            KvPageGrant: 1,
+            Priority: 3 - index,
+            CompletesPrefill: true)).ToArray(),
+        ConsumedTokens: 3,
+        ConsumedKvPages: 3);
+
+    var oversizedPrefills = new Dictionary<SequenceId, ScheduledPrefillBinding>();
+    for (var index = 0; index < ids.Length; index++)
+    {
+        oversizedPrefills.Add(
+            ids[index],
+            new ScheduledPrefillBinding(
+                model,
+                new ReadOnlyMemory<int>(new[] { 30 + index })));
+    }
+
+    var oversizedBindings = new ScheduledExecutionBindings(oversizedPrefills);
+    var preflightRejected = false;
+    try
+    {
+        await preflightScheduled.ExecuteAsync(oversized, oversizedBindings);
+    }
+    catch (InvalidOperationException exception) when (
+        exception.Message.Contains("device actor capacity is 2", StringComparison.Ordinal))
+    {
+        preflightRejected = true;
+    }
+
+    Require(preflightRejected, "An atomic envelope larger than device inference capacity must fail before execution starts.");
+    Require(preflightRuntime.SequenceCount == 0, "Oversized envelope rejection must not create runtime sequences.");
+    Require(preflightKv.AllocatedPages == 0, "Oversized envelope rejection must not allocate metadata KV pages.");
+    Require(preflightBackend.Events.Count == 0, "Oversized envelope rejection must not reach the backend.");
+}
+
 Console.WriteLine(
     $"Fission device actor specs passed: cleanDisposes={cleanDisposeBackend.DisposeCount}, " +
     $"aggregateDisposes={doubleFailureBackend.DisposeCount}, errors={aggregateFailure.InnerExceptions.Count}, " +
-    $"mixedOrder={string.Join("->", orderedKinds)}, atomicPrefill=3, atomicMixed=decode->prefill(2)->decode.");
+    $"mixedOrder={string.Join("->", orderedKinds)}, atomicPrefill=3, atomicMixed=decode->prefill(2)->decode, capacityPreflight=ok.");
 
 sealed class FailingBackend : IInferenceBackend
 {

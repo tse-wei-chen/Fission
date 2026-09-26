@@ -74,6 +74,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
 
     public int SequenceCount => _sequences.Count;
     public int SnapshotCount => _snapshots.Count;
+    internal int DeviceInferenceCapacity => _device.InferenceCapacity;
     public KvPagePool KvPages => _kvPagePool;
     public RuntimeKvCapacity KvCapacity => new(
         _kvPagePool.Capacity,
