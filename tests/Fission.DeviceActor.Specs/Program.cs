@@ -65,8 +65,6 @@ Require(pumpFailurePropagated, "Disposal must preserve the original device-pump 
 Require(cleanDisposeBackend.DisposeCount == 1, "Backend cleanup must run even after the device pump faults.");
 Require(cleanDisposeBackend.IsDisposed, "Backend cleanup must complete before DisposeAsync returns the pump failure.");
 
-// DisposeAsync is idempotent even when its first invocation reported the pump
-// failure; backend resources must not be released twice.
 await cleanDisposeExecutor.DisposeAsync();
 Require(cleanDisposeBackend.DisposeCount == 1, "Repeated executor disposal must not invoke backend cleanup twice.");
 
@@ -105,9 +103,6 @@ Require(doubleFailureBackend.IsDisposed, "Backend must record the cleanup attemp
 await doubleFailureExecutor.DisposeAsync();
 Require(doubleFailureBackend.DisposeCount == 1, "Repeated disposal after an aggregate failure must remain idempotent.");
 
-// Scheduler-selected mixed work reaches the actor in queue order. The actor may
-// coalesce adjacent work of one kind, but it must not move a later prefill in
-// front of an earlier decode just to form a larger homogeneous batch.
 var orderingBackend = new RecordingBackend(new DeviceId("cpu:ordering"));
 await using (var orderingExecutor = await ContinuousBatchExecutor.CreateAsync(
     orderingBackend,
@@ -145,10 +140,6 @@ Require(
     orderingBackend.Events[2].SequenceIds.Count == 1,
     "Kind switches must form separate contiguous backend batches.");
 
-// ScheduledBatchExecutor validates all work first, then registers each one-step
-// runtime plan into a fixed scheduler-order slot. Device capacity is now measured
-// in inference-item credits, so this executor grants enough credits for the full
-// scheduled envelope while still proving deterministic batch membership/order.
 var atomicBackend = new RecordingBackend(new DeviceId("cpu:atomic-schedule"));
 await using (var atomicDevice = await ContinuousBatchExecutor.CreateAsync(
     atomicBackend,
@@ -232,9 +223,6 @@ await using (var atomicDevice = await ContinuousBatchExecutor.CreateAsync(
         "Mixed scheduled envelope must preserve the final decode after the prefill segment.");
 }
 
-// Oversized scheduler envelopes are rejected before any one-step runtime plan is
-// launched. This keeps runtime metadata/KV/backend state untouched when the
-// scheduler/device capacity contract is misconfigured.
 var preflightBackend = new RecordingBackend(new DeviceId("cpu:capacity-preflight"));
 await using (var preflightDevice = await ContinuousBatchExecutor.CreateAsync(
     preflightBackend,
@@ -259,13 +247,18 @@ await using (var preflightDevice = await ContinuousBatchExecutor.CreateAsync(
             CompletesPrefill: true)).ToArray(),
         ConsumedTokens: 3,
         ConsumedKvPages: 3);
-    var oversizedBindings = new ScheduledExecutionBindings(
-        ids.ToDictionary(
-            static id => id,
-            static (_, index) => new ScheduledPrefillBinding(
-                model,
-                new ReadOnlyMemory<int>(new[] { 30 + index }))));
 
+    var oversizedPrefills = new Dictionary<SequenceId, ScheduledPrefillBinding>();
+    for (var index = 0; index < ids.Length; index++)
+    {
+        oversizedPrefills.Add(
+            ids[index],
+            new ScheduledPrefillBinding(
+                model,
+                new ReadOnlyMemory<int>(new[] { 30 + index })));
+    }
+
+    var oversizedBindings = new ScheduledExecutionBindings(oversizedPrefills);
     var preflightRejected = false;
     try
     {
