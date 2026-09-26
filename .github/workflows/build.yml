@@ -30,4 +30,5 @@ jobs:
       - run: dotnet run --project tests/Fission.OnnxRuntime.Optimum.Specs/Fission.OnnxRuntime.Optimum.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.OnnxRuntime.Batch.Specs/Fission.OnnxRuntime.Batch.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.OnnxRuntime.OptimumBatch.Specs/Fission.OnnxRuntime.OptimumBatch.Specs.csproj -c Release --no-build
+      - run: dotnet run --project tests/Fission.OnnxRuntime.OptimumPrefillBatch.Specs/Fission.OnnxRuntime.OptimumPrefillBatch.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.BackendTransactions.Specs/Fission.BackendTransactions.Specs.csproj -c Release --no-build
