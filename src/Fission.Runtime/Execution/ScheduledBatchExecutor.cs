@@ -94,6 +94,13 @@ public sealed class ScheduledBatchExecutor
             return new ScheduledBatchResult(batch.ScheduleId, Array.Empty<ExecutionPlanResult>());
         }
 
+        if (prepared.Length > _runtime.DeviceInferenceCapacity)
+        {
+            throw new InvalidOperationException(
+                $"Scheduled batch {batch.ScheduleId} contains {prepared.Length} inference item(s), " +
+                $"but the device actor capacity is {_runtime.DeviceInferenceCapacity}.");
+        }
+
         using var submission = ContinuousBatchExecutor.BeginAtomicSubmission(prepared.Length);
         var pending = new Task<ExecutionPlanResult>[prepared.Length];
         for (var index = 0; index < prepared.Length; index++)
