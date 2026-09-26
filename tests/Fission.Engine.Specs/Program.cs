@@ -237,11 +237,59 @@ var byteCancelled = await byteEngine.CancelAsync(byteLimited);
 Require(byteCancelled.FinishReason == InferenceFinishReason.Cancelled, "Byte-budget test request must be cancellable after partial prefill.");
 Require(byteRuntime.SequenceCount == 0 && byteKvPool.AllocatedPages == 0, "Byte-budget cancellation must release runtime KV ownership.");
 
+var capacityKvPool = new KvPagePool(capacity: 16, tokensPerPage: 4);
+await using var capacityDevice = await ContinuousBatchExecutor.CreateAsync(
+    new DeterministicBackend(new DeviceId("cpu:engine-capacity")),
+    capacity: 2,
+    maxBatchSize: 8);
+using var capacityRuntime = new ExecutionPlanExecutor(
+    capacityDevice,
+    kvPagePool: capacityKvPool);
+using var capacityEngine = new InferenceEngine(
+    capacityRuntime,
+    new SchedulingKernel(),
+    new InferenceEngineOptions(
+        MaxBatchTokens: 8,
+        MaxBatchSequences: 4,
+        Scheduling: new SchedulingPolicyOptions(
+            DecodeTokenReserve: 0,
+            MaxPrefillChunkTokens: 4,
+            DeadlineUrgencyWindow: TimeSpan.FromMilliseconds(50))));
+
+var capacityModel = new ModelId("capacity-model");
+var capacityRequests = new[]
+{
+    capacityEngine.Submit(capacityModel, new[] { 1 }, maxNewTokens: 1, priority: 3, enqueuedAt: baseTime.AddSeconds(5)),
+    capacityEngine.Submit(capacityModel, new[] { 2 }, maxNewTokens: 1, priority: 2, enqueuedAt: baseTime.AddSeconds(5).AddMilliseconds(1)),
+    capacityEngine.Submit(capacityModel, new[] { 3 }, maxNewTokens: 1, priority: 1, enqueuedAt: baseTime.AddSeconds(5).AddMilliseconds(2))
+};
+
+var capacityCycles = new List<InferenceCycleResult>();
+for (var index = 0; index < 8 && capacityEngine.ActiveRequestCount != 0; index++)
+{
+    capacityCycles.Add(await capacityEngine.RunCycleAsync(baseTime.AddSeconds(5).AddMilliseconds(10 + index)));
+}
+
+Require(capacityCycles.Count > 0, "Capacity feedback spec must execute scheduler cycles.");
+Require(
+    capacityCycles.All(static cycle => cycle.Batch.Items.Count <= 2),
+    "Engine must clamp every scheduler batch to the device's two inference-item credits.");
+Require(
+    capacityCycles[0].Batch.Items.Count == 2,
+    "A wider MaxBatchSequences setting must still use the device capacity instead of triggering an oversized envelope.");
+Require(capacityEngine.ActiveRequestCount == 0, "Requests deferred by device capacity must make progress in later cycles.");
+Require(
+    capacityRequests.All(id => capacityEngine.GetSnapshot(id).IsCompleted),
+    "All requests must complete after capacity-clamped cycles.");
+Require(capacityRuntime.SequenceCount == 0, "Capacity-clamped completion must release runtime sequences.");
+Require(capacityKvPool.AllocatedPages == 0, "Capacity-clamped completion must release KV pages.");
+
 Console.WriteLine(
     $"Fission engine specs passed: cycles={cycles.Count}, prefill=[{string.Join(',', prefillGrants)}], " +
     $"manual={snapshotA.GeneratedTokens.Count + snapshotB.GeneratedTokens.Count}, " +
     $"streamed={streamed[0].Length + streamed[1].Length}, backendReleases={trackingBackend.ReleaseCount}, " +
-    $"byteGrant={byteFirstCycle.Batch.ConsumedKvBytes}, kv={kvPool.AllocatedPages}/{kvPool.Capacity}.");
+    $"byteGrant={byteFirstCycle.Batch.ConsumedKvBytes}, deviceClamp={capacityCycles.Max(static cycle => cycle.Batch.Items.Count)}, " +
+    $"kv={kvPool.AllocatedPages}/{kvPool.Capacity}.");
 
 sealed class TrackingStateBackend : IInferenceBackend, IInferenceKvMemoryProfile
 {
