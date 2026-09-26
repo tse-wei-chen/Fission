@@ -247,13 +247,14 @@ public sealed class InferenceEngine : IDisposable
                 candidates[index] = BuildCandidate(active[index], kvBefore.TokensPerPage);
             }
 
+            var executionCapacity = _runtime.GetExecutionCapacity();
             var decision = _scheduler.Schedule(
                 scheduleId,
                 now,
                 new SchedulingBudget(
                     _options.MaxBatchTokens,
                     kvBefore.AvailablePages,
-                    _options.MaxBatchSequences,
+                    Math.Min(_options.MaxBatchSequences, executionCapacity.MaxInferenceItems),
                     GetAvailableKvBytes(active)),
                 _options.Scheduling,
                 candidates);
