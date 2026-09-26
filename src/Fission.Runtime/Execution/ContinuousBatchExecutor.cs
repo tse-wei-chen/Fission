@@ -322,6 +322,24 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
 
         for (var i = 0; i < work.Count; i++)
         {
+            var expectedSequenceId = work[i] switch
+            {
+                PendingPrefill prefill => prefill.Item.SequenceId,
+                PendingDecode decode => decode.Item.SequenceId,
+                _ => throw new InvalidOperationException(
+                    $"Unsupported inference work type {work[i].GetType().Name}.")
+            };
+
+            if (results[i].SequenceId != expectedSequenceId)
+            {
+                throw new InvalidOperationException(
+                    $"Backend result at index {i} belongs to sequence {results[i].SequenceId}, " +
+                    $"but the corresponding work item belongs to {expectedSequenceId}.");
+            }
+        }
+
+        for (var i = 0; i < work.Count; i++)
+        {
             work[i].Complete(results[i]);
         }
     }

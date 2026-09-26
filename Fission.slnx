@@ -10,6 +10,7 @@
   <Project Path="samples/Fission.PlanDemo/Fission.PlanDemo.fsproj" />
   <Project Path="tests/Fission.Runtime.Specs/Fission.Runtime.Specs.csproj" />
   <Project Path="tests/Fission.DeviceActor.Specs/Fission.DeviceActor.Specs.csproj" />
+  <Project Path="tests/Fission.DeviceActor.Identity.Specs/Fission.DeviceActor.Identity.Specs.csproj" />
   <Project Path="tests/Fission.DeviceCancellation.Specs/Fission.DeviceCancellation.Specs.csproj" />
   <Project Path="tests/Fission.Scheduler.Specs/Fission.Scheduler.Specs.fsproj" />
   <Project Path="tests/Fission.Engine.Specs/Fission.Engine.Specs.csproj" />
