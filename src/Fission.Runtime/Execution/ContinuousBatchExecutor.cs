@@ -380,7 +380,7 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
             return new AtomicSlotLease(previous);
         }
 
-        private async ValueTask RegisterAsync(
+        internal async ValueTask RegisterAsync(
             int index,
             ContinuousBatchExecutor executor,
             PendingInference work,
@@ -504,12 +504,12 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         AtomicSubmissionBatch Batch,
         int Index);
 
-    private abstract class PendingWork
+    internal abstract class PendingWork
     {
         public abstract void Fail(Exception exception);
     }
 
-    private abstract class PendingInference : PendingWork
+    internal abstract class PendingInference : PendingWork
     {
         protected PendingInference()
         {
