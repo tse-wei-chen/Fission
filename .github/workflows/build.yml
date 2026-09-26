@@ -20,6 +20,7 @@ jobs:
       - run: dotnet run --project samples/Fission.PlanDemo/Fission.PlanDemo.fsproj -c Release --no-build
       - run: dotnet run --project tests/Fission.Runtime.Specs/Fission.Runtime.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.DeviceActor.Specs/Fission.DeviceActor.Specs.csproj -c Release --no-build
+      - run: dotnet run --project tests/Fission.DeviceCancellation.Specs/Fission.DeviceCancellation.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.Scheduler.Specs/Fission.Scheduler.Specs.fsproj -c Release --no-build
       - run: dotnet run --project tests/Fission.Engine.Specs/Fission.Engine.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.Server.Specs/Fission.Server.Specs.csproj -c Release --no-build
