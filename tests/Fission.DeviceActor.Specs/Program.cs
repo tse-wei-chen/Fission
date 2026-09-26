@@ -146,14 +146,13 @@ Require(
     "Kind switches must form separate contiguous backend batches.");
 
 // ScheduledBatchExecutor validates all work first, then registers each one-step
-// runtime plan into a fixed scheduler-order slot. A channel with capacity one
-// makes this invariant observable: without an atomic envelope, the first producer
-// would fill the queue and the actor would execute it before later producers could
-// enqueue. With the envelope, all three prefills reach the backend in one call.
+// runtime plan into a fixed scheduler-order slot. Device capacity is now measured
+// in inference-item credits, so this executor grants enough credits for the full
+// scheduled envelope while still proving deterministic batch membership/order.
 var atomicBackend = new RecordingBackend(new DeviceId("cpu:atomic-schedule"));
 await using (var atomicDevice = await ContinuousBatchExecutor.CreateAsync(
     atomicBackend,
-    capacity: 1,
+    capacity: 4,
     maxBatchSize: 16))
 {
     var kvPool = new KvPagePool(capacity: 16, tokensPerPage: 4);
