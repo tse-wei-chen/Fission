@@ -12,6 +12,7 @@
   <Project Path="tests/Fission.DeviceActor.Specs/Fission.DeviceActor.Specs.csproj" />
   <Project Path="tests/Fission.Scheduler.Specs/Fission.Scheduler.Specs.fsproj" />
   <Project Path="tests/Fission.Engine.Specs/Fission.Engine.Specs.csproj" />
+  <Project Path="tests/Fission.Engine.Capacity.Specs/Fission.Engine.Capacity.Specs.csproj" />
   <Project Path="tests/Fission.Server.Specs/Fission.Server.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.Specs/Fission.OnnxRuntime.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.State.Specs/Fission.OnnxRuntime.State.Specs.csproj" />
