@@ -380,7 +380,7 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
             return new AtomicSlotLease(previous);
         }
 
-        internal async ValueTask RegisterAsync(
+        private async ValueTask RegisterAsync(
             int index,
             ContinuousBatchExecutor executor,
             PendingInference work,
