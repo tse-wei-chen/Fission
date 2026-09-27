@@ -6,6 +6,11 @@ namespace Fission.Runtime.Execution;
 /// Maps logical device ids to the single-device actors that own backend execution.
 /// The registry does not own executor lifetimes; callers remain responsible for
 /// disposing every registered ContinuousBatchExecutor.
+///
+/// A one-actor registry preserves the existing backend-internal migration model:
+/// logical placement may change to another DeviceId while all work remains routed
+/// through the same actor. With multiple actors, logical placement must resolve to
+/// an explicitly registered actor.
 /// </summary>
 public sealed class ExecutionDeviceRegistry
 {
@@ -43,7 +48,7 @@ public sealed class ExecutionDeviceRegistry
 
     public bool Contains(DeviceId device) => _devices.ContainsKey(device);
 
-    internal ContinuousBatchExecutor Resolve(DeviceId device)
+    internal ContinuousBatchExecutor ResolveRegistered(DeviceId device)
     {
         if (_devices.TryGetValue(device, out var executor))
         {
@@ -54,9 +59,33 @@ public sealed class ExecutionDeviceRegistry
             $"Execution device {device} is not registered in this runtime.");
     }
 
+    internal ContinuousBatchExecutor ResolvePlacement(DeviceId placement)
+    {
+        if (_devices.TryGetValue(placement, out var executor))
+        {
+            return executor;
+        }
+
+        if (_devices.Count == 1)
+        {
+            return _devices[DefaultDevice];
+        }
+
+        throw new KeyNotFoundException(
+            $"Execution device {placement} is not registered in this runtime.");
+    }
+
+    internal void ValidateMigrationTarget(DeviceId targetDevice)
+    {
+        if (_devices.Count > 1)
+        {
+            _ = ResolveRegistered(targetDevice);
+        }
+    }
+
     internal int MinimumInferenceCapacity =>
         _devices.Values.Min(static device => device.InferenceCapacity);
 
-    internal int GetInferenceCapacity(DeviceId device) =>
-        Resolve(device).InferenceCapacity;
+    internal int GetInferenceCapacity(DeviceId actorDevice) =>
+        ResolveRegistered(actorDevice).InferenceCapacity;
 }
