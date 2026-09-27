@@ -24,7 +24,10 @@ public sealed partial class ContinuousBatchExecutor
         DeviceId targetDevice,
         CancellationToken cancellationToken = default)
     {
-        var work = new PendingEstimateMigrationBytes(sequenceId, targetDevice);
+        var work = new PendingEstimateMigrationBytes(
+            sequenceId,
+            targetDevice,
+            cancellationToken);
         await SubmitControlAsync(work, cancellationToken).ConfigureAwait(false);
         if (work.EstimatedBytes <= 0)
         {
@@ -46,7 +49,8 @@ public sealed partial class ContinuousBatchExecutor
         var work = new PendingPreparePlannedMigration(
             sequenceId,
             targetDevice,
-            transportPlan);
+            transportPlan,
+            cancellationToken);
         await SubmitControlAsync(work, cancellationToken).ConfigureAwait(false);
         return work.Transfer ?? throw new InvalidOperationException(
             $"Backend {BackendName} completed planned migration prepare without a transfer token.");
@@ -69,14 +73,18 @@ public sealed partial class ContinuousBatchExecutor
 
     private sealed class PendingEstimateMigrationBytes(
         SequenceId sequenceId,
-        DeviceId targetDevice) : PendingControl
+        DeviceId targetDevice,
+        CancellationToken operationCancellationToken) : PendingControl
     {
         public long EstimatedBytes { get; private set; }
 
         public override async ValueTask ExecuteAsync(IInferenceBackend backend)
         {
             EstimatedBytes = await RequireTransportMigration(backend)
-                .EstimateSequenceMigrationBytesAsync(sequenceId, targetDevice)
+                .EstimateSequenceMigrationBytesAsync(
+                    sequenceId,
+                    targetDevice,
+                    operationCancellationToken)
                 .ConfigureAwait(false);
         }
     }
@@ -84,7 +92,8 @@ public sealed partial class ContinuousBatchExecutor
     private sealed class PendingPreparePlannedMigration(
         SequenceId sequenceId,
         DeviceId targetDevice,
-        SequenceMigrationTransportPlan transportPlan) : PendingControl
+        SequenceMigrationTransportPlan transportPlan,
+        CancellationToken operationCancellationToken) : PendingControl
     {
         public SequenceMigrationTransfer? Transfer { get; private set; }
 
@@ -94,7 +103,8 @@ public sealed partial class ContinuousBatchExecutor
                 .PrepareSequenceMigrationAsync(
                     sequenceId,
                     targetDevice,
-                    transportPlan)
+                    transportPlan,
+                    operationCancellationToken)
                 .ConfigureAwait(false);
         }
     }

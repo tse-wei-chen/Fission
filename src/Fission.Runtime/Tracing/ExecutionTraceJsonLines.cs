@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using Fission.Abstractions;
 using Fission.Abstractions.Execution;
+using Fission.Runtime.Execution;
 
 namespace Fission.Runtime.Tracing;
 
@@ -121,7 +122,11 @@ public static class ExecutionTraceJsonLines
                 traceEvent.EstimatedDuration?.Ticks,
                 traceEvent.Elapsed?.Ticks,
                 traceEvent.FailureType,
-                traceEvent.RollbackFailureCount);
+                traceEvent.RollbackFailureCount,
+                traceEvent.MigrationPhase?.ToString(),
+                traceEvent.MigrationFailureClass?.ToString(),
+                traceEvent.MigrationHealthImpact?.ToString(),
+                traceEvent.MigrationTimeout?.Ticks);
 
             await WriteRecordAsync(writer, persisted, cancellationToken).ConfigureAwait(false);
         }
@@ -255,31 +260,26 @@ public static class ExecutionTraceJsonLines
         TraceEventRecord persisted,
         int lineNumber)
     {
-        if (!Enum.TryParse<ExecutionTraceKind>(
-                persisted.Kind,
-                ignoreCase: false,
-                out var kind) ||
-            !Enum.IsDefined(kind))
-        {
-            throw new InvalidDataException(
-                $"Execution trace line {lineNumber} has unknown event kind '{persisted.Kind}'.");
-        }
-
-        SequenceMigrationTransportKind? transportKind = null;
-        if (persisted.TransportKind is not null)
-        {
-            if (!Enum.TryParse<SequenceMigrationTransportKind>(
-                    persisted.TransportKind,
-                    ignoreCase: false,
-                    out var parsedTransportKind) ||
-                !Enum.IsDefined(parsedTransportKind))
-            {
-                throw new InvalidDataException(
-                    $"Execution trace line {lineNumber} has unknown transport kind '{persisted.TransportKind}'.");
-            }
-
-            transportKind = parsedTransportKind;
-        }
+        var kind = ParseRequiredEnum<ExecutionTraceKind>(
+            persisted.Kind,
+            "event kind",
+            lineNumber);
+        var transportKind = ParseOptionalEnum<SequenceMigrationTransportKind>(
+            persisted.TransportKind,
+            "transport kind",
+            lineNumber);
+        var migrationPhase = ParseOptionalEnum<SequenceMigrationPhase>(
+            persisted.MigrationPhase,
+            "migration phase",
+            lineNumber);
+        var migrationFailureClass = ParseOptionalEnum<SequenceMigrationFailureClass>(
+            persisted.MigrationFailureClass,
+            "migration failure class",
+            lineNumber);
+        var migrationHealthImpact = ParseOptionalEnum<SequenceMigrationHealthImpact>(
+            persisted.MigrationHealthImpact,
+            "migration health impact",
+            lineNumber);
 
         if (string.IsNullOrWhiteSpace(persisted.Operation))
         {
@@ -312,7 +312,43 @@ public static class ExecutionTraceJsonLines
                 ? TimeSpan.FromTicks(elapsedTicks)
                 : null,
             persisted.FailureType,
-            persisted.RollbackFailureCount);
+            persisted.RollbackFailureCount,
+            migrationPhase,
+            migrationFailureClass,
+            migrationHealthImpact,
+            persisted.MigrationTimeoutTicks is { } migrationTimeoutTicks
+                ? TimeSpan.FromTicks(migrationTimeoutTicks)
+                : null);
+    }
+
+    private static TEnum ParseRequiredEnum<TEnum>(
+        string value,
+        string fieldName,
+        int lineNumber)
+        where TEnum : struct, Enum
+    {
+        if (!Enum.TryParse<TEnum>(value, ignoreCase: false, out var parsed) ||
+            !Enum.IsDefined(parsed))
+        {
+            throw new InvalidDataException(
+                $"Execution trace line {lineNumber} has unknown {fieldName} '{value}'.");
+        }
+
+        return parsed;
+    }
+
+    private static TEnum? ParseOptionalEnum<TEnum>(
+        string? value,
+        string fieldName,
+        int lineNumber)
+        where TEnum : struct, Enum
+    {
+        if (value is null)
+        {
+            return null;
+        }
+
+        return ParseRequiredEnum<TEnum>(value, fieldName, lineNumber);
     }
 
     private sealed record TraceHeaderRecord(
@@ -341,5 +377,9 @@ public static class ExecutionTraceJsonLines
         long? EstimatedDurationTicks,
         long? ElapsedTicks,
         string? FailureType,
-        int? RollbackFailureCount);
+        int? RollbackFailureCount,
+        string? MigrationPhase,
+        string? MigrationFailureClass,
+        string? MigrationHealthImpact,
+        long? MigrationTimeoutTicks);
 }

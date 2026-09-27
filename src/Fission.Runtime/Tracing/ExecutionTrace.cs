@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Fission.Abstractions;
 using Fission.Abstractions.Execution;
+using Fission.Runtime.Execution;
 
 namespace Fission.Runtime.Tracing;
 
@@ -39,7 +40,11 @@ public sealed record ExecutionTraceEvent(
     TimeSpan? EstimatedDuration = null,
     TimeSpan? Elapsed = null,
     string? FailureType = null,
-    int? RollbackFailureCount = null);
+    int? RollbackFailureCount = null,
+    SequenceMigrationPhase? MigrationPhase = null,
+    SequenceMigrationFailureClass? MigrationFailureClass = null,
+    SequenceMigrationHealthImpact? MigrationHealthImpact = null,
+    TimeSpan? MigrationTimeout = null);
 
 public sealed record RecordedExecutionTraceEvent(
     long Ordinal,

@@ -41,5 +41,6 @@ jobs:
       - run: dotnet run --project tests/Fission.MigrationTransport.Specs/Fission.MigrationTransport.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.MigrationTransportRuntime.Specs/Fission.MigrationTransportRuntime.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.MigrationObservability.Specs/Fission.MigrationObservability.Specs.csproj -c Release --no-build
+      - run: dotnet run --project tests/Fission.MigrationTimeout.Specs/Fission.MigrationTimeout.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.TracePersistence.Specs/Fission.TracePersistence.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.TraceStreaming.Specs/Fission.TraceStreaming.Specs.csproj -c Release --no-build
