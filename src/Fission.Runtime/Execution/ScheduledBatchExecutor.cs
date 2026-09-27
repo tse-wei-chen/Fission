@@ -64,9 +64,9 @@ public sealed record ScheduledBatchResult(
 /// <summary>
 /// Bridges the F# scheduling policy and the C# stateful runtime. The whole
 /// scheduled batch is validated first; only then are independent one-step plans
-/// launched concurrently. Their device submissions are registered into fixed
-/// scheduler-order slots and written to ContinuousBatchExecutor as one ordered
-/// envelope, so physical batch membership is not decided by producer timing.
+/// launched concurrently. Scheduler order is preserved independently on every
+/// execution device by one atomic submission envelope per device, so producer
+/// timing cannot change physical batch membership within an actor.
 /// </summary>
 public sealed class ScheduledBatchExecutor
 {
@@ -94,26 +94,59 @@ public sealed class ScheduledBatchExecutor
             return new ScheduledBatchResult(batch.ScheduleId, Array.Empty<ExecutionPlanResult>());
         }
 
-        if (prepared.Length > _runtime.DeviceInferenceCapacity)
-        {
-            throw new InvalidOperationException(
-                $"Scheduled batch {batch.ScheduleId} contains {prepared.Length} inference item(s), " +
-                $"but the device actor capacity is {_runtime.DeviceInferenceCapacity}.");
-        }
+        var deviceByIndex = new DeviceId[prepared.Length];
+        var slotByIndex = new int[prepared.Length];
+        var countsByDevice = new Dictionary<DeviceId, int>();
 
-        using var submission = ContinuousBatchExecutor.BeginAtomicSubmission(prepared.Length);
-        var pending = new Task<ExecutionPlanResult>[prepared.Length];
         for (var index = 0; index < prepared.Length; index++)
         {
-            pending[index] = ExecutePreparedAsync(index);
+            var sequenceId = prepared[index].Plan.Steps[0].SequenceId;
+            var device = _runtime.ResolveExecutionDevice(sequenceId);
+            deviceByIndex[index] = device;
+
+            countsByDevice.TryGetValue(device, out var count);
+            slotByIndex[index] = count;
+            countsByDevice[device] = checked(count + 1);
         }
 
-        var results = await Task.WhenAll(pending).ConfigureAwait(false);
-        return new ScheduledBatchResult(batch.ScheduleId, results);
+        foreach (var (device, count) in countsByDevice)
+        {
+            var capacity = _runtime.GetDeviceInferenceCapacity(device);
+            if (count > capacity)
+            {
+                throw new InvalidOperationException(
+                    $"Scheduled batch {batch.ScheduleId} contains {count} inference item(s) " +
+                    $"for device {device}, but that device actor capacity is {capacity}.");
+            }
+        }
+
+        var submissions = countsByDevice.ToDictionary(
+            static entry => entry.Key,
+            static entry => ContinuousBatchExecutor.BeginAtomicSubmission(entry.Value));
+
+        try
+        {
+            var pending = new Task<ExecutionPlanResult>[prepared.Length];
+            for (var index = 0; index < prepared.Length; index++)
+            {
+                pending[index] = ExecutePreparedAsync(index);
+            }
+
+            var results = await Task.WhenAll(pending).ConfigureAwait(false);
+            return new ScheduledBatchResult(batch.ScheduleId, results);
+        }
+        finally
+        {
+            foreach (var submission in submissions.Values)
+            {
+                submission.Dispose();
+            }
+        }
 
         async Task<ExecutionPlanResult> ExecutePreparedAsync(int index)
         {
-            using var slot = submission.EnterSlot(index);
+            var submission = submissions[deviceByIndex[index]];
+            using var slot = submission.EnterSlot(slotByIndex[index]);
             try
             {
                 return await _runtime.ExecuteAsync(
@@ -124,7 +157,11 @@ public sealed class ScheduledBatchExecutor
             }
             catch (Exception exception)
             {
-                submission.Abort(exception);
+                foreach (var pendingSubmission in submissions.Values)
+                {
+                    pendingSubmission.Abort(exception);
+                }
+
                 throw;
             }
         }
