@@ -5,6 +5,8 @@ namespace Fission.Backends.OnnxRuntime;
 
 internal sealed class DecoderOrtHostStagingTransfer : SequenceMigrationTransfer
 {
+    private int _payloadOwnerReleased;
+
     public DecoderOrtHostStagingTransfer(
         Guid transactionId,
         SequenceId sequenceId,
@@ -27,6 +29,14 @@ internal sealed class DecoderOrtHostStagingTransfer : SequenceMigrationTransfer
 
     public ModelId ModelId { get; }
     public DecoderOrtHostStagingPayload Payload { get; }
+
+    public void ReleasePayloadOwner()
+    {
+        if (Interlocked.Exchange(ref _payloadOwnerReleased, 1) == 0)
+        {
+            Payload.Dispose();
+        }
+    }
 }
 
 public sealed partial class DecoderOnlyOnnxExecutionAdapter :
@@ -106,34 +116,42 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
 
         var payload = binding.ExportHostStagingState(state, cancellationToken);
         ArgumentNullException.ThrowIfNull(payload);
-        if (!StringComparer.Ordinal.Equals(payload.FormatId, binding.HostStagingFormatId))
+        try
         {
-            throw new InvalidOperationException(
-                $"Decoder host-staging binding '{binding.Name}' exported format '{payload.FormatId}', " +
-                $"but advertises '{binding.HostStagingFormatId}'.");
-        }
+            if (!StringComparer.Ordinal.Equals(payload.FormatId, binding.HostStagingFormatId))
+            {
+                throw new InvalidOperationException(
+                    $"Decoder host-staging binding '{binding.Name}' exported format '{payload.FormatId}', " +
+                    $"but advertises '{binding.HostStagingFormatId}'.");
+            }
 
-        if (payload.Position != state.Position || payload.NextTokenId != state.NextTokenId)
+            if (payload.Position != state.Position || payload.NextTokenId != state.NextTokenId)
+            {
+                throw new InvalidOperationException(
+                    "Decoder host-staging payload causal frontier does not match the source state.");
+            }
+
+            if (payload.ByteLength != expectedBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Decoder host-staging payload contains {payload.ByteLength} byte(s), but prepare estimated {expectedBytes}.");
+            }
+
+            SequenceMigrationTransfer transfer = new DecoderOrtHostStagingTransfer(
+                Guid.NewGuid(),
+                sequenceId,
+                sourceDevice,
+                targetDevice,
+                modelId,
+                payload,
+                transportPlan);
+            return ValueTask.FromResult(transfer);
+        }
+        catch
         {
-            throw new InvalidOperationException(
-                "Decoder host-staging payload causal frontier does not match the source state.");
+            payload.Dispose();
+            throw;
         }
-
-        if (payload.ByteLength != expectedBytes)
-        {
-            throw new InvalidOperationException(
-                $"Decoder host-staging payload contains {payload.ByteLength} byte(s), but prepare estimated {expectedBytes}.");
-        }
-
-        SequenceMigrationTransfer transfer = new DecoderOrtHostStagingTransfer(
-            Guid.NewGuid(),
-            sequenceId,
-            sourceDevice,
-            targetDevice,
-            modelId,
-            payload,
-            transportPlan);
-        return ValueTask.FromResult(transfer);
     }
 
     ValueTask IOnnxRuntimeSequenceMigrationAdapter.ImportSequenceMigrationAsync(
@@ -190,6 +208,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
                 $"Decoder source state does not exist for migration sequence {staged.SequenceId}.");
         }
 
+        staged.ReleasePayloadOwner();
         return ValueTask.CompletedTask;
     }
 
@@ -218,6 +237,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
 
         if (_states.TryGetSequence(staged.SequenceId, out _))
         {
+            staged.ReleasePayloadOwner();
             return ValueTask.CompletedTask;
         }
 
@@ -228,6 +248,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
         {
             ValidateImportedState(staged.Payload, restored);
             _states.AddSequence(staged.SequenceId, restored);
+            staged.ReleasePayloadOwner();
         }
         catch
         {
