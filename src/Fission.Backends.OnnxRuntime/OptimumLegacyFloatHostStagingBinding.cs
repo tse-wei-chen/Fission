@@ -4,11 +4,11 @@ using Microsoft.ML.OnnxRuntime;
 namespace Fission.Backends.OnnxRuntime;
 
 /// <summary>
-/// Opt-in decorator that adds a real managed-host migration codec to the existing
+/// Opt-in decorator that adds a managed-host migration codec to the existing
 /// Optimum legacy FP32 decoder binding without changing its inference behavior.
-/// Source export deep-copies every K/V tensor into managed arrays. Target import
-/// creates new OrtValue views over those staged arrays and anchors the payload to
-/// the resulting DecoderOrtState lifetime.
+/// Source export deep-copies every K/V tensor into exact-length GC-pinned pooled
+/// arrays. Target import creates new OrtValue views over those staged arrays and
+/// retains the payload until the imported immutable state is disposed.
 /// </summary>
 public sealed class OptimumLegacyFloatHostStagingBinding :
     IDecoderOrtHostStagingBinding,
@@ -18,19 +18,30 @@ public sealed class OptimumLegacyFloatHostStagingBinding :
 {
     private const long MetadataBytes = sizeof(int) * 2L;
     private readonly OptimumLegacyFloatDecoderBinding _inner;
+    private readonly PinnedFloatBufferPool _stagingPool;
     private int _disposed;
 
     public OptimumLegacyFloatHostStagingBinding(
         OptimumLegacyFloatDecoderBinding inner)
+        : this(inner, stagingPoolOptions: null)
+    {
+    }
+
+    public OptimumLegacyFloatHostStagingBinding(
+        OptimumLegacyFloatDecoderBinding inner,
+        PinnedHostStagingPoolOptions? stagingPoolOptions)
     {
         ArgumentNullException.ThrowIfNull(inner);
         _inner = inner;
+        _stagingPool = new PinnedFloatBufferPool(stagingPoolOptions);
     }
 
     public string Name => _inner.Name;
     public OnnxSessionContract SessionContract => _inner.SessionContract;
     public DecoderOrtGeometry Geometry => _inner.Geometry;
     public OptimumLegacyFloatDecoderBinding Inner => _inner;
+    public PinnedHostStagingPoolStatistics HostStagingPoolStatistics =>
+        _stagingPool.GetStatistics();
 
     public string HostStagingFormatId =>
         $"optimum-legacy-fp32-kv-v1:l{Geometry.NumHiddenLayers}:h{Geometry.NumKvHeads}:d{Geometry.HeadDim}";
@@ -121,33 +132,56 @@ public sealed class OptimumLegacyFloatHostStagingBinding :
 
         var expectedElementsPerTensor = checked(
             Geometry.NumKvHeads * state.Position * Geometry.HeadDim);
-        var keys = new float[Geometry.NumHiddenLayers][];
-        var values = new float[Geometry.NumHiddenLayers][];
+        var keys = new PinnedFloatBufferPool.PinnedFloatBufferLease[Geometry.NumHiddenLayers];
+        var values = new PinnedFloatBufferPool.PinnedFloatBufferLease[Geometry.NumHiddenLayers];
+        var acquired = new List<PinnedFloatBufferPool.PinnedFloatBufferLease>(
+            Geometry.NumHiddenLayers * 2);
 
-        for (var layer = 0; layer < Geometry.NumHiddenLayers; layer++)
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var source = state.GetLayer(layer);
-            var sourceKey = source.Key.GetTensorDataAsSpan<float>();
-            var sourceValue = source.Value.GetTensorDataAsSpan<float>();
-            if (sourceKey.Length != expectedElementsPerTensor ||
-                sourceValue.Length != expectedElementsPerTensor)
+            for (var layer = 0; layer < Geometry.NumHiddenLayers; layer++)
             {
-                throw new InvalidOperationException(
-                    $"Decoder layer {layer} KV payload does not match position {state.Position} and configured geometry.");
+                cancellationToken.ThrowIfCancellationRequested();
+                var source = state.GetLayer(layer);
+                var sourceKey = source.Key.GetTensorDataAsSpan<float>();
+                var sourceValue = source.Value.GetTensorDataAsSpan<float>();
+                if (sourceKey.Length != expectedElementsPerTensor ||
+                    sourceValue.Length != expectedElementsPerTensor)
+                {
+                    throw new InvalidOperationException(
+                        $"Decoder layer {layer} KV payload does not match position {state.Position} and configured geometry.");
+                }
+
+                var keyBuffer = _stagingPool.Rent(expectedElementsPerTensor);
+                acquired.Add(keyBuffer);
+                sourceKey.CopyTo(keyBuffer.Span);
+                keys[layer] = keyBuffer;
+
+                var valueBuffer = _stagingPool.Rent(expectedElementsPerTensor);
+                acquired.Add(valueBuffer);
+                sourceValue.CopyTo(valueBuffer.Span);
+                values[layer] = valueBuffer;
             }
 
-            keys[layer] = sourceKey.ToArray();
-            values[layer] = sourceValue.ToArray();
+            var payload = new OptimumLegacyFloatHostStagingPayload(
+                HostStagingFormatId,
+                state.Position,
+                state.NextTokenId,
+                EstimateHostStagingBytes(state),
+                keys,
+                values);
+            acquired.Clear();
+            return payload;
         }
+        catch
+        {
+            for (var index = acquired.Count - 1; index >= 0; index--)
+            {
+                acquired[index].Dispose();
+            }
 
-        return new OptimumLegacyFloatHostStagingPayload(
-            HostStagingFormatId,
-            state.Position,
-            state.NextTokenId,
-            EstimateHostStagingBytes(state),
-            keys,
-            values);
+            throw;
+        }
     }
 
     public DecoderOrtState ImportHostStagingState(
@@ -185,14 +219,17 @@ public sealed class OptimumLegacyFloatHostStagingBinding :
             Geometry.NumKvHeads * staged.Position * Geometry.HeadDim);
         var layers = new DecoderOrtLayerState[Geometry.NumHiddenLayers];
         var owned = new List<OrtValue>(Geometry.NumHiddenLayers * 2);
+        IDisposable? lifetimeLease = null;
 
         try
         {
+            lifetimeLease = staged.Retain();
+
             for (var layer = 0; layer < Geometry.NumHiddenLayers; layer++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var keyBuffer = staged.Keys[layer];
-                var valueBuffer = staged.Values[layer];
+                var keyBuffer = staged.Keys[layer].Buffer;
+                var valueBuffer = staged.Values[layer].Buffer;
                 if (keyBuffer.Length != expectedElementsPerTensor ||
                     valueBuffer.Length != expectedElementsPerTensor)
                 {
@@ -211,7 +248,8 @@ public sealed class OptimumLegacyFloatHostStagingBinding :
                 staged.Position,
                 layers,
                 staged.NextTokenId,
-                lifetimeAnchor: staged);
+                lifetimeAnchor: lifetimeLease);
+            lifetimeLease = null;
             owned.Clear();
             return state;
         }
@@ -222,6 +260,7 @@ public sealed class OptimumLegacyFloatHostStagingBinding :
                 owned[index].Dispose();
             }
 
+            lifetimeLease?.Dispose();
             throw;
         }
     }
@@ -251,6 +290,7 @@ public sealed class OptimumLegacyFloatHostStagingBinding :
             return;
         }
 
+        _stagingPool.Dispose();
         _inner.Dispose();
     }
 
@@ -262,8 +302,8 @@ public sealed class OptimumLegacyFloatHostStagingBinding :
             int position,
             int? nextTokenId,
             long byteLength,
-            IReadOnlyList<float[]> keys,
-            IReadOnlyList<float[]> values)
+            IReadOnlyList<PinnedFloatBufferPool.PinnedFloatBufferLease> keys,
+            IReadOnlyList<PinnedFloatBufferPool.PinnedFloatBufferLease> values)
             : base(formatId, position, nextTokenId, byteLength)
         {
             ArgumentNullException.ThrowIfNull(keys);
@@ -272,7 +312,20 @@ public sealed class OptimumLegacyFloatHostStagingBinding :
             Values = values.ToArray();
         }
 
-        public IReadOnlyList<float[]> Keys { get; }
-        public IReadOnlyList<float[]> Values { get; }
+        public IReadOnlyList<PinnedFloatBufferPool.PinnedFloatBufferLease> Keys { get; }
+        public IReadOnlyList<PinnedFloatBufferPool.PinnedFloatBufferLease> Values { get; }
+
+        protected override void DisposeCore()
+        {
+            for (var index = Values.Count - 1; index >= 0; index--)
+            {
+                Values[index].Dispose();
+            }
+
+            for (var index = Keys.Count - 1; index >= 0; index--)
+            {
+                Keys[index].Dispose();
+            }
+        }
     }
 }
