@@ -386,12 +386,30 @@ public sealed class ExecutionPlanExecutor : IDisposable
 
                     _devices.ValidateMigrationTarget(migrate.TargetDevice);
                     var sourceDevice = _devices.ResolvePlacement(sequence.Device);
-                    await sourceDevice.MigrateSequenceAsync(
-                            sequence.Id,
-                            migrate.TargetDevice,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    sequence.MigrateTo(migrate.TargetDevice);
+                    var targetDevice = _devices.ResolvePlacement(migrate.TargetDevice);
+
+                    if (!ReferenceEquals(sourceDevice, targetDevice) &&
+                        sourceDevice.SupportsTransactionalMigration &&
+                        targetDevice.SupportsTransactionalMigration)
+                    {
+                        await ExecuteTransactionalMigrationAsync(
+                                sequence,
+                                sourceDevice,
+                                targetDevice,
+                                migrate.TargetDevice,
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await sourceDevice.MigrateSequenceAsync(
+                                sequence.Id,
+                                migrate.TargetDevice,
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        sequence.MigrateTo(migrate.TargetDevice);
+                    }
+
                     break;
                 }
 
@@ -414,6 +432,80 @@ public sealed class ExecutionPlanExecutor : IDisposable
             "Plan"));
 
         return new ExecutionPlanResult(plan.PlanId, backendResults, snapshotIds, forks);
+    }
+
+    private static async ValueTask ExecuteTransactionalMigrationAsync(
+        SequenceProcess sequence,
+        ContinuousBatchExecutor sourceDevice,
+        ContinuousBatchExecutor targetDevice,
+        DeviceId targetPlacement,
+        CancellationToken cancellationToken)
+    {
+        SequenceMigrationTransfer? transfer = null;
+        var importAttempted = false;
+
+        try
+        {
+            transfer = await sourceDevice.PrepareSequenceMigrationAsync(
+                    sequence.Id,
+                    targetPlacement,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            importAttempted = true;
+            await targetDevice.ImportSequenceMigrationAsync(transfer, cancellationToken)
+                .ConfigureAwait(false);
+
+            await sourceDevice.CommitSequenceMigrationAsync(transfer, cancellationToken)
+                .ConfigureAwait(false);
+
+            sequence.MigrateTo(targetPlacement);
+        }
+        catch (Exception failure)
+        {
+            if (transfer is null)
+            {
+                throw;
+            }
+
+            var rollbackFailures = new List<Exception>();
+
+            if (importAttempted)
+            {
+                try
+                {
+                    await targetDevice.AbortSequenceMigrationAsync(
+                            transfer,
+                            CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception rollbackFailure)
+                {
+                    rollbackFailures.Add(rollbackFailure);
+                }
+            }
+
+            try
+            {
+                await sourceDevice.AbortSequenceMigrationAsync(
+                        transfer,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception rollbackFailure)
+            {
+                rollbackFailures.Add(rollbackFailure);
+            }
+
+            if (rollbackFailures.Count == 0)
+            {
+                throw;
+            }
+
+            throw new AggregateException(
+                $"Sequence migration transaction {transfer.TransactionId} failed and rollback also encountered errors.",
+                new[] { failure }.Concat(rollbackFailures));
+        }
     }
 
     private PlanReservation ReservePlan(CompiledExecutionPlan plan)
