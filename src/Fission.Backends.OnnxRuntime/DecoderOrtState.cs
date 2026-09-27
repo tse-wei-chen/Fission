@@ -2,6 +2,11 @@ using Microsoft.ML.OnnxRuntime;
 
 namespace Fission.Backends.OnnxRuntime;
 
+internal interface IDecoderOrtOwnedLifetimeAnchor
+{
+    void Release();
+}
+
 public readonly record struct DecoderOrtLayerState(
     OrtValue Key,
     OrtValue Value);
@@ -47,7 +52,9 @@ public sealed class DecoderOrtState : IDisposable
     /// <summary>
     /// Creates a state whose OrtValues are views over memory owned by an external
     /// managed object. The anchor is retained until after all OrtValues are
-    /// disposed so pinned host-staging buffers cannot be reclaimed early.
+    /// disposed so host-staging buffers cannot be reclaimed early. Ordinary
+    /// caller-supplied anchors are retained only; Fission-owned host-staging leases
+    /// additionally receive a Release callback during state disposal.
     /// </summary>
     public DecoderOrtState(
         int position,
@@ -207,6 +214,10 @@ public sealed class DecoderOrtState : IDisposable
             slice.Arena.Release();
         }
 
-        _lifetimeAnchor = null;
+        var lifetimeAnchor = Interlocked.Exchange(ref _lifetimeAnchor, null);
+        if (lifetimeAnchor is IDecoderOrtOwnedLifetimeAnchor ownedAnchor)
+        {
+            ownedAnchor.Release();
+        }
     }
 }
