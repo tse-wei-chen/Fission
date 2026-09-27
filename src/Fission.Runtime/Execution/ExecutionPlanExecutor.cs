@@ -96,7 +96,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
 
     internal DeviceId ResolveExecutionDevice(SequenceId sequenceId) =>
         _sequences.TryGetValue(sequenceId, out var sequence)
-            ? sequence.Device
+            ? _devices.ResolvePlacement(sequence.Device).Device
             : _devices.DefaultDevice;
 
     internal int GetDeviceInferenceCapacity(DeviceId device) =>
@@ -122,7 +122,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
                     $"Cannot release sequence {sequenceId} while it is {sequence.Status}.");
             }
 
-            var device = _devices.Resolve(sequence.Device);
+            var device = _devices.ResolvePlacement(sequence.Device);
             await device.ReleaseSequenceAsync(sequenceId, cancellationToken)
                 .ConfigureAwait(false);
 
@@ -154,7 +154,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
                 return false;
             }
 
-            var device = _devices.Resolve(snapshot.Device);
+            var device = _devices.ResolvePlacement(snapshot.Device);
             await device.ReleaseSnapshotAsync(snapshotId, cancellationToken)
                 .ConfigureAwait(false);
 
@@ -221,7 +221,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
                 case SnapshotKvExecutionStep snapshot:
                 {
                     var sequence = GetSequence(snapshot.SequenceId);
-                    var device = _devices.Resolve(sequence.Device);
+                    var device = _devices.ResolvePlacement(sequence.Device);
                     var state = sequence.Snapshot();
 
                     try
@@ -264,7 +264,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
                 {
                     ArgumentOutOfRangeException.ThrowIfNegativeOrZero(fork.Branches);
                     var parent = GetSequence(fork.SequenceId);
-                    var device = _devices.Resolve(parent.Device);
+                    var device = _devices.ResolvePlacement(parent.Device);
                     var branches = new SequenceProcess[fork.Branches];
                     var branchIds = new SequenceId[fork.Branches];
 
@@ -358,15 +358,16 @@ public sealed class ExecutionPlanExecutor : IDisposable
                             $"Snapshot {restore.SnapshotId} is not owned by this executor.");
                     }
 
-                    if (sequence.Device != ownedSnapshot.Device)
+                    var sequenceDevice = _devices.ResolvePlacement(sequence.Device);
+                    var snapshotDevice = _devices.ResolvePlacement(ownedSnapshot.Device);
+                    if (!ReferenceEquals(sequenceDevice, snapshotDevice))
                     {
                         throw new InvalidOperationException(
                             $"Cannot restore snapshot {restore.SnapshotId} on sequence {sequence.Id}: " +
                             $"snapshot state belongs to device {ownedSnapshot.Device}, but the sequence is on {sequence.Device}.");
                     }
 
-                    var device = _devices.Resolve(sequence.Device);
-                    await device.RestoreSequenceAsync(
+                    await sequenceDevice.RestoreSequenceAsync(
                             sequence.Id,
                             restore.SnapshotId,
                             cancellationToken)
@@ -383,8 +384,8 @@ public sealed class ExecutionPlanExecutor : IDisposable
                         break;
                     }
 
-                    _ = _devices.Resolve(migrate.TargetDevice);
-                    var sourceDevice = _devices.Resolve(sequence.Device);
+                    _devices.ValidateMigrationTarget(migrate.TargetDevice);
+                    var sourceDevice = _devices.ResolvePlacement(sequence.Device);
                     await sourceDevice.MigrateSequenceAsync(
                             sequence.Id,
                             migrate.TargetDevice,
@@ -513,7 +514,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
         }
 
         var tokens = bindings.ResolvePrefill(step.SequenceId, step.TokenCount);
-        var device = _devices.Resolve(sequence.Device);
+        var device = _devices.ResolvePlacement(sequence.Device);
         var result = await device.SubmitPrefillAsync(
             new PrefillItem(step.SequenceId, step.ModelId, tokens),
             cancellationToken).ConfigureAwait(false);
@@ -546,7 +547,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
                 $"Cannot decode sequence {step.SequenceId} while it is {sequence.Status}.");
         }
 
-        var device = _devices.Resolve(sequence.Device);
+        var device = _devices.ResolvePlacement(sequence.Device);
         for (var index = 0; index < step.MaxTokens; index++)
         {
             var result = await device.SubmitDecodeAsync(
