@@ -150,14 +150,18 @@ public sealed partial class ExecutionPlanExecutor
             importAttempted = true;
             await RunMigrationPhaseAsync(
                     currentPhase,
-                    token => targetDevice.ImportSequenceMigrationAsync(transfer, token),
+                    token => targetDevice.ImportSequenceMigrationCancellableAsync(
+                        transfer,
+                        token),
                     cancellationToken)
                 .ConfigureAwait(false);
 
             currentPhase = SequenceMigrationPhase.Commit;
             await RunMigrationPhaseAsync(
                     currentPhase,
-                    token => sourceDevice.CommitSequenceMigrationAsync(transfer, token),
+                    token => sourceDevice.CommitSequenceMigrationCancellableAsync(
+                        transfer,
+                        token),
                     cancellationToken)
                 .ConfigureAwait(false);
 
@@ -392,7 +396,9 @@ public sealed partial class ExecutionPlanExecutor
             {
                 await RunMigrationPhaseAsync(
                         SequenceMigrationPhase.TargetRollback,
-                        token => targetDevice.AbortSequenceMigrationAsync(transfer, token),
+                        token => targetDevice.AbortSequenceMigrationCancellableAsync(
+                            transfer,
+                            token),
                         CancellationToken.None)
                     .ConfigureAwait(false);
             }
@@ -410,7 +416,9 @@ public sealed partial class ExecutionPlanExecutor
         {
             await RunMigrationPhaseAsync(
                     SequenceMigrationPhase.SourceRollback,
-                    token => sourceDevice.AbortSequenceMigrationAsync(transfer, token),
+                    token => sourceDevice.AbortSequenceMigrationCancellableAsync(
+                        transfer,
+                        token),
                     CancellationToken.None)
                 .ConfigureAwait(false);
         }
