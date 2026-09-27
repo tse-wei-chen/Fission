@@ -54,6 +54,12 @@ public sealed record SequenceMigrationTransportPlan(
 /// </summary>
 public interface ISequenceMigrationTransportBackend : ISequenceMigrationBackend
 {
+    /// <summary>
+    /// Conditional transport-awareness for generic backend hosts. Dedicated
+    /// transport backends keep the default true value.
+    /// </summary>
+    bool SupportsTransportAwareSequenceMigration => SupportsSequenceMigration;
+
     IReadOnlyList<SequenceMigrationTransportCapability> GetSequenceMigrationTransportCapabilities(
         DeviceId peerDevice);
 
