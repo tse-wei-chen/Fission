@@ -24,4 +24,5 @@
   <Project Path="tests/Fission.OnnxRuntime.OptimumBatch.Specs/Fission.OnnxRuntime.OptimumBatch.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.OptimumPrefillBatch.Specs/Fission.OnnxRuntime.OptimumPrefillBatch.Specs.csproj" />
   <Project Path="tests/Fission.BackendTransactions.Specs/Fission.BackendTransactions.Specs.csproj" />
+  <Project Path="tests/Fission.Migration.Specs/Fission.Migration.Specs.csproj" />
 </Solution>

@@ -348,6 +348,11 @@ public sealed class ExecutionPlanExecutor : IDisposable
                 case MigrateKvExecutionStep migrate:
                 {
                     var sequence = GetSequence(migrate.SequenceId);
+                    await _device.MigrateSequenceAsync(
+                            sequence.Id,
+                            migrate.TargetDevice,
+                            cancellationToken)
+                        .ConfigureAwait(false);
                     sequence.MigrateTo(migrate.TargetDevice);
                     break;
                 }
