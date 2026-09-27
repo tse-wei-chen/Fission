@@ -3,12 +3,21 @@ using Fission.Abstractions.Execution;
 namespace Fission.Backends.OnnxRuntime;
 
 /// <summary>
-/// Immutable managed-memory representation of one decoder state during host-staged
-/// migration. Concrete bindings own the payload format; the generic adapter only
-/// carries it between source and target actors.
+/// Host-memory representation of one decoder state during staged migration.
+/// Concrete bindings own the payload format and may own pooled/pinned buffers.
+///
+/// One owner reference belongs to the migration transfer. Bindings whose imported
+/// OrtValues are views over payload memory must call <see cref="Retain"/> and pass
+/// the returned lease as the DecoderOrtState lifetime anchor. The source-side
+/// terminal commit/abort releases the transfer owner; buffers are reclaimed only
+/// after every retained state lease is also released.
 /// </summary>
-public abstract class DecoderOrtHostStagingPayload
+public abstract class DecoderOrtHostStagingPayload : IDisposable
 {
+    private int _referenceCount = 1;
+    private int _ownerReleased;
+    private int _resourcesDisposed;
+
     protected DecoderOrtHostStagingPayload(
         string formatId,
         int position,
@@ -38,13 +47,109 @@ public abstract class DecoderOrtHostStagingPayload
     public int Position { get; }
     public int? NextTokenId { get; }
     public long ByteLength { get; }
+    public bool IsDisposed => Volatile.Read(ref _resourcesDisposed) != 0;
+
+    /// <summary>
+    /// Retains payload-owned host memory for a state whose OrtValues alias that
+    /// memory. Dispose the returned lease only after all such OrtValues are gone.
+    /// DecoderOrtState recognizes this lease as an owned lifetime anchor and does
+    /// that automatically when the lease is passed to its lifetime-anchor constructor.
+    /// </summary>
+    public IDisposable Retain()
+    {
+        while (true)
+        {
+            if (Volatile.Read(ref _ownerReleased) != 0)
+            {
+                throw new ObjectDisposedException(GetType().Name);
+            }
+
+            var current = Volatile.Read(ref _referenceCount);
+            if (current <= 0)
+            {
+                throw new ObjectDisposedException(GetType().Name);
+            }
+
+            if (current == int.MaxValue)
+            {
+                throw new InvalidOperationException("Host-staging payload reference count overflowed.");
+            }
+
+            if (Interlocked.CompareExchange(
+                    ref _referenceCount,
+                    current + 1,
+                    current) == current)
+            {
+                return new PayloadLifetimeLease(this);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Releases the migration transfer's owner reference. Derived payloads can
+    /// override <see cref="DisposeCore"/> to return pooled/pinned buffers when the
+    /// final retained state lease is also gone.
+    /// </summary>
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _ownerReleased, 1) != 0)
+        {
+            return;
+        }
+
+        ReleaseReference();
+        GC.SuppressFinalize(this);
+    }
+
+    protected virtual void DisposeCore()
+    {
+    }
+
+    private void ReleaseReference()
+    {
+        var remaining = Interlocked.Decrement(ref _referenceCount);
+        if (remaining < 0)
+        {
+            throw new InvalidOperationException("Host-staging payload reference count underflowed.");
+        }
+
+        if (remaining != 0)
+        {
+            return;
+        }
+
+        if (Interlocked.Exchange(ref _resourcesDisposed, 1) == 0)
+        {
+            DisposeCore();
+        }
+    }
+
+    private sealed class PayloadLifetimeLease :
+        IDisposable,
+        IDecoderOrtOwnedLifetimeAnchor
+    {
+        private DecoderOrtHostStagingPayload? _payload;
+
+        public PayloadLifetimeLease(DecoderOrtHostStagingPayload payload)
+        {
+            _payload = payload;
+        }
+
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _payload, null)?.ReleaseReference();
+        }
+
+        void IDecoderOrtOwnedLifetimeAnchor.Release() => Dispose();
+    }
 }
 
 /// <summary>
 /// Optional decoder-binding codec for a real host-staging migration data path.
-/// Export must deep-copy the immutable live state into managed host memory.
-/// Import must create a newly owned DecoderOrtState whose OrtValues do not alias
-/// the source decoder state's OrtValue instances.
+/// Export must deep-copy the live state into payload-owned host memory. Import
+/// must create a newly owned DecoderOrtState whose OrtValues do not alias source
+/// decoder OrtValues. If imported OrtValues alias payload memory, retain the
+/// payload and pass that lease as the DecoderOrtState lifetime anchor.
 /// </summary>
 public interface IDecoderOrtHostStagingBinding : IDecoderOrtModelBinding
 {
