@@ -62,6 +62,14 @@ public abstract class SequenceMigrationTransfer
 /// </summary>
 public interface ISequenceMigrationBackend
 {
+    /// <summary>
+    /// Allows a backend type that conditionally exposes migration (for example a
+    /// generic session host whose adapter may or may not own migratable state) to
+    /// participate without making every instance appear migration-capable.
+    /// Existing dedicated migration backends inherit the default true value.
+    /// </summary>
+    bool SupportsSequenceMigration => true;
+
     ValueTask<SequenceMigrationTransfer> PrepareSequenceMigrationAsync(
         SequenceId sequenceId,
         DeviceId targetDevice,
