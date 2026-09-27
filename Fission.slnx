@@ -32,4 +32,5 @@
   <Project Path="tests/Fission.MigrationTransportRuntime.Specs/Fission.MigrationTransportRuntime.Specs.csproj" />
   <Project Path="tests/Fission.MigrationObservability.Specs/Fission.MigrationObservability.Specs.csproj" />
   <Project Path="tests/Fission.TracePersistence.Specs/Fission.TracePersistence.Specs.csproj" />
+  <Project Path="tests/Fission.TraceStreaming.Specs/Fission.TraceStreaming.Specs.csproj" />
 </Solution>
