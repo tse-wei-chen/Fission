@@ -1,0 +1,72 @@
+namespace Fission.Abstractions.Execution;
+
+/// <summary>
+/// Opaque backend-owned transfer object carried by the runtime between source and
+/// target device actors. Implementations may wrap host buffers, CUDA IPC handles,
+/// NIXL/RDMA descriptors, shared immutable state, or another backend-specific
+/// transfer representation. The runtime never inspects the payload.
+/// </summary>
+public abstract class SequenceMigrationTransfer : IAsyncDisposable
+{
+    protected SequenceMigrationTransfer(
+        Guid transactionId,
+        SequenceId sequenceId,
+        DeviceId sourceDevice,
+        DeviceId targetDevice)
+    {
+        if (transactionId == Guid.Empty)
+        {
+            throw new ArgumentException("Migration transaction id cannot be empty.", nameof(transactionId));
+        }
+
+        TransactionId = transactionId;
+        SequenceId = sequenceId;
+        SourceDevice = sourceDevice;
+        TargetDevice = targetDevice;
+    }
+
+    public Guid TransactionId { get; }
+    public SequenceId SequenceId { get; }
+    public DeviceId SourceDevice { get; }
+    public DeviceId TargetDevice { get; }
+
+    public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+/// <summary>
+/// Optional two-actor migration protocol for stateful backends.
+///
+/// The runtime executes the protocol in this order:
+/// 1. prepare on the source actor,
+/// 2. import on the target actor,
+/// 3. commit on the source actor,
+/// 4. publish runtime placement.
+///
+/// If import or commit fails, AbortSequenceMigrationAsync is invoked best-effort
+/// on target and source with caller cancellation suppressed. Implementations must
+/// therefore retain enough source state during prepare/commit to restore the
+/// source when abort follows a failed commit. Import must likewise be reversible.
+///
+/// Commit is the source-side destructive/finalizing phase. A successful commit
+/// means the target already owns runnable state. Runtime metadata is changed only
+/// after commit returns successfully.
+/// </summary>
+public interface ISequenceMigrationBackend
+{
+    ValueTask<SequenceMigrationTransfer> PrepareSequenceMigrationAsync(
+        SequenceId sequenceId,
+        DeviceId targetDevice,
+        CancellationToken cancellationToken = default);
+
+    ValueTask ImportSequenceMigrationAsync(
+        SequenceMigrationTransfer transfer,
+        CancellationToken cancellationToken = default);
+
+    ValueTask CommitSequenceMigrationAsync(
+        SequenceMigrationTransfer transfer,
+        CancellationToken cancellationToken = default);
+
+    ValueTask AbortSequenceMigrationAsync(
+        SequenceMigrationTransfer transfer,
+        CancellationToken cancellationToken = default);
+}
