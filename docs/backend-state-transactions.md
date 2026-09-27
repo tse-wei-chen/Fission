@@ -18,14 +18,17 @@ decode(A)
 
 the executor flushes the first inference segment, executes the snapshot control, then starts the later inference segment. The two decodes cannot be coalesced ahead of the snapshot.
 
-The serialized backend controls are:
+The serialized backend controls include:
 
 - `SnapshotSequenceAsync`
 - `ForkSequenceAsync`
 - `RestoreSequenceAsync`
-- `MigrateSequenceAsync`
+- legacy `MigrateSequenceAsync`
+- transactional migration prepare/import/commit/abort
 - `ReleaseSnapshotAsync`
 - `ReleaseSequenceAsync`
+
+Transaction-control exceptions fail only the submitted control and do not terminate the device actor. This is required so migration rollback can enqueue abort work after an import or commit failure. Inference execution failures remain actor-fatal because a failed backend batch may have partially advanced model-owned state.
 
 Stateless `IInferenceBackend` implementations may use the default no-op transaction hooks. Stateful adapters must implement the operations they support.
 
@@ -63,17 +66,23 @@ For restore:
 4. Execute the backend restore barrier.
 5. Restore metadata KV and position.
 
-For migration:
+For migration, the preferred cross-actor path is the optional `ISequenceMigrationBackend` protocol:
 
 1. Reserve the sequence for the plan lifetime.
-2. When multiple actors are registered, validate that the target `DeviceId` has an execution actor.
-3. Execute the backend migration barrier on the current/source actor.
-4. Require the backend/fabric to make the target actor able to continue the sequence before the hook returns.
-5. Commit `SequenceProcess.Device` only after backend migration succeeds.
-6. Route subsequent inference and sequence release to the target actor.
-7. If backend migration fails, leave runtime device metadata and sequence version unchanged.
+2. Validate that the target `DeviceId` resolves to a registered actor.
+3. `PrepareSequenceMigrationAsync` on the source actor and obtain an opaque `SequenceMigrationTransfer`.
+4. `ImportSequenceMigrationAsync` on the target actor.
+5. `CommitSequenceMigrationAsync` on the source actor.
+6. Commit `SequenceProcess.Device` only after source commit succeeds.
+7. Route later inference and release to the target actor.
 
-A one-actor registry preserves backend-internal migration: the logical placement may change to an unregistered `DeviceId`, but later work continues through the same actor and the backend owns internal routing.
+The transfer token carries transaction, sequence, source-device, and target-device identity. Its backend-specific payload is represented by the concrete transfer type; the runtime does not inspect physical transport state.
+
+If import or commit fails, the runtime keeps `SequenceProcess.Device` and sequence version unchanged, then invokes `AbortSequenceMigrationAsync` on target and source using `CancellationToken.None`. Target abort must remove any partially imported state. Source abort must restore source state even when commit failed after destructive work. Abort should therefore be idempotent for a transfer that may only have been partially applied.
+
+Prepare failure is different: because no transfer token reaches the runtime, a backend prepare operation must leave the source usable before propagating its exception.
+
+When source and target resolve to the same actor, or when both actors do not advertise `ISequenceMigrationBackend`, Fission keeps the existing legacy `MigrateSequenceAsync` hook. This preserves one-actor backend-internal routing and existing migration-capable fabrics while allowing newer backends to opt into explicit rollback semantics.
 
 For release:
 
@@ -87,12 +96,10 @@ Backend release happens before metadata removal. If backend cleanup fails, runti
 
 ## ONNX Runtime adapters
 
-`OnnxRuntimeBackend` forwards transaction controls to `IOnnxRuntimeExecutionAdapter`.
+`OnnxRuntimeBackend` forwards the legacy transaction controls to `IOnnxRuntimeExecutionAdapter`.
 
-The ONNX adapter boundary owns model/export-specific physical state semantics. An adapter that does not implement snapshot/fork/restore/migrate throws `NotSupportedException`; Fission must not silently pretend metadata-only state changes are valid for a stateful model.
-
-A future causal-LM adapter can implement snapshots with immutable/shared OrtValue state, copy-on-write KV pages, migration to another execution provider/device, or another representation without changing scheduler, engine, or serving contracts.
+The current ONNX adapter does not implement physical cross-device migration and therefore still rejects migration. A future causal-LM adapter may implement `ISequenceMigrationBackend` at the backend/fabric layer and use immutable/shared OrtValue state, CUDA IPC, staged host transfer, NIXL/RDMA, or another transport without changing scheduler or plan contracts.
 
 ## Current scope
 
-The runtime now supports multiple registered device actors, placement-aware inference/control routing, migration target admission, snapshot locality, and per-device scheduler envelopes. It still does not provide a concrete ONNX/CUDA/NIXL/RDMA KV transfer implementation or automatic placement policy. See `multi-device-runtime.md` for the actor-routing boundary.
+The runtime supports multiple registered device actors, placement-aware routing, snapshot locality, per-device scheduler envelopes, explicit source/target migration transactions, rollback after partial target import or source commit failure, and control-failure isolation. It still does not provide a concrete CUDA/NIXL/RDMA transfer implementation, topology-aware placement policy, bandwidth admission, or distributed recovery after process/node loss. See `multi-device-runtime.md` and `migration-transfer-protocol.md` for the current boundaries.
