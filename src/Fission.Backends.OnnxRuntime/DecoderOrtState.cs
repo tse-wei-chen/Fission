@@ -24,13 +24,14 @@ public sealed class DecoderOrtState : IDisposable
 {
     private readonly DecoderOrtLayerState[] _layers;
     private DecoderOrtCohortSlice? _cohortSlice;
+    private object? _lifetimeAnchor;
     private int _disposed;
 
     public DecoderOrtState(
         int position,
         IReadOnlyList<DecoderOrtLayerState> layers,
         int? nextTokenId = null)
-        : this(position, layers, nextTokenId, cohortSlice: null)
+        : this(position, layers, nextTokenId, cohortSlice: null, lifetimeAnchor: null)
     {
     }
 
@@ -39,15 +40,31 @@ public sealed class DecoderOrtState : IDisposable
         IReadOnlyList<DecoderOrtLayerState> layers,
         int? nextTokenId,
         DecoderOrtCohortSlice cohortSlice)
-        : this(position, layers, nextTokenId, (DecoderOrtCohortSlice?)cohortSlice)
+        : this(position, layers, nextTokenId, (DecoderOrtCohortSlice?)cohortSlice, lifetimeAnchor: null)
     {
+    }
+
+    /// <summary>
+    /// Creates a state whose OrtValues are views over memory owned by an external
+    /// managed object. The anchor is retained until after all OrtValues are
+    /// disposed so pinned host-staging buffers cannot be reclaimed early.
+    /// </summary>
+    internal DecoderOrtState(
+        int position,
+        IReadOnlyList<DecoderOrtLayerState> layers,
+        int? nextTokenId,
+        object lifetimeAnchor)
+        : this(position, layers, nextTokenId, cohortSlice: null, lifetimeAnchor)
+    {
+        ArgumentNullException.ThrowIfNull(lifetimeAnchor);
     }
 
     private DecoderOrtState(
         int position,
         IReadOnlyList<DecoderOrtLayerState> layers,
         int? nextTokenId,
-        DecoderOrtCohortSlice? cohortSlice)
+        DecoderOrtCohortSlice? cohortSlice,
+        object? lifetimeAnchor)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(position);
         if (nextTokenId is < 0)
@@ -137,6 +154,7 @@ public sealed class DecoderOrtState : IDisposable
         NextTokenId = nextTokenId;
         _layers = validated;
         _cohortSlice = cohortSlice;
+        _lifetimeAnchor = lifetimeAnchor;
     }
 
     public int Position { get; }
@@ -196,5 +214,9 @@ public sealed class DecoderOrtState : IDisposable
             _cohortSlice = null;
             slice.Arena.Release();
         }
+
+        // Host-staging states may pin managed arrays through their OrtValues. Keep
+        // the payload alive until every OrtValue above has released its native pin.
+        _lifetimeAnchor = null;
     }
 }
