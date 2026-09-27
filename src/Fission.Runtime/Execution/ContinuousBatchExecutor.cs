@@ -18,7 +18,9 @@ namespace Fission.Runtime.Execution;
 /// so an N-item envelope consumes the same bounded capacity as N scalar submits.
 /// Caller cancellation may withdraw work only before queue acceptance; once a
 /// device operation is accepted, its terminal result is observed so runtime and
-/// backend state advance at the same transaction boundary.
+/// backend state advance at the same transaction boundary. Transaction-control
+/// failures are completed on that control without poisoning the actor; inference
+/// execution failures remain actor-fatal because batch state may be ambiguous.
 /// </summary>
 public sealed class ContinuousBatchExecutor : IAsyncDisposable
 {
@@ -51,6 +53,7 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
     public DeviceId Device => _backend.Device;
     public string BackendName => _backend.Name;
     internal int InferenceCapacity => _inferenceCredits.Capacity;
+    internal bool SupportsTransactionalMigration => _backend is ISequenceMigrationBackend;
 
     public static async ValueTask<ContinuousBatchExecutor> CreateAsync(
         IInferenceBackend backend,
@@ -109,6 +112,32 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         SubmitControlAsync(
             new PendingMigration(sequenceId, targetDevice),
             cancellationToken);
+
+    internal async ValueTask<SequenceMigrationTransfer> PrepareSequenceMigrationAsync(
+        SequenceId sequenceId,
+        DeviceId targetDevice,
+        CancellationToken cancellationToken = default)
+    {
+        var work = new PendingPrepareMigration(sequenceId, targetDevice);
+        await SubmitControlAsync(work, cancellationToken).ConfigureAwait(false);
+        return work.Transfer ?? throw new InvalidOperationException(
+            $"Backend {BackendName} completed migration prepare without a transfer token.");
+    }
+
+    internal ValueTask ImportSequenceMigrationAsync(
+        SequenceMigrationTransfer transfer,
+        CancellationToken cancellationToken = default) =>
+        SubmitControlAsync(new PendingImportMigration(transfer), cancellationToken);
+
+    internal ValueTask CommitSequenceMigrationAsync(
+        SequenceMigrationTransfer transfer,
+        CancellationToken cancellationToken = default) =>
+        SubmitControlAsync(new PendingCommitMigration(transfer), cancellationToken);
+
+    internal ValueTask AbortSequenceMigrationAsync(
+        SequenceMigrationTransfer transfer,
+        CancellationToken cancellationToken = default) =>
+        SubmitControlAsync(new PendingAbortMigration(transfer), cancellationToken);
 
     public ValueTask ReleaseSnapshotAsync(
         KvSnapshotId snapshotId,
@@ -235,8 +264,15 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
                     break;
 
                 case PendingControl control:
-                    await control.ExecuteAsync(_backend).ConfigureAwait(false);
-                    control.Completion.TrySetResult(true);
+                    try
+                    {
+                        await control.ExecuteAsync(_backend).ConfigureAwait(false);
+                        control.Completion.TrySetResult(true);
+                    }
+                    catch (Exception exception)
+                    {
+                        control.Fail(exception);
+                    }
                     break;
 
                 default:
@@ -696,6 +732,84 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
             backend.MigrateSequenceAsync(sequenceId, targetDevice);
     }
 
+    private sealed class PendingPrepareMigration(
+        SequenceId sequenceId,
+        DeviceId targetDevice) : PendingControl
+    {
+        public SequenceMigrationTransfer? Transfer { get; private set; }
+
+        public override async ValueTask ExecuteAsync(IInferenceBackend backend)
+        {
+            var migration = RequireTransactionalMigration(backend);
+            var transfer = await migration.PrepareSequenceMigrationAsync(
+                    sequenceId,
+                    targetDevice)
+                .ConfigureAwait(false);
+
+            if (transfer.SequenceId != sequenceId ||
+                transfer.SourceDevice != backend.Device ||
+                transfer.TargetDevice != targetDevice)
+            {
+                throw new InvalidOperationException(
+                    $"Backend {backend.Name} returned migration transfer {transfer.TransactionId} " +
+                    "with sequence or device identity that does not match the prepare request.");
+            }
+
+            Transfer = transfer;
+        }
+    }
+
+    private sealed class PendingImportMigration(
+        SequenceMigrationTransfer transfer) : PendingControl
+    {
+        public override ValueTask ExecuteAsync(IInferenceBackend backend)
+        {
+            if (transfer.TargetDevice != backend.Device)
+            {
+                throw new InvalidOperationException(
+                    $"Migration transfer {transfer.TransactionId} targets {transfer.TargetDevice}, " +
+                    $"but import was submitted to actor {backend.Device}.");
+            }
+
+            return RequireTransactionalMigration(backend)
+                .ImportSequenceMigrationAsync(transfer);
+        }
+    }
+
+    private sealed class PendingCommitMigration(
+        SequenceMigrationTransfer transfer) : PendingControl
+    {
+        public override ValueTask ExecuteAsync(IInferenceBackend backend)
+        {
+            if (transfer.SourceDevice != backend.Device)
+            {
+                throw new InvalidOperationException(
+                    $"Migration transfer {transfer.TransactionId} originates on {transfer.SourceDevice}, " +
+                    $"but commit was submitted to actor {backend.Device}.");
+            }
+
+            return RequireTransactionalMigration(backend)
+                .CommitSequenceMigrationAsync(transfer);
+        }
+    }
+
+    private sealed class PendingAbortMigration(
+        SequenceMigrationTransfer transfer) : PendingControl
+    {
+        public override ValueTask ExecuteAsync(IInferenceBackend backend)
+        {
+            if (backend.Device != transfer.SourceDevice && backend.Device != transfer.TargetDevice)
+            {
+                throw new InvalidOperationException(
+                    $"Migration transfer {transfer.TransactionId} belongs to " +
+                    $"{transfer.SourceDevice}->{transfer.TargetDevice}, but abort was submitted to {backend.Device}.");
+            }
+
+            return RequireTransactionalMigration(backend)
+                .AbortSequenceMigrationAsync(transfer);
+        }
+    }
+
     private sealed class PendingReleaseSnapshot(
         KvSnapshotId snapshotId) : PendingControl
     {
@@ -709,4 +823,10 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
         public override ValueTask ExecuteAsync(IInferenceBackend backend) =>
             backend.ReleaseSequenceAsync(sequenceId);
     }
+
+    private static ISequenceMigrationBackend RequireTransactionalMigration(
+        IInferenceBackend backend) =>
+        backend as ISequenceMigrationBackend ??
+        throw new NotSupportedException(
+            $"Backend '{backend.Name}' does not implement transactional sequence migration.");
 }
