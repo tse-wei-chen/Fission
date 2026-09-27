@@ -105,6 +105,32 @@ The runtime planner selects among mutually supported capabilities without changi
 
 Source and target advertise a model/format-specific host-staging transport id. Incompatible codecs therefore fail mutual transport negotiation before physical export. See `docs/onnx-host-staging-migration.md` for the concrete data path and executable-spec coverage.
 
+## Migration observability
+
+Transport-aware migration emits first-class `ExecutionTraceEvent` records correlated with the originating plan and `MigrateKvExecutionStep`.
+
+The lifecycle is represented explicitly:
+
+```text
+MigrationStarted
+      |
+MigrationPlanned
+      |
+      +--> MigrationCommitted
+      |
+      +--> MigrationFailed          // no transfer token existed
+      |
+      +--> MigrationRolledBack      // transfer existed, abort succeeded
+      |
+      +--> MigrationRollbackFailed  // one or more abort operations failed
+```
+
+Trace metadata includes source and target placement, backend transaction id when one exists, selected transport id and kind, estimated transfer bytes, planner-estimated duration, measured end-to-end elapsed time, triggering exception type, and rollback-failure count.
+
+`MigrationPlanned` is recorded before admission acquisition. This means an admission wait that is later cancelled still leaves enough trace data to explain which physical route and byte budget the runtime intended to consume. Terminal elapsed time includes planning, admission waiting, transfer phases, and rollback when rollback is required.
+
+The existing metadata replay remains driven by `StepCompleted`. A successful migration therefore replays the new target placement, while a failed migration never publishes a completed migration step and leaves replayed placement on the source. The richer migration events are additive evidence for later time-travel debugging and scheduler simulation rather than a replacement for deterministic state reconstruction.
+
 ## Remaining work
 
-The control plane now includes transactional rollback, deterministic transport planning, transfer-plan attestation, byte/concurrency admission, and one correctness-first ONNX managed-host transport. Production GPU migration still needs pinned/asynchronous host staging, concrete CUDA P2P/IPC and NIXL/RDMA implementations, measured topology/bandwidth inputs, timeout/health classification, migration latency/bytes observability, and process/node failure recovery. The current protocol handles synchronous runtime rollback while both device actors remain alive.
+The control plane now includes transactional rollback, deterministic transport planning, transfer-plan attestation, byte/concurrency admission, one correctness-first ONNX managed-host transport, and plan-correlated migration tracing. Production GPU migration still needs pinned/asynchronous host staging, concrete CUDA P2P/IPC and NIXL/RDMA implementations, measured topology/bandwidth inputs, timeout/health classification, process/node failure recovery, and durable/exportable trace storage. The current protocol handles synchronous runtime rollback while both device actors remain alive.
