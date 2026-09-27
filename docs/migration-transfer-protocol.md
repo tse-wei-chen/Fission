@@ -23,19 +23,24 @@ source actor                  target actor
 
 `SequenceMigrationTransfer` identifies one migration transaction and carries sequence/source/target identity. Concrete backends derive their own transfer type and may attach host buffers, CUDA IPC handles, NIXL descriptors, RDMA registrations, immutable-state references, or other transport-specific state.
 
+Transport-aware backends additionally attach the runtime-selected `SequenceMigrationTransportPlan` to the transfer token. Legacy protocol transfers leave that field null.
+
 ## Success path
 
 For a sequence moving from actor A to actor B:
 
 1. The plan reserves the sequence, preventing concurrent runtime operations on that sequence.
-2. A prepare control is serialized through actor A.
-3. Actor A returns a transfer token while retaining enough source state for rollback.
-4. An import control is serialized through actor B.
-5. Actor B creates runnable target state without requiring runtime placement to change yet.
-6. A commit control is serialized through actor A.
-7. Actor A may release or retire source state and transport resources.
-8. Only after commit returns does the runtime update `SequenceProcess.Device`.
-9. Later decode/release operations resolve to actor B.
+2. If both actors are transport-aware, the runtime serializes physical-byte estimation and peer-capability discovery through the actors, selects one transport plan, and acquires migration admission.
+3. A prepare control is serialized through actor A. Transport-aware prepare receives the exact selected plan.
+4. Actor A returns a transfer token while retaining enough source state for rollback.
+5. For transport-aware migration, the runtime verifies that the transfer token attests the selected plan.
+6. An import control is serialized through actor B.
+7. Actor B creates runnable target state without requiring runtime placement to change yet.
+8. A commit control is serialized through actor A.
+9. Actor A may release or retire source state and transport resources.
+10. Only after commit returns does the runtime update `SequenceProcess.Device`.
+11. Later decode/release operations resolve to actor B.
+12. Transport admission is released after the physical transaction is complete.
 
 The runtime does not publish an intermediate placement.
 
@@ -55,6 +60,8 @@ Target abort is attempted whenever target import was attempted, even if import i
 
 Source abort must restore a runnable source sequence when commit throws after destructive work. This lets the original sequence continue decoding after rollback.
 
+A transport-plan attestation mismatch is detected before target import. The source transfer is aborted, target abort is skipped, logical placement remains unchanged, and migration admission is held until source abort finishes.
+
 If rollback itself fails, `ExecutionPlanExecutor` raises an `AggregateException` containing the original migration failure plus rollback failures. Runtime placement is not advanced.
 
 Prepare failure has no transfer token available to the runtime, so prepare must be self-rollbacking: a thrown prepare operation must leave source state usable.
@@ -66,17 +73,21 @@ Migration rollback requires the actor to survive control-operation exceptions. `
 - control exception: complete that control with the exception and continue pumping later work;
 - inference exception: fail the actor because a partially executed batch may have ambiguous model state.
 
-This means a failed target import can be followed by target abort, and a failed source commit can be followed by source abort on the same actors.
+Transport capability discovery, byte estimation, planned prepare, import, commit, and abort all execute through the device actor rather than touching backend state out of band.
 
-## Compatibility path
+## Compatibility paths
 
-The explicit protocol is used only when source and target are different actors and both backends implement `ISequenceMigrationBackend`.
+There are three migration levels:
 
-Otherwise the runtime falls back to `IInferenceBackend.MigrateSequenceAsync`. This preserves existing one-actor internal routing and older fabric backends. The legacy hook remains responsible for making the logical target usable before it reports success, but it does not provide the runtime-visible prepare/import/commit rollback phases.
+1. **Transport-aware two-actor protocol**: source and target both implement `ISequenceMigrationTransportBackend`; runtime plans/admit the physical transfer and then runs prepare/import/commit/abort.
+2. **Transactional two-actor protocol**: source and target both implement `ISequenceMigrationBackend`, but one or both do not expose transport planning; runtime runs the #49 prepare/import/commit/abort transaction without an explicit transport plan.
+3. **Legacy/internal routing**: one actor owns the fabric or the two-actor transaction protocol is unavailable; runtime uses `IInferenceBackend.MigrateSequenceAsync`.
+
+The legacy hook remains responsible for making the logical target usable before it reports success, but it does not provide runtime-visible prepare/import/commit rollback phases.
 
 ## Transport mapping
 
-The protocol intentionally does not prescribe a byte format. Likely transport implementations include:
+The protocol intentionally does not prescribe a byte format. Transport-aware backends can advertise paths such as:
 
 - same-node CUDA peer-to-peer copies;
 - CUDA IPC or shared GPU-memory handles;
@@ -84,8 +95,8 @@ The protocol intentionally does not prescribe a byte format. Likely transport im
 - NIXL or RDMA descriptors for cross-process/cross-node migration;
 - immutable/shared KV representations when devices can reference common storage.
 
-A future topology-aware migration planner can choose among these transports without changing `ExecutionPlan`, sequence metadata, or scheduler contracts.
+The runtime planner selects among mutually supported capabilities without changing `ExecutionPlan`, sequence metadata, or scheduler contracts.
 
 ## Remaining work
 
-The transaction boundary is now explicit, but production migration still needs concrete transfer implementations, topology and bandwidth admission, timeout/health classification, observability for migration bytes and latency, and process/node failure recovery. The current protocol handles synchronous runtime rollback while both device actors remain alive.
+The control plane now includes transactional rollback, deterministic transport planning, transfer-plan attestation, and byte/concurrency admission. Production migration still needs concrete CUDA/NIXL/RDMA transfer implementations, measured topology/bandwidth inputs, timeout/health classification, migration latency/bytes observability, and process/node failure recovery. The current protocol handles synchronous runtime rollback while both device actors remain alive.
