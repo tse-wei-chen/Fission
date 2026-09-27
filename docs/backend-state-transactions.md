@@ -44,38 +44,44 @@ Sequence and snapshot release use the same reservation mechanism, so a state obj
 For snapshot creation:
 
 1. Create/acquire the metadata snapshot.
-2. Execute the backend snapshot barrier.
-3. Publish the snapshot into runtime ownership.
+2. Execute the backend snapshot barrier on the sequence's current actor.
+3. Publish the snapshot into runtime ownership together with its device placement.
 4. If backend snapshot creation fails, dispose the unpublished metadata snapshot.
 
 For fork:
 
 1. Materialize unpublished metadata branches.
-2. Execute the backend fork barrier for all branch IDs.
-3. Publish metadata branches.
+2. Execute the backend fork barrier for all branch IDs on the parent sequence actor.
+3. Publish metadata branches with the parent's current placement.
 4. If publication fails, dispose metadata branches and best-effort release backend branch state.
 
 For restore:
 
 1. Validate runtime ownership of sequence and snapshot.
-2. Execute the backend restore barrier.
-3. Restore metadata KV and position.
+2. Resolve both sequence placement and snapshot ownership to execution actors.
+3. Reject the restore if they belong to different actors.
+4. Execute the backend restore barrier.
+5. Restore metadata KV and position.
 
 For migration:
 
 1. Reserve the sequence for the plan lifetime.
-2. Execute the backend migration barrier with the target `DeviceId`.
-3. Commit `SequenceProcess.Device` only after backend migration succeeds.
-4. If the backend migration fails, leave runtime device metadata and sequence version unchanged.
+2. When multiple actors are registered, validate that the target `DeviceId` has an execution actor.
+3. Execute the backend migration barrier on the current/source actor.
+4. Require the backend/fabric to make the target actor able to continue the sequence before the hook returns.
+5. Commit `SequenceProcess.Device` only after backend migration succeeds.
+6. Route subsequent inference and sequence release to the target actor.
+7. If backend migration fails, leave runtime device metadata and sequence version unchanged.
 
-A migration-capable backend owns the physical transfer or rerouting semantics. The current runtime still submits subsequent sequence work through the same device actor, so a backend that reports migration success must continue to route that sequence correctly after the move. The in-process ONNX Runtime adapter does not yet implement this and therefore rejects migration explicitly.
+A one-actor registry preserves backend-internal migration: the logical placement may change to an unregistered `DeviceId`, but later work continues through the same actor and the backend owns internal routing.
 
 For release:
 
 1. Reserve the state object.
-2. Release backend-owned state on the device actor.
-3. Remove runtime ownership.
-4. Dispose metadata KV leases.
+2. Resolve the actor that owns the sequence or snapshot.
+3. Release backend-owned state on that actor.
+4. Remove runtime ownership.
+5. Dispose metadata KV leases.
 
 Backend release happens before metadata removal. If backend cleanup fails, runtime metadata remains available for diagnostics or retry rather than creating orphaned native state.
 
@@ -89,4 +95,4 @@ A future causal-LM adapter can implement snapshots with immutable/shared OrtValu
 
 ## Current scope
 
-This protocol covers snapshot, fork, restore, migration commit ordering, snapshot release, and sequence release. It does not yet provide a multi-device actor fabric or a concrete ONNX/CUDA KV transfer mechanism. Those are the next layer required for transparent cross-device process migration.
+The runtime now supports multiple registered device actors, placement-aware inference/control routing, migration target admission, snapshot locality, and per-device scheduler envelopes. It still does not provide a concrete ONNX/CUDA/NIXL/RDMA KV transfer implementation or automatic placement policy. See `multi-device-runtime.md` for the actor-routing boundary.
