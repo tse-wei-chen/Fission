@@ -47,17 +47,17 @@ public sealed record ExecutionPlanResult(
 /// <summary>
 /// Interprets a compiled inference plan against the stateful runtime.
 /// Plans targeting different sequences may execute concurrently and converge on
-/// the single-device continuous batch executor. A sequence, and any snapshot used
-/// by restore, is reserved for one plan at a time so metadata state cannot race
-/// backend transaction barriers.
+/// one of the registered single-device continuous batch executors. A sequence,
+/// and any snapshot used by restore, is reserved for one plan at a time so
+/// metadata state cannot race backend transaction barriers.
 /// </summary>
 public sealed class ExecutionPlanExecutor : IDisposable
 {
-    private readonly ContinuousBatchExecutor _device;
+    private readonly ExecutionDeviceRegistry _devices;
     private readonly IExecutionTraceSink? _trace;
     private readonly KvPagePool _kvPagePool;
     private readonly ConcurrentDictionary<SequenceId, SequenceProcess> _sequences = new();
-    private readonly ConcurrentDictionary<KvSnapshotId, KvSnapshot> _snapshots = new();
+    private readonly ConcurrentDictionary<KvSnapshotId, RuntimeOwnedSnapshot> _snapshots = new();
     private readonly ConcurrentDictionary<SequenceId, byte> _sequenceReservations = new();
     private readonly ConcurrentDictionary<KvSnapshotId, byte> _snapshotReservations = new();
     private int _disposed;
@@ -66,15 +66,24 @@ public sealed class ExecutionPlanExecutor : IDisposable
         ContinuousBatchExecutor device,
         IExecutionTraceSink? trace = null,
         KvPagePool? kvPagePool = null)
+        : this(new ExecutionDeviceRegistry(device), trace, kvPagePool)
     {
-        _device = device;
+    }
+
+    public ExecutionPlanExecutor(
+        ExecutionDeviceRegistry devices,
+        IExecutionTraceSink? trace = null,
+        KvPagePool? kvPagePool = null)
+    {
+        ArgumentNullException.ThrowIfNull(devices);
+        _devices = devices;
         _trace = trace;
         _kvPagePool = kvPagePool ?? new KvPagePool(int.MaxValue);
     }
 
     public int SequenceCount => _sequences.Count;
     public int SnapshotCount => _snapshots.Count;
-    internal int DeviceInferenceCapacity => _device.InferenceCapacity;
+    internal int DeviceInferenceCapacity => _devices.MinimumInferenceCapacity;
     public KvPagePool KvPages => _kvPagePool;
     public RuntimeKvCapacity KvCapacity => new(
         _kvPagePool.Capacity,
@@ -84,6 +93,14 @@ public sealed class ExecutionPlanExecutor : IDisposable
 
     public bool TryGetSequence(SequenceId sequenceId, out SequenceProcess? sequence) =>
         _sequences.TryGetValue(sequenceId, out sequence);
+
+    internal DeviceId ResolveExecutionDevice(SequenceId sequenceId) =>
+        _sequences.TryGetValue(sequenceId, out var sequence)
+            ? _devices.ResolvePlacement(sequence.Device).Device
+            : _devices.DefaultDevice;
+
+    internal int GetDeviceInferenceCapacity(DeviceId device) =>
+        _devices.GetInferenceCapacity(device);
 
     public async ValueTask<bool> ReleaseSequenceAsync(
         SequenceId sequenceId,
@@ -105,7 +122,8 @@ public sealed class ExecutionPlanExecutor : IDisposable
                     $"Cannot release sequence {sequenceId} while it is {sequence.Status}.");
             }
 
-            await _device.ReleaseSequenceAsync(sequenceId, cancellationToken)
+            var device = _devices.ResolvePlacement(sequence.Device);
+            await device.ReleaseSequenceAsync(sequenceId, cancellationToken)
                 .ConfigureAwait(false);
 
             if (!_sequences.TryRemove(sequenceId, out var removed))
@@ -131,12 +149,13 @@ public sealed class ExecutionPlanExecutor : IDisposable
 
         try
         {
-            if (!_snapshots.ContainsKey(snapshotId))
+            if (!_snapshots.TryGetValue(snapshotId, out var snapshot))
             {
                 return false;
             }
 
-            await _device.ReleaseSnapshotAsync(snapshotId, cancellationToken)
+            var device = _devices.ResolvePlacement(snapshot.Device);
+            await device.ReleaseSnapshotAsync(snapshotId, cancellationToken)
                 .ConfigureAwait(false);
 
             if (!_snapshots.TryRemove(snapshotId, out var removed))
@@ -144,7 +163,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
                 return false;
             }
 
-            removed.Dispose();
+            removed.Snapshot.Dispose();
             return true;
         }
         finally
@@ -202,19 +221,21 @@ public sealed class ExecutionPlanExecutor : IDisposable
                 case SnapshotKvExecutionStep snapshot:
                 {
                     var sequence = GetSequence(snapshot.SequenceId);
+                    var device = _devices.ResolvePlacement(sequence.Device);
                     var state = sequence.Snapshot();
 
                     try
                     {
-                        await _device.SnapshotSequenceAsync(
+                        await device.SnapshotSequenceAsync(
                                 sequence.Id,
                                 state.Id,
                                 cancellationToken)
                             .ConfigureAwait(false);
 
-                        if (!_snapshots.TryAdd(state.Id, state))
+                        var ownedSnapshot = new RuntimeOwnedSnapshot(state, sequence.Device);
+                        if (!_snapshots.TryAdd(state.Id, ownedSnapshot))
                         {
-                            await _device.ReleaseSnapshotAsync(state.Id, cancellationToken)
+                            await device.ReleaseSnapshotAsync(state.Id, cancellationToken)
                                 .ConfigureAwait(false);
                             throw new InvalidOperationException($"Duplicate snapshot id {state.Id}.");
                         }
@@ -243,6 +264,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
                 {
                     ArgumentOutOfRangeException.ThrowIfNegativeOrZero(fork.Branches);
                     var parent = GetSequence(fork.SequenceId);
+                    var device = _devices.ResolvePlacement(parent.Device);
                     var branches = new SequenceProcess[fork.Branches];
                     var branchIds = new SequenceId[fork.Branches];
 
@@ -255,7 +277,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
 
                     try
                     {
-                        await _device.ForkSequenceAsync(
+                        await device.ForkSequenceAsync(
                                 parent.Id,
                                 branchIds,
                                 cancellationToken)
@@ -308,7 +330,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
                             branches[index].Dispose();
                             try
                             {
-                                await _device.ReleaseSequenceAsync(
+                                await device.ReleaseSequenceAsync(
                                         branches[index].Id,
                                         CancellationToken.None)
                                     .ConfigureAwait(false);
@@ -330,25 +352,41 @@ public sealed class ExecutionPlanExecutor : IDisposable
                 case RestoreKvExecutionStep restore:
                 {
                     var sequence = GetSequence(restore.SequenceId);
-                    if (!_snapshots.TryGetValue(restore.SnapshotId, out var snapshot))
+                    if (!_snapshots.TryGetValue(restore.SnapshotId, out var ownedSnapshot))
                     {
                         throw new KeyNotFoundException(
                             $"Snapshot {restore.SnapshotId} is not owned by this executor.");
                     }
 
-                    await _device.RestoreSequenceAsync(
+                    var sequenceDevice = _devices.ResolvePlacement(sequence.Device);
+                    var snapshotDevice = _devices.ResolvePlacement(ownedSnapshot.Device);
+                    if (!ReferenceEquals(sequenceDevice, snapshotDevice))
+                    {
+                        throw new InvalidOperationException(
+                            $"Cannot restore snapshot {restore.SnapshotId} on sequence {sequence.Id}: " +
+                            $"snapshot state belongs to device {ownedSnapshot.Device}, but the sequence is on {sequence.Device}.");
+                    }
+
+                    await sequenceDevice.RestoreSequenceAsync(
                             sequence.Id,
                             restore.SnapshotId,
                             cancellationToken)
                         .ConfigureAwait(false);
-                    sequence.Restore(snapshot);
+                    sequence.Restore(ownedSnapshot.Snapshot);
                     break;
                 }
 
                 case MigrateKvExecutionStep migrate:
                 {
                     var sequence = GetSequence(migrate.SequenceId);
-                    await _device.MigrateSequenceAsync(
+                    if (sequence.Device == migrate.TargetDevice)
+                    {
+                        break;
+                    }
+
+                    _devices.ValidateMigrationTarget(migrate.TargetDevice);
+                    var sourceDevice = _devices.ResolvePlacement(sequence.Device);
+                    await sourceDevice.MigrateSequenceAsync(
                             sequence.Id,
                             migrate.TargetDevice,
                             cancellationToken)
@@ -457,7 +495,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
 
         var sequence = _sequences.GetOrAdd(
             step.SequenceId,
-            id => SequenceProcess.Create(id, step.ModelId, _device.Device, _kvPagePool));
+            id => SequenceProcess.Create(id, step.ModelId, _devices.DefaultDevice, _kvPagePool));
 
         if (sequence.Model != step.ModelId)
         {
@@ -476,7 +514,8 @@ public sealed class ExecutionPlanExecutor : IDisposable
         }
 
         var tokens = bindings.ResolvePrefill(step.SequenceId, step.TokenCount);
-        var result = await _device.SubmitPrefillAsync(
+        var device = _devices.ResolvePlacement(sequence.Device);
+        var result = await device.SubmitPrefillAsync(
             new PrefillItem(step.SequenceId, step.ModelId, tokens),
             cancellationToken).ConfigureAwait(false);
 
@@ -508,9 +547,10 @@ public sealed class ExecutionPlanExecutor : IDisposable
                 $"Cannot decode sequence {step.SequenceId} while it is {sequence.Status}.");
         }
 
+        var device = _devices.ResolvePlacement(sequence.Device);
         for (var index = 0; index < step.MaxTokens; index++)
         {
-            var result = await _device.SubmitDecodeAsync(
+            var result = await device.SubmitDecodeAsync(
                 new DecodeItem(sequence.Id, sequence.Model, sequence.Position),
                 cancellationToken).ConfigureAwait(false);
 
@@ -581,7 +621,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
 
         foreach (var snapshot in _snapshots.Values)
         {
-            snapshot.Dispose();
+            snapshot.Snapshot.Dispose();
         }
 
         _snapshots.Clear();
@@ -595,6 +635,10 @@ public sealed class ExecutionPlanExecutor : IDisposable
         _sequenceReservations.Clear();
         _snapshotReservations.Clear();
     }
+
+    private sealed record RuntimeOwnedSnapshot(
+        KvSnapshot Snapshot,
+        DeviceId Device);
 
     private sealed class PlanReservation : IDisposable
     {
