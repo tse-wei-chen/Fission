@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Fission.Abstractions;
+using Fission.Abstractions.Execution;
 
 namespace Fission.Runtime.Tracing;
 
@@ -10,6 +11,12 @@ public enum ExecutionTraceKind
     StepCompleted,
     SequenceForked,
     SnapshotCreated,
+    MigrationStarted,
+    MigrationPlanned,
+    MigrationCommitted,
+    MigrationRolledBack,
+    MigrationRollbackFailed,
+    MigrationFailed,
     PlanCompleted
 }
 
@@ -23,7 +30,16 @@ public sealed record ExecutionTraceEvent(
     KvSnapshotId? SnapshotId = null,
     int? Position = null,
     int? KvPageCount = null,
-    DeviceId? Device = null);
+    DeviceId? Device = null,
+    DeviceId? TargetDevice = null,
+    Guid? TransactionId = null,
+    string? TransportId = null,
+    SequenceMigrationTransportKind? TransportKind = null,
+    long? TransferBytes = null,
+    TimeSpan? EstimatedDuration = null,
+    TimeSpan? Elapsed = null,
+    string? FailureType = null,
+    int? RollbackFailureCount = null);
 
 public sealed record RecordedExecutionTraceEvent(
     long Ordinal,

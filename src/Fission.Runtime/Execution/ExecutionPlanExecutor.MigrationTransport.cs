@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Fission.Abstractions;
 using Fission.Abstractions.Execution;
 using Fission.Runtime.Kv;
@@ -43,39 +44,62 @@ public sealed partial class ExecutionPlanExecutor
         ContinuousBatchExecutor sourceDevice,
         ContinuousBatchExecutor targetDevice,
         DeviceId targetPlacement,
+        Guid planId,
+        int stepIndex,
         CancellationToken cancellationToken)
     {
-        var estimatedBytes = await sourceDevice.EstimateSequenceMigrationBytesAsync(
-                sequence.Id,
-                targetPlacement,
-                cancellationToken)
-            .ConfigureAwait(false);
-
-        var sourceCapabilities = await sourceDevice
-            .GetSequenceMigrationTransportCapabilitiesAsync(
-                targetDevice.Device,
-                cancellationToken)
-            .ConfigureAwait(false);
-        var targetCapabilities = await targetDevice
-            .GetSequenceMigrationTransportCapabilitiesAsync(
-                sourceDevice.Device,
-                cancellationToken)
-            .ConfigureAwait(false);
-
-        var transportPlan = _migrationTransportPlanner.Plan(
-            estimatedBytes,
-            sourceCapabilities,
-            targetCapabilities);
-
-        using var admission = await _migrationAdmission
-            .AcquireAsync(transportPlan.EstimatedBytes, cancellationToken)
-            .ConfigureAwait(false);
-
+        var startedAt = Stopwatch.GetTimestamp();
+        var sourcePlacement = sequence.Device;
+        SequenceMigrationTransportPlan? transportPlan = null;
         SequenceMigrationTransfer? transfer = null;
+        SequenceMigrationAdmissionController.Lease? admission = null;
         var importAttempted = false;
+
+        RecordMigrationTrace(
+            planId,
+            stepIndex,
+            ExecutionTraceKind.MigrationStarted,
+            sequence,
+            sourcePlacement,
+            targetPlacement);
 
         try
         {
+            var estimatedBytes = await sourceDevice.EstimateSequenceMigrationBytesAsync(
+                    sequence.Id,
+                    targetPlacement,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            var sourceCapabilities = await sourceDevice
+                .GetSequenceMigrationTransportCapabilitiesAsync(
+                    targetDevice.Device,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var targetCapabilities = await targetDevice
+                .GetSequenceMigrationTransportCapabilitiesAsync(
+                    sourceDevice.Device,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            transportPlan = _migrationTransportPlanner.Plan(
+                estimatedBytes,
+                sourceCapabilities,
+                targetCapabilities);
+
+            RecordMigrationTrace(
+                planId,
+                stepIndex,
+                ExecutionTraceKind.MigrationPlanned,
+                sequence,
+                sourcePlacement,
+                targetPlacement,
+                transportPlan: transportPlan);
+
+            admission = await _migrationAdmission
+                .AcquireAsync(transportPlan.EstimatedBytes, cancellationToken)
+                .ConfigureAwait(false);
+
             transfer = await sourceDevice.PrepareSequenceMigrationAsync(
                     sequence.Id,
                     targetPlacement,
@@ -99,22 +123,106 @@ public sealed partial class ExecutionPlanExecutor
                 .ConfigureAwait(false);
 
             sequence.MigrateTo(targetPlacement);
+
+            RecordMigrationTrace(
+                planId,
+                stepIndex,
+                ExecutionTraceKind.MigrationCommitted,
+                sequence,
+                sourcePlacement,
+                targetPlacement,
+                transportPlan,
+                transfer,
+                elapsed: Stopwatch.GetElapsedTime(startedAt));
         }
         catch (Exception failure)
         {
             if (transfer is null)
             {
+                RecordMigrationTrace(
+                    planId,
+                    stepIndex,
+                    ExecutionTraceKind.MigrationFailed,
+                    sequence,
+                    sourcePlacement,
+                    targetPlacement,
+                    transportPlan,
+                    failure: failure,
+                    elapsed: Stopwatch.GetElapsedTime(startedAt));
                 throw;
             }
 
-            await RollBackMigrationAsync(
+            var rollbackFailures = await RollBackMigrationAsync(
                     transfer,
                     sourceDevice,
                     targetDevice,
-                    importAttempted,
-                    failure)
+                    importAttempted)
                 .ConfigureAwait(false);
+
+            var traceKind = rollbackFailures.Count == 0
+                ? ExecutionTraceKind.MigrationRolledBack
+                : ExecutionTraceKind.MigrationRollbackFailed;
+            RecordMigrationTrace(
+                planId,
+                stepIndex,
+                traceKind,
+                sequence,
+                sourcePlacement,
+                targetPlacement,
+                transportPlan,
+                transfer,
+                failure,
+                Stopwatch.GetElapsedTime(startedAt),
+                rollbackFailures.Count);
+
+            if (rollbackFailures.Count == 0)
+            {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo
+                    .Capture(failure)
+                    .Throw();
+            }
+
+            throw new AggregateException(
+                $"Sequence migration transaction {transfer.TransactionId} failed and rollback also encountered errors.",
+                new[] { failure }.Concat(rollbackFailures));
         }
+        finally
+        {
+            admission?.Dispose();
+        }
+    }
+
+    private void RecordMigrationTrace(
+        Guid planId,
+        int stepIndex,
+        ExecutionTraceKind kind,
+        SequenceProcess sequence,
+        DeviceId sourcePlacement,
+        DeviceId targetPlacement,
+        SequenceMigrationTransportPlan? transportPlan = null,
+        SequenceMigrationTransfer? transfer = null,
+        Exception? failure = null,
+        TimeSpan? elapsed = null,
+        int? rollbackFailureCount = null)
+    {
+        Record(new ExecutionTraceEvent(
+            planId,
+            kind,
+            stepIndex,
+            nameof(MigrateKvExecutionStep),
+            sequence.Id,
+            Position: sequence.Position,
+            KvPageCount: sequence.Kv.Count,
+            Device: sourcePlacement,
+            TargetDevice: targetPlacement,
+            TransactionId: transfer?.TransactionId,
+            TransportId: transportPlan?.TransportId,
+            TransportKind: transportPlan?.Kind,
+            TransferBytes: transportPlan?.EstimatedBytes,
+            EstimatedDuration: transportPlan?.EstimatedDuration,
+            Elapsed: elapsed,
+            FailureType: failure?.GetType().FullName,
+            RollbackFailureCount: rollbackFailureCount));
     }
 
     private static void ValidatePlannedTransfer(
@@ -149,12 +257,11 @@ public sealed partial class ExecutionPlanExecutor
         }
     }
 
-    private static async ValueTask RollBackMigrationAsync(
+    private static async ValueTask<IReadOnlyList<Exception>> RollBackMigrationAsync(
         SequenceMigrationTransfer transfer,
         ContinuousBatchExecutor sourceDevice,
         ContinuousBatchExecutor targetDevice,
-        bool importAttempted,
-        Exception failure)
+        bool importAttempted)
     {
         var rollbackFailures = new List<Exception>();
 
@@ -185,16 +292,7 @@ public sealed partial class ExecutionPlanExecutor
             rollbackFailures.Add(rollbackFailure);
         }
 
-        if (rollbackFailures.Count == 0)
-        {
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo
-                .Capture(failure)
-                .Throw();
-        }
-
-        throw new AggregateException(
-            $"Sequence migration transaction {transfer.TransactionId} failed and rollback also encountered errors.",
-            new[] { failure }.Concat(rollbackFailures));
+        return rollbackFailures;
     }
 
     private void DisposeMigrationTransportResources()
