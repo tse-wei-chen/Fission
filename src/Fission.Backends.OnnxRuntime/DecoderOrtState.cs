@@ -49,7 +49,7 @@ public sealed class DecoderOrtState : IDisposable
     /// managed object. The anchor is retained until after all OrtValues are
     /// disposed so pinned host-staging buffers cannot be reclaimed early.
     /// </summary>
-    internal DecoderOrtState(
+    public DecoderOrtState(
         int position,
         IReadOnlyList<DecoderOrtLayerState> layers,
         int? nextTokenId,
