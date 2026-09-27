@@ -52,6 +52,7 @@ public sealed partial class ExecutionPlanExecutor
         var sourcePlacement = sequence.Device;
         SequenceMigrationTransportPlan? transportPlan = null;
         SequenceMigrationTransfer? transfer = null;
+        SequenceMigrationAdmissionController.Lease? admission = null;
         var importAttempted = false;
 
         RecordMigrationTrace(
@@ -95,7 +96,7 @@ public sealed partial class ExecutionPlanExecutor
                 targetPlacement,
                 transportPlan: transportPlan);
 
-            using var admission = await _migrationAdmission
+            admission = await _migrationAdmission
                 .AcquireAsync(transportPlan.EstimatedBytes, cancellationToken)
                 .ConfigureAwait(false);
 
@@ -184,6 +185,10 @@ public sealed partial class ExecutionPlanExecutor
             throw new AggregateException(
                 $"Sequence migration transaction {transfer.TransactionId} failed and rollback also encountered errors.",
                 new[] { failure }.Concat(rollbackFailures));
+        }
+        finally
+        {
+            admission?.Dispose();
         }
     }
 
