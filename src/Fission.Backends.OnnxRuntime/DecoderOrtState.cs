@@ -54,7 +54,12 @@ public sealed class DecoderOrtState : IDisposable
         IReadOnlyList<DecoderOrtLayerState> layers,
         int? nextTokenId,
         object lifetimeAnchor)
-        : this(position, layers, nextTokenId, cohortSlice: null, lifetimeAnchor)
+        : this(
+            position,
+            layers,
+            nextTokenId,
+            cohortSlice: null,
+            lifetimeAnchor: lifetimeAnchor)
     {
         ArgumentNullException.ThrowIfNull(lifetimeAnchor);
     }
@@ -144,9 +149,6 @@ public sealed class DecoderOrtState : IDisposable
                     "Decoder cohort row is outside the arena batch.");
             }
 
-            // The arena starts with a builder reference. A state obtains its own
-            // reference only after the complete payload and slice metadata validate.
-            // From this point onward Dispose is responsible for releasing it.
             slice.Arena.Retain();
         }
 
@@ -158,14 +160,7 @@ public sealed class DecoderOrtState : IDisposable
     }
 
     public int Position { get; }
-
-    /// <summary>
-    /// Sampled token to feed into the next decode step. It is null for payloads
-    /// created outside the causal-LM execution protocol (for example low-level
-    /// ownership tests).
-    /// </summary>
     public int? NextTokenId { get; }
-
     public int LayerCount => _layers.Length;
     public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 
@@ -206,17 +201,12 @@ public sealed class DecoderOrtState : IDisposable
             _layers[index].Key.Dispose();
         }
 
-        // OrtValue slices must be gone before the arena can possibly return its
-        // backing arrays to the pool. The final row release is the only path that
-        // transfers those arrays back to ArrayPool.
         if (_cohortSlice is { } slice)
         {
             _cohortSlice = null;
             slice.Arena.Release();
         }
 
-        // Host-staging states may pin managed arrays through their OrtValues. Keep
-        // the payload alive until every OrtValue above has released its native pin.
         _lifetimeAnchor = null;
     }
 }
