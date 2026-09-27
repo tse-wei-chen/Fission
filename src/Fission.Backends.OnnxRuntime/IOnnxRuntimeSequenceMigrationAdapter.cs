@@ -10,6 +10,8 @@ namespace Fission.Backends.OnnxRuntime;
 /// </summary>
 internal interface IOnnxRuntimeSequenceMigrationAdapter
 {
+    bool SupportsSequenceMigration { get; }
+
     IReadOnlyList<SequenceMigrationTransportCapability> GetSequenceMigrationTransportCapabilities(
         ModelId modelId,
         DeviceId localDevice,
