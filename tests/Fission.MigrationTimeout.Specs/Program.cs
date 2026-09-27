@@ -1,11 +1,14 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using Fission.Abstractions;
 using Fission.Abstractions.Execution;
 using Fission.Runtime.Execution;
 using Fission.Runtime.Kv;
 using Fission.Runtime.Tracing;
 
-static void Require(bool condition, string message)
+static void Require(
+    [DoesNotReturnIf(false)] bool condition,
+    string message)
 {
     if (!condition)
     {
