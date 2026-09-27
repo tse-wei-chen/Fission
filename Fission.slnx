@@ -27,4 +27,5 @@
   <Project Path="tests/Fission.Migration.Specs/Fission.Migration.Specs.csproj" />
   <Project Path="tests/Fission.MultiDevice.Specs/Fission.MultiDevice.Specs.csproj" />
   <Project Path="tests/Fission.MigrationProtocol.Specs/Fission.MigrationProtocol.Specs.csproj" />
+  <Project Path="tests/Fission.MigrationTransport.Specs/Fission.MigrationTransport.Specs.csproj" />
 </Solution>
