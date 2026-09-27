@@ -11,7 +11,7 @@ namespace Fission.Backends.OnnxRuntime;
 /// This class owns sequence/snapshot state transactions and commits each batch
 /// only after every model step has produced a valid immutable next-state version.
 /// </summary>
-public sealed class DecoderOnlyOnnxExecutionAdapter :
+public sealed partial class DecoderOnlyOnnxExecutionAdapter :
     IOnnxRuntimeExecutionAdapter,
     IOnnxRuntimeSessionContractProvider
 {

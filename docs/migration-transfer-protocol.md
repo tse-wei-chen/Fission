@@ -97,6 +97,14 @@ The protocol intentionally does not prescribe a byte format. Transport-aware bac
 
 The runtime planner selects among mutually supported capabilities without changing `ExecutionPlan`, sequence metadata, or scheduler contracts.
 
+## First concrete transport: ONNX host staging
+
+`OnnxRuntimeMigratableBackend` and `DecoderOnlyOnnxExecutionAdapter` now provide the first concrete physical implementation of this protocol. A decoder binding that implements `IDecoderOrtHostStagingBinding` can export backend-owned decoder state into a managed host payload and reconstruct a distinct target `DecoderOrtState` from that payload.
+
+`OptimumLegacyFloatHostStagingBinding` supplies an FP32 implementation for the existing Optimum legacy decoder binding. Prepare deep-copies K/V tensors and the causal frontier, import creates target-owned `OrtValue` views over the staged arrays, commit releases source state, and abort can remove target state or reconstruct source state after destructive commit failure. The imported state retains a lifetime anchor to the managed payload until its `OrtValue` views are disposed.
+
+Source and target advertise a model/format-specific host-staging transport id. Incompatible codecs therefore fail mutual transport negotiation before physical export. See `docs/onnx-host-staging-migration.md` for the concrete data path and executable-spec coverage.
+
 ## Remaining work
 
-The control plane now includes transactional rollback, deterministic transport planning, transfer-plan attestation, and byte/concurrency admission. Production migration still needs concrete CUDA/NIXL/RDMA transfer implementations, measured topology/bandwidth inputs, timeout/health classification, migration latency/bytes observability, and process/node failure recovery. The current protocol handles synchronous runtime rollback while both device actors remain alive.
+The control plane now includes transactional rollback, deterministic transport planning, transfer-plan attestation, byte/concurrency admission, and one correctness-first ONNX managed-host transport. Production GPU migration still needs pinned/asynchronous host staging, concrete CUDA P2P/IPC and NIXL/RDMA implementations, measured topology/bandwidth inputs, timeout/health classification, migration latency/bytes observability, and process/node failure recovery. The current protocol handles synchronous runtime rollback while both device actors remain alive.
