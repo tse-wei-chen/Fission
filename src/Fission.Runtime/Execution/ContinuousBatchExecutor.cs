@@ -22,7 +22,7 @@ namespace Fission.Runtime.Execution;
 /// failures are completed on that control without poisoning the actor; inference
 /// execution failures remain actor-fatal because batch state may be ambiguous.
 /// </summary>
-public sealed class ContinuousBatchExecutor : IAsyncDisposable
+public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
 {
     private static readonly AsyncLocal<AtomicSubmissionSlot?> AmbientAtomicSlot = new();
 

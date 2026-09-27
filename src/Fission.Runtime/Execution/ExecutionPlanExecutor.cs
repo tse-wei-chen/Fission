@@ -51,7 +51,7 @@ public sealed record ExecutionPlanResult(
 /// and any snapshot used by restore, is reserved for one plan at a time so
 /// metadata state cannot race backend transaction barriers.
 /// </summary>
-public sealed class ExecutionPlanExecutor : IDisposable
+public sealed partial class ExecutionPlanExecutor : IDisposable
 {
     private readonly ExecutionDeviceRegistry _devices;
     private readonly IExecutionTraceSink? _trace;
@@ -434,13 +434,26 @@ public sealed class ExecutionPlanExecutor : IDisposable
         return new ExecutionPlanResult(plan.PlanId, backendResults, snapshotIds, forks);
     }
 
-    private static async ValueTask ExecuteTransactionalMigrationAsync(
+    private async ValueTask ExecuteTransactionalMigrationAsync(
         SequenceProcess sequence,
         ContinuousBatchExecutor sourceDevice,
         ContinuousBatchExecutor targetDevice,
         DeviceId targetPlacement,
         CancellationToken cancellationToken)
     {
+        if (sourceDevice.SupportsTransportAwareMigration &&
+            targetDevice.SupportsTransportAwareMigration)
+        {
+            await ExecuteTransportAwareTransactionalMigrationAsync(
+                    sequence,
+                    sourceDevice,
+                    targetDevice,
+                    targetPlacement,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
         SequenceMigrationTransfer? transfer = null;
         var importAttempted = false;
 
@@ -726,6 +739,7 @@ public sealed class ExecutionPlanExecutor : IDisposable
         _sequences.Clear();
         _sequenceReservations.Clear();
         _snapshotReservations.Clear();
+        DisposeMigrationTransportResources();
     }
 
     private sealed record RuntimeOwnedSnapshot(

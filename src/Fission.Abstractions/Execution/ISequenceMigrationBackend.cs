@@ -12,7 +12,8 @@ public abstract class SequenceMigrationTransfer
         Guid transactionId,
         SequenceId sequenceId,
         DeviceId sourceDevice,
-        DeviceId targetDevice)
+        DeviceId targetDevice,
+        SequenceMigrationTransportPlan? transportPlan = null)
     {
         if (transactionId == Guid.Empty)
         {
@@ -23,12 +24,19 @@ public abstract class SequenceMigrationTransfer
         SequenceId = sequenceId;
         SourceDevice = sourceDevice;
         TargetDevice = targetDevice;
+        TransportPlan = transportPlan;
     }
 
     public Guid TransactionId { get; }
     public SequenceId SequenceId { get; }
     public DeviceId SourceDevice { get; }
     public DeviceId TargetDevice { get; }
+
+    /// <summary>
+    /// Physical transport decision attested by a transport-aware backend.
+    /// Legacy migration backends leave this null.
+    /// </summary>
+    public SequenceMigrationTransportPlan? TransportPlan { get; }
 }
 
 /// <summary>

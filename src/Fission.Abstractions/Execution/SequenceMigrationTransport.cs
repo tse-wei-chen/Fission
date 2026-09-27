@@ -48,8 +48,9 @@ public sealed record SequenceMigrationTransportPlan(
 /// TransportId and Kind before the planner may select that path. The source owns
 /// byte estimation because only it necessarily has the authoritative live state.
 ///
-/// This interface intentionally does not replace ISequenceMigrationBackend yet;
-/// it is the planning/admission contract consumed before prepare/import/commit.
+/// A transport-aware prepare receives the exact runtime-selected plan. Its returned
+/// transfer must expose an equal TransportPlan so import/commit can verify that the
+/// backend did not silently substitute a different physical route.
 /// </summary>
 public interface ISequenceMigrationTransportBackend : ISequenceMigrationBackend
 {
@@ -59,5 +60,11 @@ public interface ISequenceMigrationTransportBackend : ISequenceMigrationBackend
     ValueTask<long> EstimateSequenceMigrationBytesAsync(
         SequenceId sequenceId,
         DeviceId targetDevice,
+        CancellationToken cancellationToken = default);
+
+    ValueTask<SequenceMigrationTransfer> PrepareSequenceMigrationAsync(
+        SequenceId sequenceId,
+        DeviceId targetDevice,
+        SequenceMigrationTransportPlan transportPlan,
         CancellationToken cancellationToken = default);
 }
