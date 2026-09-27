@@ -29,8 +29,8 @@ static ExecutionBindings PrefillBindings(SequenceId sequenceId, params int[] tok
         [sequenceId] = new ReadOnlyMemory<int>(tokens)
     });
 
-static readonly ExecutionBindings EmptyBindings =
-    new(new Dictionary<SequenceId, ReadOnlyMemory<int>>());
+var EmptyBindings = new ExecutionBindings(
+    new Dictionary<SequenceId, ReadOnlyMemory<int>>());
 
 var model = new ModelId("multi-device-model");
 var sourceId = new DeviceId("gpu:0");
