@@ -397,6 +397,8 @@ public sealed partial class ExecutionPlanExecutor : IDisposable
                                 sourceDevice,
                                 targetDevice,
                                 migrate.TargetDevice,
+                                plan.PlanId,
+                                stepIndex,
                                 cancellationToken)
                             .ConfigureAwait(false);
                     }
@@ -439,6 +441,8 @@ public sealed partial class ExecutionPlanExecutor : IDisposable
         ContinuousBatchExecutor sourceDevice,
         ContinuousBatchExecutor targetDevice,
         DeviceId targetPlacement,
+        Guid planId,
+        int stepIndex,
         CancellationToken cancellationToken)
     {
         if (sourceDevice.SupportsTransportAwareMigration &&
@@ -449,6 +453,8 @@ public sealed partial class ExecutionPlanExecutor : IDisposable
                     sourceDevice,
                     targetDevice,
                     targetPlacement,
+                    planId,
+                    stepIndex,
                     cancellationToken)
                 .ConfigureAwait(false);
             return;
