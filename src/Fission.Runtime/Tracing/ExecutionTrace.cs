@@ -15,6 +15,7 @@ public enum ExecutionTraceKind
     MigrationPlanned,
     MigrationCommitted,
     MigrationRolledBack,
+    MigrationRollbackFailed,
     MigrationFailed,
     PlanCompleted
 }
@@ -37,7 +38,8 @@ public sealed record ExecutionTraceEvent(
     long? TransferBytes = null,
     TimeSpan? EstimatedDuration = null,
     TimeSpan? Elapsed = null,
-    string? FailureType = null);
+    string? FailureType = null,
+    int? RollbackFailureCount = null);
 
 public sealed record RecordedExecutionTraceEvent(
     long Ordinal,
