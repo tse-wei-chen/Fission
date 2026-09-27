@@ -55,6 +55,13 @@ public interface IOnnxRuntimeExecutionAdapter : IDisposable
         throw new NotSupportedException(
             $"ONNX adapter '{Name}' does not implement backend restore state.");
 
+    ValueTask MigrateSequenceAsync(
+        SequenceId sequenceId,
+        DeviceId targetDevice,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException(
+            $"ONNX adapter '{Name}' does not implement backend sequence migration.");
+
     ValueTask ReleaseSnapshotAsync(
         KvSnapshotId snapshotId,
         CancellationToken cancellationToken = default) =>

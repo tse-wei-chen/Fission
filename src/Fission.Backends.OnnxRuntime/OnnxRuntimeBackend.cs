@@ -148,6 +148,15 @@ public sealed class OnnxRuntimeBackend : IInferenceBackend
         return _adapter.RestoreSequenceAsync(sequenceId, snapshotId, cancellationToken);
     }
 
+    public ValueTask MigrateSequenceAsync(
+        SequenceId sequenceId,
+        DeviceId targetDevice,
+        CancellationToken cancellationToken = default)
+    {
+        _ = GetSession();
+        return _adapter.MigrateSequenceAsync(sequenceId, targetDevice, cancellationToken);
+    }
+
     public ValueTask ReleaseSnapshotAsync(
         KvSnapshotId snapshotId,
         CancellationToken cancellationToken = default)

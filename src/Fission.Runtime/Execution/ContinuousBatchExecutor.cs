@@ -102,6 +102,14 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
             new PendingRestore(sequenceId, snapshotId),
             cancellationToken);
 
+    public ValueTask MigrateSequenceAsync(
+        SequenceId sequenceId,
+        DeviceId targetDevice,
+        CancellationToken cancellationToken = default) =>
+        SubmitControlAsync(
+            new PendingMigration(sequenceId, targetDevice),
+            cancellationToken);
+
     public ValueTask ReleaseSnapshotAsync(
         KvSnapshotId snapshotId,
         CancellationToken cancellationToken = default) =>
@@ -678,6 +686,14 @@ public sealed class ContinuousBatchExecutor : IAsyncDisposable
     {
         public override ValueTask ExecuteAsync(IInferenceBackend backend) =>
             backend.RestoreSequenceAsync(sequenceId, snapshotId);
+    }
+
+    private sealed class PendingMigration(
+        SequenceId sequenceId,
+        DeviceId targetDevice) : PendingControl
+    {
+        public override ValueTask ExecuteAsync(IInferenceBackend backend) =>
+            backend.MigrateSequenceAsync(sequenceId, targetDevice);
     }
 
     private sealed class PendingReleaseSnapshot(

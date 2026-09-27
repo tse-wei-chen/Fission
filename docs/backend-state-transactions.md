@@ -2,7 +2,7 @@
 
 Fission treats model-owned inference state as part of the same logical state machine as runtime KV metadata.
 
-A stateful backend may retain logits, physical KV tensors, decoder buffers, or other per-sequence objects between prefill and decode. Snapshot, fork, restore, and release therefore cannot update only `KvPageTable`; the backend must observe the same transaction in the same order.
+A stateful backend may retain logits, physical KV tensors, decoder buffers, or other per-sequence objects between prefill and decode. Snapshot, fork, restore, migrate, and release therefore cannot update only `KvPageTable` or `SequenceProcess.Device`; the backend must observe the same transaction in the same order.
 
 ## Device-actor ordering
 
@@ -23,6 +23,7 @@ The serialized backend controls are:
 - `SnapshotSequenceAsync`
 - `ForkSequenceAsync`
 - `RestoreSequenceAsync`
+- `MigrateSequenceAsync`
 - `ReleaseSnapshotAsync`
 - `ReleaseSequenceAsync`
 
@@ -60,6 +61,15 @@ For restore:
 2. Execute the backend restore barrier.
 3. Restore metadata KV and position.
 
+For migration:
+
+1. Reserve the sequence for the plan lifetime.
+2. Execute the backend migration barrier with the target `DeviceId`.
+3. Commit `SequenceProcess.Device` only after backend migration succeeds.
+4. If the backend migration fails, leave runtime device metadata and sequence version unchanged.
+
+A migration-capable backend owns the physical transfer or rerouting semantics. The current runtime still submits subsequent sequence work through the same device actor, so a backend that reports migration success must continue to route that sequence correctly after the move. The in-process ONNX Runtime adapter does not yet implement this and therefore rejects migration explicitly.
+
 For release:
 
 1. Reserve the state object.
@@ -73,10 +83,10 @@ Backend release happens before metadata removal. If backend cleanup fails, runti
 
 `OnnxRuntimeBackend` forwards transaction controls to `IOnnxRuntimeExecutionAdapter`.
 
-The ONNX adapter boundary owns model/export-specific physical state semantics. An adapter that does not implement snapshot/fork/restore throws `NotSupportedException`; Fission must not silently pretend metadata-only branching is valid for a stateful model.
+The ONNX adapter boundary owns model/export-specific physical state semantics. An adapter that does not implement snapshot/fork/restore/migrate throws `NotSupportedException`; Fission must not silently pretend metadata-only state changes are valid for a stateful model.
 
-A future causal-LM adapter can implement snapshots with immutable/shared OrtValue state, copy-on-write KV pages, or another representation without changing scheduler, engine, or serving contracts.
+A future causal-LM adapter can implement snapshots with immutable/shared OrtValue state, copy-on-write KV pages, migration to another execution provider/device, or another representation without changing scheduler, engine, or serving contracts.
 
 ## Current scope
 
-This protocol covers snapshot, fork, restore, snapshot release, and sequence release. Backend-aware device migration is intentionally separate work; `MigrateKvExecutionStep` must not be treated as transparent physical-state migration for a stateful backend until a migration transaction hook is added.
+This protocol covers snapshot, fork, restore, migration commit ordering, snapshot release, and sequence release. It does not yet provide a multi-device actor fabric or a concrete ONNX/CUDA KV transfer mechanism. Those are the next layer required for transparent cross-device process migration.

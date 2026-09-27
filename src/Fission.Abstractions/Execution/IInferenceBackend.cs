@@ -33,6 +33,8 @@ public readonly record struct BackendStepResult(
 /// Stateful backends may retain logits, decoder state, physical KV, and snapshot
 /// state between calls. Lifecycle and transaction hooks are serialized by the
 /// device actor. Their default implementations are no-ops for stateless backends.
+/// A backend that supports migration is responsible for moving or rerouting the
+/// sequence's physical state before MigrateSequenceAsync completes.
 /// </summary>
 public interface IInferenceBackend : IAsyncDisposable
 {
@@ -70,6 +72,15 @@ public interface IInferenceBackend : IAsyncDisposable
     ValueTask RestoreSequenceAsync(
         SequenceId sequenceId,
         KvSnapshotId snapshotId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.CompletedTask;
+    }
+
+    ValueTask MigrateSequenceAsync(
+        SequenceId sequenceId,
+        DeviceId targetDevice,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
