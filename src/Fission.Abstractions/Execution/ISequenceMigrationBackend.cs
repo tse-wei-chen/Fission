@@ -6,7 +6,7 @@ namespace Fission.Abstractions.Execution;
 /// NIXL/RDMA descriptors, shared immutable state, or another backend-specific
 /// transfer representation. The runtime never inspects the payload.
 /// </summary>
-public abstract class SequenceMigrationTransfer : IAsyncDisposable
+public abstract class SequenceMigrationTransfer
 {
     protected SequenceMigrationTransfer(
         Guid transactionId,
@@ -29,8 +29,6 @@ public abstract class SequenceMigrationTransfer : IAsyncDisposable
     public SequenceId SequenceId { get; }
     public DeviceId SourceDevice { get; }
     public DeviceId TargetDevice { get; }
-
-    public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }
 
 /// <summary>
@@ -46,10 +44,13 @@ public abstract class SequenceMigrationTransfer : IAsyncDisposable
 /// on target and source with caller cancellation suppressed. Implementations must
 /// therefore retain enough source state during prepare/commit to restore the
 /// source when abort follows a failed commit. Import must likewise be reversible.
+/// Prepare failures must leave the source usable because no transfer token exists
+/// for the runtime to abort.
 ///
 /// Commit is the source-side destructive/finalizing phase. A successful commit
 /// means the target already owns runnable state. Runtime metadata is changed only
-/// after commit returns successfully.
+/// after commit returns successfully. Commit and abort own cleanup of any transport
+/// resources referenced by the transfer token.
 /// </summary>
 public interface ISequenceMigrationBackend
 {
