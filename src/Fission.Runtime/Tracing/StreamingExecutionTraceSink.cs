@@ -109,14 +109,7 @@ public sealed class StreamingExecutionTraceSink : IExecutionTraceSink, IAsyncDis
             if (backgroundFailure is not null)
             {
                 Interlocked.Increment(ref _droppedEventCount);
-                if (_options.BackgroundFailurePolicy ==
-                    ExecutionTraceBackgroundFailurePolicy.ThrowOnRecord)
-                {
-                    throw new InvalidOperationException(
-                        "Execution trace background writer has failed.",
-                        backgroundFailure);
-                }
-
+                ThrowIfConfiguredForBackgroundFailure(backgroundFailure);
                 return;
             }
 
@@ -127,6 +120,14 @@ public sealed class StreamingExecutionTraceSink : IExecutionTraceSink, IAsyncDis
             }
 
             Interlocked.Increment(ref _droppedEventCount);
+
+            backgroundFailure = Volatile.Read(ref _backgroundFailure);
+            if (backgroundFailure is not null)
+            {
+                ThrowIfConfiguredForBackgroundFailure(backgroundFailure);
+                return;
+            }
+
             if (_options.OverflowPolicy == ExecutionTraceBufferOverflowPolicy.Throw)
             {
                 throw new InvalidOperationException(
@@ -201,18 +202,32 @@ public sealed class StreamingExecutionTraceSink : IExecutionTraceSink, IAsyncDis
                     continue;
                 }
 
-                var waitForData = _channel.Reader.WaitToReadAsync().AsTask();
-                var flushDelay = Task.Delay(remaining);
+                using var waitCancellation = new CancellationTokenSource();
+                using var delayCancellation = new CancellationTokenSource();
+                var waitForData = _channel.Reader
+                    .WaitToReadAsync(waitCancellation.Token)
+                    .AsTask();
+                var flushDelay = Task.Delay(remaining, delayCancellation.Token);
                 var completed = await Task.WhenAny(waitForData, flushDelay)
                     .ConfigureAwait(false);
 
                 if (completed == flushDelay)
                 {
+                    waitCancellation.Cancel();
+                    try
+                    {
+                        await waitForData.ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+
                     await PersistSegmentAsync(batch).ConfigureAwait(false);
                     batch.Clear();
                     continue;
                 }
 
+                delayCancellation.Cancel();
                 if (!await waitForData.ConfigureAwait(false))
                 {
                     await PersistSegmentAsync(batch).ConfigureAwait(false);
@@ -300,6 +315,17 @@ public sealed class StreamingExecutionTraceSink : IExecutionTraceSink, IAsyncDis
             }
 
             throw;
+        }
+    }
+
+    private void ThrowIfConfiguredForBackgroundFailure(Exception backgroundFailure)
+    {
+        if (_options.BackgroundFailurePolicy ==
+            ExecutionTraceBackgroundFailurePolicy.ThrowOnRecord)
+        {
+            throw new InvalidOperationException(
+                "Execution trace background writer has failed.",
+                backgroundFailure);
         }
     }
 
