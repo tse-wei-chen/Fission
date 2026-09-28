@@ -74,7 +74,6 @@ internal sealed class OptimumLegacyCudaPresentKvBatch : IDisposable
         {
             for (var layer = 0; layer < geometry.NumHiddenLayers; layer++)
             {
-                var layerState = _arena.CreateBatchedLayer(layer);
                 var offset = checked(layer * 2);
                 outputNames[offset] = DecoderOnlyOnnxContract.ExpandLayerName(
                     contract.PresentKeyNames,
@@ -82,6 +81,10 @@ internal sealed class OptimumLegacyCudaPresentKvBatch : IDisposable
                 outputNames[offset + 1] = DecoderOnlyOnnxContract.ExpandLayerName(
                     contract.PresentValueNames,
                     layer);
+
+                // Resolve all contract metadata before creating the caller-owned
+                // CUDA views so name-format failure cannot strand untracked OrtValues.
+                var layerState = _arena.CreateBatchedLayer(layer);
                 _outputValues[offset] = layerState.Key;
                 produced++;
                 _outputValues[offset + 1] = layerState.Value;
