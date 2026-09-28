@@ -13,5 +13,6 @@
     <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaMigrationCodec.Specs" />
     <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaKvArena.Specs" />
     <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaPresentKv.Specs" />
+    <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaPastKv.Specs" />
   </ItemGroup>
 </Project>
