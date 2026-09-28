@@ -1,9 +1,57 @@
 namespace Fission.Backends.OnnxRuntime;
 
 /// <summary>
-/// Retention policy for GC-pinned managed host buffers used by decoder staging.
-/// Buffers are exact-length arrays so they can be passed directly to existing
-/// OrtValue array-backed tensor constructors without exposing unused capacity.
+/// Allocation boundary for host-staging FP32 buffers. The returned Memory must
+/// remain valid and stable for the lifetime of the buffer and must support pinning
+/// so ONNX Runtime can create zero-copy OrtValue views over it.
+///
+/// CUDA-specific implementations can back Memory with a custom MemoryManager over
+/// page-locked native memory without changing migration payload ownership or pooling.
+/// </summary>
+public interface IHostStagingFloatBufferAllocator
+{
+    IHostStagingFloatBuffer Allocate(int length);
+}
+
+/// <summary>
+/// One exact-length host-staging allocation. Dispose releases the physical backing
+/// allocation; pool leases may retain the buffer across migrations before doing so.
+/// </summary>
+public interface IHostStagingFloatBuffer : IDisposable
+{
+    Memory<float> Memory { get; }
+}
+
+/// <summary>
+/// Default allocator used by the ONNX staging path. Buffers are exact-length arrays
+/// allocated directly into the pinned object heap so their managed address is stable.
+/// </summary>
+public sealed class GcPinnedHostStagingFloatBufferAllocator : IHostStagingFloatBufferAllocator
+{
+    public static GcPinnedHostStagingFloatBufferAllocator Shared { get; } = new();
+
+    public IHostStagingFloatBuffer Allocate(int length)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(length);
+        return new GcPinnedHostStagingFloatBuffer(
+            GC.AllocateUninitializedArray<float>(length, pinned: true));
+    }
+
+    private sealed class GcPinnedHostStagingFloatBuffer(float[] buffer) : IHostStagingFloatBuffer
+    {
+        public Memory<float> Memory { get; } = buffer;
+
+        public void Dispose()
+        {
+            // GC owns the pinned-object-heap allocation. Dropping the final managed
+            // reference is the physical release operation.
+        }
+    }
+}
+
+/// <summary>
+/// Retention policy for host buffers used by decoder staging. Buffers are exact
+/// length so they can be exposed directly to ONNX Runtime without unused capacity.
 /// </summary>
 public sealed record PinnedHostStagingPoolOptions
 {
@@ -29,8 +77,9 @@ public readonly record struct PinnedHostStagingPoolStatistics(
 internal sealed class PinnedFloatBufferPool : IDisposable
 {
     private readonly object _gate = new();
-    private readonly Dictionary<int, Stack<float[]>> _buckets = new();
+    private readonly Dictionary<int, Stack<IHostStagingFloatBuffer>> _buckets = new();
     private readonly PinnedHostStagingPoolOptions _options;
+    private readonly IHostStagingFloatBufferAllocator _allocator;
     private long _allocatedBuffers;
     private long _reusedBuffers;
     private long _returnedBuffers;
@@ -39,10 +88,13 @@ internal sealed class PinnedFloatBufferPool : IDisposable
     private long _retainedBytes;
     private bool _disposed;
 
-    public PinnedFloatBufferPool(PinnedHostStagingPoolOptions? options = null)
+    public PinnedFloatBufferPool(
+        PinnedHostStagingPoolOptions? options = null,
+        IHostStagingFloatBufferAllocator? allocator = null)
     {
         _options = options ?? new PinnedHostStagingPoolOptions();
         _options.Validate();
+        _allocator = allocator ?? GcPinnedHostStagingFloatBufferAllocator.Shared;
     }
 
     public PinnedFloatBufferLease Rent(int length)
@@ -66,11 +118,31 @@ internal sealed class PinnedFloatBufferPool : IDisposable
                 _retainedBytes = checked(_retainedBytes - GetByteLength(length));
                 return new PinnedFloatBufferLease(this, buffer);
             }
+        }
+
+        var allocated = _allocator.Allocate(length) ??
+            throw new InvalidOperationException(
+                $"Host-staging allocator {_allocator.GetType().Name} returned null.");
+
+        if (allocated.Memory.Length != length)
+        {
+            var actualLength = allocated.Memory.Length;
+            allocated.Dispose();
+            throw new InvalidOperationException(
+                $"Host-staging allocator {_allocator.GetType().Name} returned {actualLength} element(s); expected exact length {length}.");
+        }
+
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                allocated.Dispose();
+                throw new ObjectDisposedException(nameof(PinnedFloatBufferPool));
+            }
 
             _allocatedBuffers++;
         }
 
-        var allocated = GC.AllocateUninitializedArray<float>(length, pinned: true);
         return new PinnedFloatBufferLease(this, allocated);
     }
 
@@ -90,6 +162,7 @@ internal sealed class PinnedFloatBufferPool : IDisposable
 
     public void Dispose()
     {
+        IHostStagingFloatBuffer[] retained;
         lock (_gate)
         {
             if (_disposed)
@@ -98,48 +171,63 @@ internal sealed class PinnedFloatBufferPool : IDisposable
             }
 
             _disposed = true;
+            retained = _buckets.Values
+                .SelectMany(static bucket => bucket)
+                .ToArray();
             _buckets.Clear();
             _retainedBuffers = 0;
             _retainedBytes = 0;
         }
+
+        foreach (var buffer in retained)
+        {
+            buffer.Dispose();
+        }
     }
 
-    private void Return(float[] buffer)
+    private void Return(IHostStagingFloatBuffer buffer)
     {
-        var bytes = GetByteLength(buffer.Length);
+        var length = buffer.Memory.Length;
+        var bytes = GetByteLength(length);
         if (_options.ClearOnReturn)
         {
-            Array.Clear(buffer);
+            buffer.Memory.Span.Clear();
         }
 
+        var retain = false;
         lock (_gate)
         {
             _returnedBuffers++;
 
-            if (_disposed ||
-                _options.MaxRetainedBuffersPerLength == 0 ||
-                _options.MaxRetainedBytes < bytes ||
-                _retainedBytes > _options.MaxRetainedBytes - bytes)
+            if (!_disposed &&
+                _options.MaxRetainedBuffersPerLength != 0 &&
+                _options.MaxRetainedBytes >= bytes &&
+                _retainedBytes <= _options.MaxRetainedBytes - bytes)
+            {
+                if (!_buckets.TryGetValue(length, out var bucket))
+                {
+                    bucket = new Stack<IHostStagingFloatBuffer>();
+                    _buckets.Add(length, bucket);
+                }
+
+                if (bucket.Count < _options.MaxRetainedBuffersPerLength)
+                {
+                    bucket.Push(buffer);
+                    _retainedBuffers++;
+                    _retainedBytes = checked(_retainedBytes + bytes);
+                    retain = true;
+                }
+            }
+
+            if (!retain)
             {
                 _droppedBuffers++;
-                return;
             }
+        }
 
-            if (!_buckets.TryGetValue(buffer.Length, out var bucket))
-            {
-                bucket = new Stack<float[]>();
-                _buckets.Add(buffer.Length, bucket);
-            }
-
-            if (bucket.Count >= _options.MaxRetainedBuffersPerLength)
-            {
-                _droppedBuffers++;
-                return;
-            }
-
-            bucket.Push(buffer);
-            _retainedBuffers++;
-            _retainedBytes = checked(_retainedBytes + bytes);
+        if (!retain)
+        {
+            buffer.Dispose();
         }
     }
 
@@ -149,21 +237,22 @@ internal sealed class PinnedFloatBufferPool : IDisposable
     internal sealed class PinnedFloatBufferLease : IDisposable
     {
         private PinnedFloatBufferPool? _owner;
+        private readonly IHostStagingFloatBuffer _buffer;
 
         internal PinnedFloatBufferLease(
             PinnedFloatBufferPool owner,
-            float[] buffer)
+            IHostStagingFloatBuffer buffer)
         {
             _owner = owner;
-            Buffer = buffer;
+            _buffer = buffer;
         }
 
-        public float[] Buffer { get; }
-        public Span<float> Span => Buffer.AsSpan();
+        public Memory<float> Memory => _buffer.Memory;
+        public Span<float> Span => _buffer.Memory.Span;
 
         public void Dispose()
         {
-            Interlocked.Exchange(ref _owner, null)?.Return(Buffer);
+            Interlocked.Exchange(ref _owner, null)?.Return(_buffer);
         }
     }
 }
