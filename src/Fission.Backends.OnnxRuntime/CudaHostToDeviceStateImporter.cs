@@ -81,6 +81,7 @@ public sealed class CudaHostToDeviceStateImporter
         var valueBytes = new long[payload.LayerCount];
         var ownedOrtValues = new List<OrtValue>(checked(payload.LayerCount * 2));
         OrtMemoryInfo? memoryInfo = null;
+        CudaImportedStateLifetime? lifetimeAnchor = null;
 
         try
         {
@@ -178,6 +179,7 @@ public sealed class CudaHostToDeviceStateImporter
                 OrtMemType.Default);
 
             var layers = new DecoderOrtLayerState[payload.LayerCount];
+            var residentLayers = new DecoderOrtCudaLayerView[payload.LayerCount];
             for (var layer = 0; layer < payload.LayerCount; layer++)
             {
                 var keyAllocation = allocations[layer * 2];
@@ -199,28 +201,40 @@ public sealed class CudaHostToDeviceStateImporter
                     valueBytes[layer]);
                 ownedOrtValues.Add(value);
                 layers[layer] = new DecoderOrtLayerState(key, value);
+                residentLayers[layer] = new DecoderOrtCudaLayerView(
+                    new CudaDeviceTensorView(
+                        keyAllocation.Pointer,
+                        keyBytes[layer],
+                        TensorElementType.Float,
+                        keyShapes[layer],
+                        DeviceId),
+                    new CudaDeviceTensorView(
+                        valueAllocation.Pointer,
+                        valueBytes[layer],
+                        TensorElementType.Float,
+                        valueShapes[layer],
+                        DeviceId));
             }
 
-            var lifetimeAnchor = new CudaImportedStateLifetime(
+            lifetimeAnchor = new CudaImportedStateLifetime(
+                expectedCudaFormatId,
+                DeviceId,
                 memoryInfo,
-                allocations.ToArray());
-            DecoderOrtState state;
-            try
-            {
-                state = new DecoderOrtState(
-                    payload.Position,
-                    layers,
-                    payload.NextTokenId,
-                    lifetimeAnchor);
-            }
-            catch
-            {
-                lifetimeAnchor.Dispose();
-                throw;
-            }
+                allocations.ToArray(),
+                residentLayers);
 
+            // Transfer native allocation/memory-info ownership into the lifetime
+            // anchor before constructing the state. If state construction fails,
+            // the outer catch disposes OrtValue wrappers first, then the anchor.
             memoryInfo = null;
             allocations.Clear();
+
+            var state = new DecoderOrtState(
+                payload.Position,
+                layers,
+                payload.NextTokenId,
+                lifetimeAnchor);
+            lifetimeAnchor = null;
             ownedOrtValues.Clear();
             return state;
         }
@@ -231,6 +245,7 @@ public sealed class CudaHostToDeviceStateImporter
                 ownedOrtValues[index].Dispose();
             }
 
+            lifetimeAnchor?.Dispose();
             memoryInfo?.Dispose();
             for (var index = allocations.Count - 1; index >= 0; index--)
             {
@@ -294,23 +309,107 @@ public sealed class CudaHostToDeviceStateImporter
 
     private sealed class CudaImportedStateLifetime :
         IDisposable,
-        IDecoderOrtOwnedLifetimeAnchor
+        IDecoderOrtOwnedLifetimeAnchor,
+        IDecoderOrtCudaResidentStateSource
     {
+        private readonly string _cudaFormatId;
+        private readonly int _deviceId;
+        private readonly DecoderOrtCudaLayerView[] _residentLayers;
         private OrtMemoryInfo? _memoryInfo;
         private CudaDeviceMemoryAllocation[]? _allocations;
+        private int _referenceCount = 1;
+        private int _ownerReleased;
 
         public CudaImportedStateLifetime(
+            string cudaFormatId,
+            int deviceId,
             OrtMemoryInfo memoryInfo,
-            CudaDeviceMemoryAllocation[] allocations)
+            CudaDeviceMemoryAllocation[] allocations,
+            DecoderOrtCudaLayerView[] residentLayers)
         {
+            ArgumentException.ThrowIfNullOrWhiteSpace(cudaFormatId);
+            ArgumentOutOfRangeException.ThrowIfNegative(deviceId);
             ArgumentNullException.ThrowIfNull(memoryInfo);
             ArgumentNullException.ThrowIfNull(allocations);
+            ArgumentNullException.ThrowIfNull(residentLayers);
+            if (allocations.Length != checked(residentLayers.Length * 2))
+            {
+                throw new ArgumentException(
+                    "Imported CUDA allocation count must equal two buffers per decoder layer.",
+                    nameof(allocations));
+            }
+
+            _cudaFormatId = cudaFormatId;
+            _deviceId = deviceId;
             _memoryInfo = memoryInfo;
             _allocations = allocations;
+            _residentLayers = residentLayers.ToArray();
+        }
+
+        DecoderOrtCudaResidentStateLease IDecoderOrtCudaResidentStateSource.AcquireCudaResidentState(
+            string formatId,
+            DecoderOrtState state)
+        {
+            if (!StringComparer.Ordinal.Equals(formatId, _cudaFormatId))
+            {
+                throw new InvalidOperationException(
+                    $"Imported CUDA state format '{_cudaFormatId}' is incompatible with requested format '{formatId}'.");
+            }
+
+            var retain = new RetainedImportedStateLifetime(this);
+            return DecoderOrtCudaResidentStateLease.Create(
+                _cudaFormatId,
+                state,
+                _deviceId,
+                _residentLayers,
+                retain);
         }
 
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _ownerReleased, 1) == 0)
+            {
+                ReleaseReference();
+            }
+        }
+
+        void IDecoderOrtOwnedLifetimeAnchor.Release() => Dispose();
+
+        private void Retain()
+        {
+            while (true)
+            {
+                var current = Volatile.Read(ref _referenceCount);
+                if (current <= 0 || Volatile.Read(ref _allocations) is null)
+                {
+                    throw new ObjectDisposedException(
+                        nameof(CudaImportedStateLifetime));
+                }
+
+                if (Interlocked.CompareExchange(
+                        ref _referenceCount,
+                        checked(current + 1),
+                        current) == current)
+                {
+                    return;
+                }
+            }
+        }
+
+        private void ReleaseReference()
+        {
+            var remaining = Interlocked.Decrement(ref _referenceCount);
+            if (remaining < 0)
+            {
+                throw new InvalidOperationException(
+                    "Imported CUDA state lifetime reference count underflowed.");
+            }
+
+            if (remaining != 0)
+            {
+                return;
+            }
+
             var allocations = Interlocked.Exchange(ref _allocations, null);
             if (allocations is not null)
             {
@@ -323,6 +422,21 @@ public sealed class CudaHostToDeviceStateImporter
             Interlocked.Exchange(ref _memoryInfo, null)?.Dispose();
         }
 
-        void IDecoderOrtOwnedLifetimeAnchor.Release() => Dispose();
+        private sealed class RetainedImportedStateLifetime : IDisposable
+        {
+            private CudaImportedStateLifetime? _owner;
+
+            public RetainedImportedStateLifetime(
+                CudaImportedStateLifetime owner)
+            {
+                owner.Retain();
+                _owner = owner;
+            }
+
+            public void Dispose()
+            {
+                Interlocked.Exchange(ref _owner, null)?.ReleaseReference();
+            }
+        }
     }
 }
