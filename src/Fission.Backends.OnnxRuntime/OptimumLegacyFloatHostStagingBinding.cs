@@ -253,9 +253,15 @@ public sealed class OptimumLegacyFloatHostStagingBinding :
                         $"Optimum host-staging layer {layer} payload length does not match decoder geometry.");
                 }
 
-                var key = OrtValue.CreateTensorValueFromMemory(keyMemory, shape);
+                var key = OrtValue.CreateTensorValueFromMemory(
+                    OrtMemoryInfo.DefaultInstance,
+                    keyMemory,
+                    shape);
                 owned.Add(key);
-                var value = OrtValue.CreateTensorValueFromMemory(valueMemory, shape);
+                var value = OrtValue.CreateTensorValueFromMemory(
+                    OrtMemoryInfo.DefaultInstance,
+                    valueMemory,
+                    shape);
                 owned.Add(value);
                 layers[layer] = new DecoderOrtLayerState(key, value);
             }
