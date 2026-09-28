@@ -401,7 +401,7 @@ sealed class FakeCudaAsyncCopyApi : ICudaAsyncCopyApi
         Interlocked.Increment(ref _streamCreateCalls);
         lock (_gate)
         {
-            stream = (nint)++_nextHandle;
+            stream = (nint)(++_nextHandle);
             _streams.Add(stream);
             _streamCreateFlags.Add(flags);
         }
@@ -464,7 +464,7 @@ sealed class FakeCudaAsyncCopyApi : ICudaAsyncCopyApi
     {
         lock (_gate)
         {
-            completionEvent = (nint)++_nextHandle;
+            completionEvent = (nint)(++_nextHandle);
             _events.Add(completionEvent, new FakeEventState());
             _eventCreateFlags.Add(flags);
         }
