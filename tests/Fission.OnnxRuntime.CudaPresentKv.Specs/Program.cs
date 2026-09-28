@@ -115,7 +115,7 @@ var nonFloatProfile = OptimumLegacyDecoderProfile.CreateLlamaLike(
     numKvHeads: 1,
     headDim: 2,
     vocabularySize: 16,
-    kvElementType: TensorElementType.Double);
+    kvElementType: TensorElementType.Float16);
 var nonFloatRejected = false;
 try
 {
