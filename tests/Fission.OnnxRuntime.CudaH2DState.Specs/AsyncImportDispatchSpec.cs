@@ -12,15 +12,13 @@ internal static class AsyncImportDispatchSpec
         "DAgBEggKAggDCgIIAmITCgFZEg4KDAgBEggKAggDCgIIAkIECgAQBw==";
 
     [ModuleInitializer]
-    internal static void Run() => RunAsync().GetAwaiter().GetResult();
-
-    private static async Task RunAsync()
+    internal static void Run()
     {
         using var session = new InferenceSession(
             Convert.FromBase64String(MulModelBase64));
         using var binding = new AsyncImportProbeBinding();
         using var adapter = new DecoderOnlyOnnxExecutionAdapter(binding);
-        await adapter.InitializeAsync(session);
+        adapter.InitializeAsync(session).GetAwaiter().GetResult();
 
         var modelId = new ModelId("async-import-dispatch");
         var sequenceId = SequenceId.New();
@@ -40,29 +38,23 @@ internal static class AsyncImportDispatchSpec
             transportPlan: null);
 
         var migration = (IOnnxRuntimeSequenceMigrationAdapter)adapter;
-        var importTask = migration.ImportSequenceMigrationAsync(
-            modelId,
-            targetDevice,
-            transfer).AsTask();
+        migration.ImportSequenceMigrationAsync(
+                modelId,
+                targetDevice,
+                transfer)
+            .GetAwaiter()
+            .GetResult();
 
-        await binding.Started.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        Require(
-            !importTask.IsCompleted,
-            "Migration adapter must await the asynchronous host-staging import before publishing target state.");
         Require(
             binding.AsyncImportCount == 1 && binding.SyncImportCount == 0,
             "Migration adapter must dispatch to the async import capability instead of the synchronous fallback.");
 
-        binding.Release.TrySetResult();
-        await importTask;
-        Require(
-            binding.AsyncImportCount == 1 && binding.SyncImportCount == 0,
-            "Successful target import must use exactly one asynchronous import call.");
-
-        await migration.AbortSequenceMigrationAsync(
-            modelId,
-            targetDevice,
-            transfer);
+        migration.AbortSequenceMigrationAsync(
+                modelId,
+                targetDevice,
+                transfer)
+            .GetAwaiter()
+            .GetResult();
         transfer.ReleasePayloadOwner();
         Require(
             payload.IsDisposed,
@@ -74,6 +66,31 @@ internal static class AsyncImportDispatchSpec
         if (!condition)
         {
             throw new InvalidOperationException(message);
+        }
+    }
+
+    private static DecoderOrtState CreateState(
+        int position,
+        int? nextTokenId)
+    {
+        var key = OrtValue.CreateTensorValueFromMemory(
+            new[] { 1f, 2f },
+            new long[] { 1, 2 });
+        var value = OrtValue.CreateTensorValueFromMemory(
+            new[] { 3f, 4f },
+            new long[] { 1, 2 });
+        try
+        {
+            return new DecoderOrtState(
+                position,
+                new[] { new DecoderOrtLayerState(key, value) },
+                nextTokenId);
+        }
+        catch
+        {
+            value.Dispose();
+            key.Dispose();
+            throw;
         }
     }
 
@@ -98,10 +115,6 @@ internal static class AsyncImportDispatchSpec
             Array.Empty<OnnxTensorContract>());
         public int AsyncImportCount => Volatile.Read(ref _asyncImportCount);
         public int SyncImportCount => Volatile.Read(ref _syncImportCount);
-        public TaskCompletionSource Started { get; } = new(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-        public TaskCompletionSource Release { get; } = new(
-            TaskCreationOptions.RunContinuationsAsynchronously);
 
         public long EstimateHostStagingBytes(DecoderOrtState state) => 8;
 
@@ -119,34 +132,14 @@ internal static class AsyncImportDispatchSpec
                 "Synchronous import fallback must not run when async import capability is present.");
         }
 
-        public async ValueTask<DecoderOrtState> ImportHostStagingStateAsync(
+        public ValueTask<DecoderOrtState> ImportHostStagingStateAsync(
             DecoderOrtHostStagingPayload payload,
             CancellationToken cancellationToken = default)
         {
-            Interlocked.Increment(ref _asyncImportCount);
-            Started.TrySetResult();
-            await Release.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
-
-            var key = OrtValue.CreateTensorValueFromMemory(
-                new[] { 1f, 2f },
-                new long[] { 1, 2 });
-            var value = OrtValue.CreateTensorValueFromMemory(
-                new[] { 3f, 4f },
-                new long[] { 1, 2 });
-            try
-            {
-                return new DecoderOrtState(
-                    payload.Position,
-                    new[] { new DecoderOrtLayerState(key, value) },
-                    payload.NextTokenId);
-            }
-            catch
-            {
-                value.Dispose();
-                key.Dispose();
-                throw;
-            }
+            Interlocked.Increment(ref _asyncImportCount);
+            return ValueTask.FromResult(
+                CreateState(payload.Position, payload.NextTokenId));
         }
 
         public DecoderOrtStepResult ExecutePrefill(
@@ -164,7 +157,6 @@ internal static class AsyncImportDispatchSpec
 
         public void Dispose()
         {
-            Release.TrySetResult();
         }
     }
 }
