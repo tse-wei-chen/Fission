@@ -140,7 +140,10 @@ public sealed class CudaPageLockedHostStagingFloatBufferAllocator :
         var result = _cuda.HostAlloc(out var pointer, byteLength, _flags);
         if (result != 0)
         {
-            throw CreateCudaFailure("cudaHostAlloc", result);
+            throw new CudaRuntimeException(
+                "cudaHostAlloc",
+                result,
+                _cuda.GetErrorString(result));
         }
 
         if (pointer == 0)
@@ -149,12 +152,10 @@ public sealed class CudaPageLockedHostStagingFloatBufferAllocator :
                 "cudaHostAlloc reported success but returned a null host pointer.");
         }
 
+        var handle = new CudaHostAllocationHandle(_cuda, pointer);
         return new CudaPageLockedHostStagingFloatBuffer(
-            new CudaPageLockedFloatMemoryManager(_cuda, pointer, length));
+            new CudaPageLockedFloatMemoryManager(handle, length));
     }
-
-    private CudaRuntimeException CreateCudaFailure(string operation, int errorCode) =>
-        new(operation, errorCode, _cuda.GetErrorString(errorCode));
 
     private sealed class CudaPageLockedHostStagingFloatBuffer : IHostStagingFloatBuffer
     {
@@ -172,31 +173,32 @@ public sealed class CudaPageLockedHostStagingFloatBufferAllocator :
 
         public void Dispose()
         {
-            Interlocked.Exchange(ref _memoryManager, null)?.Dispose();
+            var memoryManager = Interlocked.Exchange(ref _memoryManager, null);
+            if (memoryManager is not null)
+            {
+                ((IDisposable)memoryManager).Dispose();
+            }
         }
     }
 
     private sealed unsafe class CudaPageLockedFloatMemoryManager : MemoryManager<float>
     {
-        private readonly ICudaHostMemoryApi _cuda;
+        private readonly CudaHostAllocationHandle _handle;
         private readonly int _length;
-        private nint _pointer;
         private int _disposed;
 
         public CudaPageLockedFloatMemoryManager(
-            ICudaHostMemoryApi cuda,
-            nint pointer,
+            CudaHostAllocationHandle handle,
             int length)
         {
-            _cuda = cuda;
-            _pointer = pointer;
+            _handle = handle;
             _length = length;
         }
 
         public override Span<float> GetSpan()
         {
             ThrowIfDisposed();
-            return new Span<float>((void*)_pointer, _length);
+            return new Span<float>((void*)_handle.DangerousGetHandle(), _length);
         }
 
         public override MemoryHandle Pin(int elementIndex = 0)
@@ -207,7 +209,8 @@ public sealed class CudaPageLockedHostStagingFloatBufferAllocator :
                 throw new ArgumentOutOfRangeException(nameof(elementIndex));
             }
 
-            return new MemoryHandle(((float*)_pointer) + elementIndex);
+            return new MemoryHandle(
+                ((float*)_handle.DangerousGetHandle()) + elementIndex);
         }
 
         public override void Unpin()
@@ -223,24 +226,27 @@ public sealed class CudaPageLockedHostStagingFloatBufferAllocator :
                 return;
             }
 
-            var pointer = Interlocked.Exchange(ref _pointer, 0);
-            if (pointer == 0)
-            {
-                return;
-            }
-
-            var result = _cuda.FreeHost(pointer);
-            if (result != 0 && disposing)
-            {
-                throw new CudaRuntimeException(
-                    "cudaFreeHost",
-                    result,
-                    _cuda.GetErrorString(result));
-            }
+            _handle.Dispose();
         }
 
         private void ThrowIfDisposed() =>
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+    }
+
+    private sealed class CudaHostAllocationHandle : SafeHandle
+    {
+        private readonly ICudaHostMemoryApi _cuda;
+
+        public CudaHostAllocationHandle(ICudaHostMemoryApi cuda, nint pointer)
+            : base(IntPtr.Zero, ownsHandle: true)
+        {
+            _cuda = cuda;
+            SetHandle(pointer);
+        }
+
+        public override bool IsInvalid => handle == IntPtr.Zero;
+
+        protected override bool ReleaseHandle() => _cuda.FreeHost(handle) == 0;
     }
 }
 
