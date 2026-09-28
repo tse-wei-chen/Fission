@@ -40,6 +40,7 @@ jobs:
       - run: dotnet run --project tests/Fission.OnnxRuntime.CudaResidentState.Specs/Fission.OnnxRuntime.CudaResidentState.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.OnnxRuntime.CudaD2HStaging.Specs/Fission.OnnxRuntime.CudaD2HStaging.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.OnnxRuntime.CudaH2DState.Specs/Fission.OnnxRuntime.CudaH2DState.Specs.csproj -c Release --no-build
+      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaMigrationCodec.Specs/Fission.OnnxRuntime.CudaMigrationCodec.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.BackendTransactions.Specs/Fission.BackendTransactions.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.Migration.Specs/Fission.Migration.Specs.csproj -c Release --no-build
       - run: dotnet run --project tests/Fission.MultiDevice.Specs/Fission.MultiDevice.Specs.csproj -c Release --no-build
