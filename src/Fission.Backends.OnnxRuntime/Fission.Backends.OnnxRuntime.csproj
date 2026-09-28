@@ -1,6 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../Fission.Abstractions/Fission.Abstractions.csproj" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.30.0" />
+    <InternalsVisibleTo Include="Fission.OnnxRuntime.PinnedStaging.Specs" />
   </ItemGroup>
 </Project>
