@@ -28,6 +28,7 @@
   <Project Path="tests/Fission.OnnxRuntime.CudaCopy.Specs/Fission.OnnxRuntime.CudaCopy.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.CudaResidentState.Specs/Fission.OnnxRuntime.CudaResidentState.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.CudaD2HStaging.Specs/Fission.OnnxRuntime.CudaD2HStaging.Specs.csproj" />
+  <Project Path="tests/Fission.OnnxRuntime.CudaH2DState.Specs/Fission.OnnxRuntime.CudaH2DState.Specs.csproj" />
   <Project Path="tests/Fission.BackendTransactions.Specs/Fission.BackendTransactions.Specs.csproj" />
   <Project Path="tests/Fission.Migration.Specs/Fission.Migration.Specs.csproj" />
   <Project Path="tests/Fission.MultiDevice.Specs/Fission.MultiDevice.Specs.csproj" />

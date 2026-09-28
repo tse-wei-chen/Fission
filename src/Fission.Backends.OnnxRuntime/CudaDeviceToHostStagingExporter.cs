@@ -115,17 +115,23 @@ public sealed class DecoderOrtCudaHostStagingPayload : DecoderOrtHostStagingPayl
 /// into exact-length CUDA page-locked host buffers.
 ///
 /// The exporter deliberately owns only its staging-buffer pool. The supplied
-/// <see cref="CudaAsyncCopyEngine"/> is caller-owned and can be shared across
-/// exporters/transfers. A payload is returned only after every submitted D2H copy
-/// has reached terminal CUDA event completion.
+/// copy engine is caller-owned and can be shared across exporters/transfers. A
+/// payload is returned only after every submitted D2H copy has reached terminal
+/// CUDA event completion.
 /// </summary>
 public sealed class CudaDeviceToHostStagingExporter : IDisposable
 {
     private const long MetadataBytes = sizeof(int) * 2L;
     private readonly CudaAsyncCopyEngine _copyEngine;
+    private readonly int? _deviceId;
     private readonly PinnedFloatBufferPool _stagingPool;
     private int _disposed;
 
+    /// <summary>
+    /// Creates an exporter over a generic copy engine. This preserves the original
+    /// low-level primitive for tests and single-device integrations that already
+    /// scope CUDA device state externally.
+    /// </summary>
     public CudaDeviceToHostStagingExporter(
         CudaAsyncCopyEngine copyEngine,
         CudaPageLockedHostStagingFloatBufferAllocator stagingAllocator,
@@ -137,6 +143,25 @@ public sealed class CudaDeviceToHostStagingExporter : IDisposable
     {
     }
 
+    /// <summary>
+    /// Creates an exporter bound to one explicit CUDA device ordinal. Source
+    /// resident-state leases from any other ordinal are rejected before staging
+    /// allocation or native DMA submission.
+    /// </summary>
+    public CudaDeviceToHostStagingExporter(
+        CudaDeviceBoundAsyncCopyEngine copyEngine,
+        CudaPageLockedHostStagingFloatBufferAllocator stagingAllocator,
+        PinnedHostStagingPoolOptions? stagingPoolOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(copyEngine);
+        ArgumentNullException.ThrowIfNull(stagingAllocator);
+        _copyEngine = copyEngine.InnerEngine;
+        _deviceId = copyEngine.DeviceId;
+        _stagingPool = new PinnedFloatBufferPool(
+            stagingPoolOptions,
+            stagingAllocator);
+    }
+
     internal CudaDeviceToHostStagingExporter(
         CudaAsyncCopyEngine copyEngine,
         IHostStagingFloatBufferAllocator stagingAllocator,
@@ -145,6 +170,7 @@ public sealed class CudaDeviceToHostStagingExporter : IDisposable
         ArgumentNullException.ThrowIfNull(copyEngine);
         ArgumentNullException.ThrowIfNull(stagingAllocator);
         _copyEngine = copyEngine;
+        _deviceId = null;
         _stagingPool = new PinnedFloatBufferPool(
             stagingPoolOptions,
             stagingAllocator);
@@ -227,6 +253,12 @@ public sealed class CudaDeviceToHostStagingExporter : IDisposable
         ArgumentNullException.ThrowIfNull(residentState);
         ObjectDisposedException.ThrowIf(residentState.IsDisposed, residentState);
         cancellationToken.ThrowIfCancellationRequested();
+
+        if (_deviceId is { } deviceId && residentState.DeviceId != deviceId)
+        {
+            throw new InvalidOperationException(
+                $"CUDA D2H exporter targets device {deviceId}, but resident decoder state belongs to device {residentState.DeviceId}.");
+        }
 
         var layerCount = residentState.LayerCount;
         var keys = new PinnedFloatBufferPool.PinnedFloatBufferLease[layerCount];

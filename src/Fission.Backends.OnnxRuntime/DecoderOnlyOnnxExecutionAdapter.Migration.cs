@@ -157,7 +157,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
         }
     }
 
-    ValueTask IOnnxRuntimeSequenceMigrationAdapter.ImportSequenceMigrationAsync(
+    async ValueTask IOnnxRuntimeSequenceMigrationAdapter.ImportSequenceMigrationAsync(
         ModelId modelId,
         DeviceId localDevice,
         SequenceMigrationTransfer transfer,
@@ -174,7 +174,10 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
         }
 
         ValidatePayloadFormat(binding, staged.Payload);
-        var imported = binding.ImportHostStagingState(staged.Payload, cancellationToken);
+        var imported = await ImportHostStagingStateAsync(
+            binding,
+            staged.Payload,
+            cancellationToken).ConfigureAwait(false);
         ArgumentNullException.ThrowIfNull(imported);
         try
         {
@@ -186,8 +189,6 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
             imported.Dispose();
             throw;
         }
-
-        return ValueTask.CompletedTask;
     }
 
     ValueTask IOnnxRuntimeSequenceMigrationAdapter.CommitSequenceMigrationAsync(
@@ -215,7 +216,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
         return ValueTask.CompletedTask;
     }
 
-    ValueTask IOnnxRuntimeSequenceMigrationAdapter.AbortSequenceMigrationAsync(
+    async ValueTask IOnnxRuntimeSequenceMigrationAdapter.AbortSequenceMigrationAsync(
         ModelId modelId,
         DeviceId localDevice,
         SequenceMigrationTransfer transfer,
@@ -229,7 +230,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
         if (localDevice == staged.TargetDevice)
         {
             _states.ReleaseSequence(staged.SequenceId);
-            return ValueTask.CompletedTask;
+            return;
         }
 
         if (localDevice != staged.SourceDevice)
@@ -241,11 +242,14 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
         if (_states.TryGetSequence(staged.SequenceId, out _))
         {
             staged.ReleasePayloadOwner();
-            return ValueTask.CompletedTask;
+            return;
         }
 
         ValidatePayloadFormat(binding, staged.Payload);
-        var restored = binding.ImportHostStagingState(staged.Payload, cancellationToken);
+        var restored = await ImportHostStagingStateAsync(
+            binding,
+            staged.Payload,
+            cancellationToken).ConfigureAwait(false);
         ArgumentNullException.ThrowIfNull(restored);
         try
         {
@@ -258,8 +262,6 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
             restored.Dispose();
             throw;
         }
-
-        return ValueTask.CompletedTask;
     }
 
     private IDecoderOrtHostStagingBinding RequireHostStagingBinding() =>
@@ -324,6 +326,21 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
                 $"Decoder host-staging payload format '{payload.FormatId}' is incompatible with " +
                 $"binding format '{binding.HostStagingFormatId}'.");
         }
+    }
+
+    private static async ValueTask<DecoderOrtState> ImportHostStagingStateAsync(
+        IDecoderOrtHostStagingBinding binding,
+        DecoderOrtHostStagingPayload payload,
+        CancellationToken cancellationToken)
+    {
+        if (binding is IDecoderOrtAsyncHostStagingImportBinding asyncBinding)
+        {
+            return await asyncBinding.ImportHostStagingStateAsync(
+                payload,
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        return binding.ImportHostStagingState(payload, cancellationToken);
     }
 
     private static void ValidateImportedState(
