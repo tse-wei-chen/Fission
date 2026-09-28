@@ -4,11 +4,11 @@ using Microsoft.ML.OnnxRuntime;
 namespace Fission.Backends.OnnxRuntime;
 
 /// <summary>
-/// Opt-in decorator that adds a managed-host migration codec to the existing
+/// Opt-in decorator that adds a host-memory migration codec to the existing
 /// Optimum legacy FP32 decoder binding without changing its inference behavior.
-/// Source export deep-copies every K/V tensor into exact-length GC-pinned pooled
-/// arrays. Target import creates new OrtValue views over those staged arrays and
-/// retains the payload until the imported immutable state is disposed.
+/// Source export deep-copies every K/V tensor into exact-length pooled host buffers.
+/// Target import creates new OrtValue views over those staged buffers and retains
+/// the payload until the imported immutable state is disposed.
 /// </summary>
 public sealed class OptimumLegacyFloatHostStagingBinding :
     IDecoderOrtHostStagingBinding,
@@ -23,17 +23,33 @@ public sealed class OptimumLegacyFloatHostStagingBinding :
 
     public OptimumLegacyFloatHostStagingBinding(
         OptimumLegacyFloatDecoderBinding inner)
-        : this(inner, stagingPoolOptions: null)
+        : this(inner, stagingPoolOptions: null, stagingBufferAllocator: null)
     {
     }
 
     public OptimumLegacyFloatHostStagingBinding(
         OptimumLegacyFloatDecoderBinding inner,
         PinnedHostStagingPoolOptions? stagingPoolOptions)
+        : this(inner, stagingPoolOptions, stagingBufferAllocator: null)
+    {
+    }
+
+    /// <summary>
+    /// Creates a host-staging binding with an optional physical allocation strategy.
+    /// The default allocator uses exact-length GC-pinned managed arrays. A CUDA
+    /// integration can instead provide Memory backed by page-locked native host
+    /// allocation while reusing the same pool, payload, rollback, and lifetime model.
+    /// </summary>
+    public OptimumLegacyFloatHostStagingBinding(
+        OptimumLegacyFloatDecoderBinding inner,
+        PinnedHostStagingPoolOptions? stagingPoolOptions,
+        IHostStagingFloatBufferAllocator? stagingBufferAllocator)
     {
         ArgumentNullException.ThrowIfNull(inner);
         _inner = inner;
-        _stagingPool = new PinnedFloatBufferPool(stagingPoolOptions);
+        _stagingPool = new PinnedFloatBufferPool(
+            stagingPoolOptions,
+            stagingBufferAllocator);
     }
 
     public string Name => _inner.Name;
@@ -228,18 +244,18 @@ public sealed class OptimumLegacyFloatHostStagingBinding :
             for (var layer = 0; layer < Geometry.NumHiddenLayers; layer++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var keyBuffer = staged.Keys[layer].Buffer;
-                var valueBuffer = staged.Values[layer].Buffer;
-                if (keyBuffer.Length != expectedElementsPerTensor ||
-                    valueBuffer.Length != expectedElementsPerTensor)
+                var keyMemory = staged.Keys[layer].Memory;
+                var valueMemory = staged.Values[layer].Memory;
+                if (keyMemory.Length != expectedElementsPerTensor ||
+                    valueMemory.Length != expectedElementsPerTensor)
                 {
                     throw new InvalidOperationException(
                         $"Optimum host-staging layer {layer} payload length does not match decoder geometry.");
                 }
 
-                var key = OrtValue.CreateTensorValueFromMemory(keyBuffer, shape);
+                var key = OrtValue.CreateTensorValueFromMemory(keyMemory, shape);
                 owned.Add(key);
-                var value = OrtValue.CreateTensorValueFromMemory(valueBuffer, shape);
+                var value = OrtValue.CreateTensorValueFromMemory(valueMemory, shape);
                 owned.Add(value);
                 layers[layer] = new DecoderOrtLayerState(key, value);
             }
