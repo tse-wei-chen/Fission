@@ -7,6 +7,18 @@ internal interface IDecoderOrtOwnedLifetimeAnchor
     void Release();
 }
 
+/// <summary>
+/// Internal capability implemented by a state lifetime owner that can provide an
+/// independently retained CUDA resident-state lease. This is used for CUDA states
+/// whose allocations are not cohort-backed, such as H2D migration imports.
+/// </summary>
+internal interface IDecoderOrtCudaResidentStateSource
+{
+    DecoderOrtCudaResidentStateLease AcquireCudaResidentState(
+        string formatId,
+        DecoderOrtState state);
+}
+
 public readonly record struct DecoderOrtLayerState(
     OrtValue Key,
     OrtValue Value);
@@ -237,6 +249,34 @@ public sealed class DecoderOrtState : IDisposable
 
         slice = default;
         return false;
+    }
+
+    /// <summary>
+    /// Acquires an independently retained CUDA resident-state lease regardless of
+    /// whether this state is backed by a cohort row or by a standalone CUDA
+    /// lifetime owner such as H2D migration import.
+    /// </summary>
+    internal DecoderOrtCudaResidentStateLease AcquireCudaResidentState(
+        string formatId)
+    {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+        ArgumentException.ThrowIfNullOrWhiteSpace(formatId);
+
+        if (_cudaCohortSlice is { } cudaSlice)
+        {
+            return cudaSlice.Arena.AcquireResidentState(
+                formatId,
+                this,
+                cudaSlice.Row);
+        }
+
+        if (_lifetimeAnchor is IDecoderOrtCudaResidentStateSource source)
+        {
+            return source.AcquireCudaResidentState(formatId, this);
+        }
+
+        throw new InvalidOperationException(
+            "Decoder state does not expose a retained CUDA resident-state source.");
     }
 
     public void Dispose()
