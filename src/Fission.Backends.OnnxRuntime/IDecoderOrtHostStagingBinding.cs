@@ -4,9 +4,9 @@ namespace Fission.Backends.OnnxRuntime;
 
 /// <summary>
 /// Host-memory representation of one decoder state during staged migration.
-/// Concrete bindings own the payload format and may own pooled/pinned buffers.
+/// Concrete codecs own the payload format and may own pooled/pinned buffers.
 ///
-/// One owner reference belongs to the migration transfer. Bindings whose imported
+/// One owner reference belongs to the migration transfer. Codecs whose imported
 /// OrtValues are views over payload memory must call <see cref="Retain"/> and pass
 /// the returned lease as the DecoderOrtState lifetime anchor. The source-side
 /// terminal commit/abort releases the transfer owner; buffers are reclaimed only
@@ -145,14 +145,20 @@ public abstract class DecoderOrtHostStagingPayload : IDisposable
 }
 
 /// <summary>
-/// Optional decoder-binding codec for a real host-staging migration data path.
+/// Physical decoder-state codec used by the migration protocol. The codec is
+/// deliberately independent from model execution capabilities so a high-throughput
+/// batch/chunked model binding can keep its exact runtime type while migration is
+/// supplied by a separate component.
+///
 /// Export must deep-copy the live state into payload-owned host memory. Import
 /// must create a newly owned DecoderOrtState whose OrtValues do not alias source
 /// decoder OrtValues. If imported OrtValues alias payload memory, retain the
 /// payload and pass that lease as the DecoderOrtState lifetime anchor.
 /// </summary>
-public interface IDecoderOrtHostStagingBinding : IDecoderOrtModelBinding
+public interface IDecoderOrtHostStagingCodec
 {
+    string Name { get; }
+
     /// <summary>
     /// Versioned payload compatibility key. The ONNX backend combines this with
     /// ModelId to build the runtime transport id, so peers only negotiate when
@@ -172,16 +178,21 @@ public interface IDecoderOrtHostStagingBinding : IDecoderOrtModelBinding
 }
 
 /// <summary>
-/// Optional extension for host-staging codecs whose source export has a real
-/// asynchronous completion boundary, such as CUDA device-to-host DMA.
-///
-/// The migration adapter awaits this method before publishing a transfer token.
-/// Implementations must not return a payload until all native operations that can
-/// mutate its host buffers have reached terminal completion. On failure or caller
-/// cancellation, implementations must likewise wait for already-submitted native
-/// work before releasing source/destination allocations.
+/// Backward-compatible combined capability for bindings that own both model
+/// execution and their migration codec. Existing bindings can keep implementing
+/// this interface; the adapter treats the binding itself as its default codec.
 /// </summary>
-public interface IDecoderOrtAsyncHostStagingBinding : IDecoderOrtHostStagingBinding
+public interface IDecoderOrtHostStagingBinding :
+    IDecoderOrtModelBinding,
+    IDecoderOrtHostStagingCodec
+{
+}
+
+/// <summary>
+/// Optional codec extension whose source export has a real asynchronous completion
+/// boundary, such as CUDA device-to-host DMA.
+/// </summary>
+public interface IDecoderOrtAsyncHostStagingCodec : IDecoderOrtHostStagingCodec
 {
     ValueTask<DecoderOrtHostStagingPayload> ExportHostStagingStateAsync(
         DecoderOrtState state,
@@ -189,17 +200,32 @@ public interface IDecoderOrtAsyncHostStagingBinding : IDecoderOrtHostStagingBind
 }
 
 /// <summary>
-/// Optional extension for host-staging codecs whose target import has a real
-/// asynchronous completion boundary, such as CUDA host-to-device DMA.
-///
-/// The migration adapter awaits this method before publishing target state to the
-/// decoder store. Implementations must not return a state until every submitted
-/// native operation that can mutate its backing memory has reached terminal
-/// completion. The same rule applies to destructive-source rollback imports.
+/// Backward-compatible combined binding form of
+/// <see cref="IDecoderOrtAsyncHostStagingCodec"/>.
 /// </summary>
-public interface IDecoderOrtAsyncHostStagingImportBinding : IDecoderOrtHostStagingBinding
+public interface IDecoderOrtAsyncHostStagingBinding :
+    IDecoderOrtHostStagingBinding,
+    IDecoderOrtAsyncHostStagingCodec
+{
+}
+
+/// <summary>
+/// Optional codec extension whose target import has a real asynchronous completion
+/// boundary, such as CUDA host-to-device DMA.
+/// </summary>
+public interface IDecoderOrtAsyncHostStagingImportCodec : IDecoderOrtHostStagingCodec
 {
     ValueTask<DecoderOrtState> ImportHostStagingStateAsync(
         DecoderOrtHostStagingPayload payload,
         CancellationToken cancellationToken = default);
+}
+
+/// <summary>
+/// Backward-compatible combined binding form of
+/// <see cref="IDecoderOrtAsyncHostStagingImportCodec"/>.
+/// </summary>
+public interface IDecoderOrtAsyncHostStagingImportBinding :
+    IDecoderOrtHostStagingBinding,
+    IDecoderOrtAsyncHostStagingImportCodec
+{
 }
