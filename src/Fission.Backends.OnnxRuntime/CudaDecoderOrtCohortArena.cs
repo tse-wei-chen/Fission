@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 
@@ -18,6 +19,8 @@ internal sealed class CudaDecoderOrtCohortArena
     private readonly CudaDeviceMemoryAllocation[] _valueAllocations;
     private readonly long[] _perSequenceShape;
     private readonly long[] _batchedShape;
+    private readonly ReadOnlyCollection<long> _perSequenceShapeView;
+    private readonly ReadOnlyCollection<long> _batchedShapeView;
     private OrtMemoryInfo? _memoryInfo;
     private int _referenceCount = 1;
     private int _released;
@@ -65,6 +68,8 @@ internal sealed class CudaDecoderOrtCohortArena
 
         _batchedShape = _perSequenceShape.ToArray();
         _batchedShape[0] = batchSize;
+        _perSequenceShapeView = Array.AsReadOnly(_perSequenceShape);
+        _batchedShapeView = Array.AsReadOnly(_batchedShape);
         PerSequenceByteLength = checked(elementCount * sizeof(float));
         BatchedByteLength = checked(PerSequenceByteLength * batchSize);
         Position = position;
@@ -114,8 +119,8 @@ internal sealed class CudaDecoderOrtCohortArena
     public long PerSequenceByteLength { get; }
     public long BatchedByteLength { get; }
     public bool IsReleased => Volatile.Read(ref _released) != 0;
-    public IReadOnlyList<long> PerSequenceShape => _perSequenceShape;
-    public IReadOnlyList<long> BatchedShape => _batchedShape;
+    public IReadOnlyList<long> PerSequenceShape => _perSequenceShapeView;
+    public IReadOnlyList<long> BatchedShape => _batchedShapeView;
 
     /// <summary>
     /// Creates caller-owned batched ORT output wrappers over one layer's complete
