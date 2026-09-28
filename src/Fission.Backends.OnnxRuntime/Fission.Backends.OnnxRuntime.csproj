@@ -10,5 +10,6 @@
     <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaD2HStaging.Specs" />
     <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaH2DState.Specs" />
     <InternalsVisibleTo Include="Fission.OnnxRuntime.MigrationCodec.Specs" />
+    <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaMigrationCodec.Specs" />
   </ItemGroup>
 </Project>
