@@ -86,8 +86,8 @@ static async Task RunBoundedConcurrencyAsync()
 
     Require(cuda.CompleteOneRecordedEvent(), "At least one recorded CUDA event must be available for completion.");
     await WaitUntilAsync(
-        () => cuda.MemcpyAsyncCalls == 3,
-        "Completing one event must release exactly one stream slot for the queued copy.");
+        () => cuda.EventRecordCalls == 3,
+        "Completing one event must release exactly one stream slot and fully record the queued copy.");
 
     cuda.CompleteAllRecordedEvents();
     await Task.WhenAll(first, second, third);
