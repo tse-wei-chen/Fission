@@ -130,7 +130,10 @@ public sealed class CudaDeviceToHostStagingExporter : IDisposable
         CudaAsyncCopyEngine copyEngine,
         CudaPageLockedHostStagingFloatBufferAllocator stagingAllocator,
         PinnedHostStagingPoolOptions? stagingPoolOptions = null)
-        : this(copyEngine, stagingAllocator, stagingPoolOptions)
+        : this(
+            copyEngine,
+            (IHostStagingFloatBufferAllocator)stagingAllocator,
+            stagingPoolOptions)
     {
     }
 
