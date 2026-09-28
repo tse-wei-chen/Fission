@@ -212,6 +212,29 @@ internal sealed class CudaDecoderOrtCohortArena
     }
 
     /// <summary>
+    /// Acquires an independent resident-state retain from any state created as a
+    /// row view over a CUDA cohort arena. This is the binding-facing entry point:
+    /// the original output batch object may already be disposed when migration
+    /// later borrows the row state.
+    /// </summary>
+    public static DecoderOrtCudaResidentStateLease AcquireResidentState(
+        string formatId,
+        DecoderOrtState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        if (!state.TryGetCudaCohortSlice(out var slice))
+        {
+            throw new InvalidOperationException(
+                "Decoder state is not backed by a CUDA cohort arena.");
+        }
+
+        return slice.Arena.AcquireResidentState(
+            formatId,
+            state,
+            slice.Row);
+    }
+
+    /// <summary>
     /// Creates an independently retained raw-pointer lease for a row state. The
     /// returned lease may outlive the DecoderOrtState owner that requested it.
     /// </summary>
