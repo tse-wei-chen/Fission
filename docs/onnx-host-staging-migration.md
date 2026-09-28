@@ -209,4 +209,4 @@ Direct CUDA P2P/IPC, NIXL/RDMA, topology measurement, peer-access policy, GPU al
 - cancellation after submission draining before `cudaFree`;
 - allocation failure before any H2D submission;
 - format and allocator/copy-engine device mismatch rejection;
-- adapter dispatch to `IDecoderOrtAsyncHostStagingImportBinding`, including proof that migration import remains incomplete until the asynchronous binding releases its completion gate.
+- adapter dispatch to `IDecoderOrtAsyncHostStagingImportBinding`; the H2D cancellation spec separately proves that post-submit asynchronous completion is awaited before native lifetimes are released.
