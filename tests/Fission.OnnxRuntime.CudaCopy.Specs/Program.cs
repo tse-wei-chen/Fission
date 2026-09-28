@@ -474,7 +474,6 @@ sealed class FakeCudaAsyncCopyApi : ICudaAsyncCopyApi
 
     public int EventRecord(nint completionEvent, nint stream)
     {
-        Interlocked.Increment(ref _eventRecordCalls);
         lock (_gate)
         {
             if (!_events.TryGetValue(completionEvent, out var state) ||
@@ -487,6 +486,7 @@ sealed class FakeCudaAsyncCopyApi : ICudaAsyncCopyApi
             state.Recorded = true;
         }
 
+        Interlocked.Increment(ref _eventRecordCalls);
         return 0;
     }
 
