@@ -24,6 +24,7 @@
   <Project Path="tests/Fission.OnnxRuntime.OptimumBatch.Specs/Fission.OnnxRuntime.OptimumBatch.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.OptimumPrefillBatch.Specs/Fission.OnnxRuntime.OptimumPrefillBatch.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.Migration.Specs/Fission.OnnxRuntime.Migration.Specs.csproj" />
+  <Project Path="tests/Fission.OnnxRuntime.MigrationCodec.Specs/Fission.OnnxRuntime.MigrationCodec.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.PinnedStaging.Specs/Fission.OnnxRuntime.PinnedStaging.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.CudaCopy.Specs/Fission.OnnxRuntime.CudaCopy.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.CudaResidentState.Specs/Fission.OnnxRuntime.CudaResidentState.Specs.csproj" />
