@@ -46,7 +46,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
     private static readonly TimeSpan HostStagingFixedLatency = TimeSpan.FromTicks(500);
 
     bool IOnnxRuntimeSequenceMigrationAdapter.SupportsSequenceMigration =>
-        _binding is IDecoderOrtHostStagingBinding;
+        HostStagingCodec is not null;
 
     IReadOnlyList<SequenceMigrationTransportCapability>
         IOnnxRuntimeSequenceMigrationAdapter.GetSequenceMigrationTransportCapabilities(
@@ -55,11 +55,11 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
             DeviceId peerDevice)
     {
         EnsureInitialized();
-        var binding = RequireHostStagingBinding();
+        var codec = RequireHostStagingCodec();
         return new[]
         {
             new SequenceMigrationTransportCapability(
-                BuildHostStagingTransportId(modelId, binding.HostStagingFormatId),
+                BuildHostStagingTransportId(modelId, codec.HostStagingFormatId),
                 SequenceMigrationTransportKind.HostStaging,
                 MaxTransferBytes: 0,
                 EstimatedBandwidthBytesPerSecond: HostStagingBandwidthBytesPerSecond,
@@ -77,13 +77,13 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
     {
         EnsureInitialized();
         cancellationToken.ThrowIfCancellationRequested();
-        var binding = RequireHostStagingBinding();
+        var codec = RequireHostStagingCodec();
         var state = _states.GetSequence(sequenceId);
-        var bytes = binding.EstimateHostStagingBytes(state);
+        var bytes = codec.EstimateHostStagingBytes(state);
         if (bytes <= 0)
         {
             throw new InvalidOperationException(
-                $"Decoder host-staging binding '{binding.Name}' estimated {bytes} byte(s) for sequence {sequenceId}.");
+                $"Decoder host-staging codec '{codec.Name}' estimated {bytes} byte(s) for sequence {sequenceId}.");
         }
 
         return ValueTask.FromResult(bytes);
@@ -100,33 +100,33 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
     {
         EnsureInitialized();
         cancellationToken.ThrowIfCancellationRequested();
-        var binding = RequireHostStagingBinding();
+        var codec = RequireHostStagingCodec();
         var state = _states.GetSequence(sequenceId);
-        var expectedBytes = binding.EstimateHostStagingBytes(state);
+        var expectedBytes = codec.EstimateHostStagingBytes(state);
         if (expectedBytes <= 0)
         {
             throw new InvalidOperationException(
-                $"Decoder host-staging binding '{binding.Name}' estimated {expectedBytes} byte(s) for sequence {sequenceId}.");
+                $"Decoder host-staging codec '{codec.Name}' estimated {expectedBytes} byte(s) for sequence {sequenceId}.");
         }
 
         if (transportPlan is not null)
         {
-            ValidateTransportPlan(modelId, binding, expectedBytes, transportPlan);
+            ValidateTransportPlan(modelId, codec, expectedBytes, transportPlan);
         }
 
-        var payload = binding is IDecoderOrtAsyncHostStagingBinding asyncBinding
-            ? await asyncBinding.ExportHostStagingStateAsync(
+        var payload = codec is IDecoderOrtAsyncHostStagingCodec asyncCodec
+            ? await asyncCodec.ExportHostStagingStateAsync(
                 state,
                 cancellationToken).ConfigureAwait(false)
-            : binding.ExportHostStagingState(state, cancellationToken);
+            : codec.ExportHostStagingState(state, cancellationToken);
         ArgumentNullException.ThrowIfNull(payload);
         try
         {
-            if (!StringComparer.Ordinal.Equals(payload.FormatId, binding.HostStagingFormatId))
+            if (!StringComparer.Ordinal.Equals(payload.FormatId, codec.HostStagingFormatId))
             {
                 throw new InvalidOperationException(
-                    $"Decoder host-staging binding '{binding.Name}' exported format '{payload.FormatId}', " +
-                    $"but advertises '{binding.HostStagingFormatId}'.");
+                    $"Decoder host-staging codec '{codec.Name}' exported format '{payload.FormatId}', " +
+                    $"but advertises '{codec.HostStagingFormatId}'.");
             }
 
             if (payload.Position != state.Position || payload.NextTokenId != state.NextTokenId)
@@ -165,7 +165,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
     {
         EnsureInitialized();
         cancellationToken.ThrowIfCancellationRequested();
-        var binding = RequireHostStagingBinding();
+        var codec = RequireHostStagingCodec();
         var staged = RequireTransfer(modelId, transfer);
         if (staged.TargetDevice != localDevice)
         {
@@ -173,9 +173,9 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
                 $"Decoder migration {staged.TransactionId} targets {staged.TargetDevice}, not local device {localDevice}.");
         }
 
-        ValidatePayloadFormat(binding, staged.Payload);
+        ValidatePayloadFormat(codec, staged.Payload);
         var imported = await ImportHostStagingStateAsync(
-            binding,
+            codec,
             staged.Payload,
             cancellationToken).ConfigureAwait(false);
         ArgumentNullException.ThrowIfNull(imported);
@@ -224,7 +224,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
     {
         EnsureInitialized();
         cancellationToken.ThrowIfCancellationRequested();
-        var binding = RequireHostStagingBinding();
+        var codec = RequireHostStagingCodec();
         var staged = RequireTransfer(modelId, transfer);
 
         if (localDevice == staged.TargetDevice)
@@ -245,9 +245,9 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
             return;
         }
 
-        ValidatePayloadFormat(binding, staged.Payload);
+        ValidatePayloadFormat(codec, staged.Payload);
         var restored = await ImportHostStagingStateAsync(
-            binding,
+            codec,
             staged.Payload,
             cancellationToken).ConfigureAwait(false);
         ArgumentNullException.ThrowIfNull(restored);
@@ -264,10 +264,10 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
         }
     }
 
-    private IDecoderOrtHostStagingBinding RequireHostStagingBinding() =>
-        _binding as IDecoderOrtHostStagingBinding ??
+    private IDecoderOrtHostStagingCodec RequireHostStagingCodec() =>
+        HostStagingCodec ??
         throw new NotSupportedException(
-            $"Decoder binding '{_binding.Name}' does not implement host-staging migration.");
+            $"Decoder binding '{_binding.Name}' has no host-staging migration codec.");
 
     private static string BuildHostStagingTransportId(
         ModelId modelId,
@@ -276,18 +276,18 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
 
     private static void ValidateTransportPlan(
         ModelId modelId,
-        IDecoderOrtHostStagingBinding binding,
+        IDecoderOrtHostStagingCodec codec,
         long expectedBytes,
         SequenceMigrationTransportPlan transportPlan)
     {
         var expectedTransportId = BuildHostStagingTransportId(
             modelId,
-            binding.HostStagingFormatId);
+            codec.HostStagingFormatId);
         if (transportPlan.Kind != SequenceMigrationTransportKind.HostStaging ||
             !StringComparer.Ordinal.Equals(transportPlan.TransportId, expectedTransportId))
         {
             throw new InvalidOperationException(
-                $"Decoder binding '{binding.Name}' cannot materialize migration transport " +
+                $"Decoder codec '{codec.Name}' cannot materialize migration transport " +
                 $"'{transportPlan.TransportId}' ({transportPlan.Kind}); expected '{expectedTransportId}'.");
         }
 
@@ -317,30 +317,30 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
     }
 
     private static void ValidatePayloadFormat(
-        IDecoderOrtHostStagingBinding binding,
+        IDecoderOrtHostStagingCodec codec,
         DecoderOrtHostStagingPayload payload)
     {
-        if (!StringComparer.Ordinal.Equals(payload.FormatId, binding.HostStagingFormatId))
+        if (!StringComparer.Ordinal.Equals(payload.FormatId, codec.HostStagingFormatId))
         {
             throw new InvalidOperationException(
                 $"Decoder host-staging payload format '{payload.FormatId}' is incompatible with " +
-                $"binding format '{binding.HostStagingFormatId}'.");
+                $"codec format '{codec.HostStagingFormatId}'.");
         }
     }
 
     private static async ValueTask<DecoderOrtState> ImportHostStagingStateAsync(
-        IDecoderOrtHostStagingBinding binding,
+        IDecoderOrtHostStagingCodec codec,
         DecoderOrtHostStagingPayload payload,
         CancellationToken cancellationToken)
     {
-        if (binding is IDecoderOrtAsyncHostStagingImportBinding asyncBinding)
+        if (codec is IDecoderOrtAsyncHostStagingImportCodec asyncCodec)
         {
-            return await asyncBinding.ImportHostStagingStateAsync(
+            return await asyncCodec.ImportHostStagingStateAsync(
                 payload,
                 cancellationToken).ConfigureAwait(false);
         }
 
-        return binding.ImportHostStagingState(payload, cancellationToken);
+        return codec.ImportHostStagingState(payload, cancellationToken);
     }
 
     private static void ValidateImportedState(
