@@ -29,6 +29,7 @@ public sealed class DecoderOrtState : IDisposable
 {
     private readonly DecoderOrtLayerState[] _layers;
     private DecoderOrtCohortSlice? _cohortSlice;
+    private DecoderOrtCudaCohortSlice? _cudaCohortSlice;
     private object? _lifetimeAnchor;
     private int _disposed;
 
@@ -36,7 +37,13 @@ public sealed class DecoderOrtState : IDisposable
         int position,
         IReadOnlyList<DecoderOrtLayerState> layers,
         int? nextTokenId = null)
-        : this(position, layers, nextTokenId, cohortSlice: null, lifetimeAnchor: null)
+        : this(
+            position,
+            layers,
+            nextTokenId,
+            cohortSlice: null,
+            cudaCohortSlice: null,
+            lifetimeAnchor: null)
     {
     }
 
@@ -45,7 +52,28 @@ public sealed class DecoderOrtState : IDisposable
         IReadOnlyList<DecoderOrtLayerState> layers,
         int? nextTokenId,
         DecoderOrtCohortSlice cohortSlice)
-        : this(position, layers, nextTokenId, (DecoderOrtCohortSlice?)cohortSlice, lifetimeAnchor: null)
+        : this(
+            position,
+            layers,
+            nextTokenId,
+            (DecoderOrtCohortSlice?)cohortSlice,
+            cudaCohortSlice: null,
+            lifetimeAnchor: null)
+    {
+    }
+
+    internal DecoderOrtState(
+        int position,
+        IReadOnlyList<DecoderOrtLayerState> layers,
+        int? nextTokenId,
+        DecoderOrtCudaCohortSlice cudaCohortSlice)
+        : this(
+            position,
+            layers,
+            nextTokenId,
+            cohortSlice: null,
+            (DecoderOrtCudaCohortSlice?)cudaCohortSlice,
+            lifetimeAnchor: null)
     {
     }
 
@@ -66,6 +94,7 @@ public sealed class DecoderOrtState : IDisposable
             layers,
             nextTokenId,
             cohortSlice: null,
+            cudaCohortSlice: null,
             lifetimeAnchor: lifetimeAnchor)
     {
         ArgumentNullException.ThrowIfNull(lifetimeAnchor);
@@ -76,6 +105,7 @@ public sealed class DecoderOrtState : IDisposable
         IReadOnlyList<DecoderOrtLayerState> layers,
         int? nextTokenId,
         DecoderOrtCohortSlice? cohortSlice,
+        DecoderOrtCudaCohortSlice? cudaCohortSlice,
         object? lifetimeAnchor)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(position);
@@ -90,6 +120,12 @@ public sealed class DecoderOrtState : IDisposable
             throw new ArgumentException(
                 "Decoder KV state must contain at least one layer.",
                 nameof(layers));
+        }
+
+        if (cohortSlice is not null && cudaCohortSlice is not null)
+        {
+            throw new ArgumentException(
+                "Decoder state cannot belong to CPU and CUDA cohort arenas simultaneously.");
         }
 
         var owned = new HashSet<OrtValue>(ReferenceEqualityComparer.Instance);
@@ -134,35 +170,31 @@ public sealed class DecoderOrtState : IDisposable
 
         if (cohortSlice is { } slice)
         {
-            ArgumentNullException.ThrowIfNull(slice.Arena);
-            if (slice.Arena.Position != position)
-            {
-                throw new ArgumentException(
-                    "Decoder cohort arena position must match the state position.",
-                    nameof(cohortSlice));
-            }
-
-            if (slice.Arena.LayerCount != layers.Count)
-            {
-                throw new ArgumentException(
-                    "Decoder cohort arena layer count must match the state payload.",
-                    nameof(cohortSlice));
-            }
-
-            if (slice.Row < 0 || slice.Row >= slice.Arena.BatchSize)
-            {
-                throw new ArgumentOutOfRangeException(
-                    nameof(cohortSlice),
-                    "Decoder cohort row is outside the arena batch.");
-            }
-
+            ValidateCohortSlice(
+                slice.Arena,
+                slice.Row,
+                position,
+                layers.Count,
+                nameof(cohortSlice));
             slice.Arena.Retain();
+        }
+
+        if (cudaCohortSlice is { } cudaSlice)
+        {
+            ValidateCudaCohortSlice(
+                cudaSlice.Arena,
+                cudaSlice.Row,
+                position,
+                layers.Count,
+                nameof(cudaCohortSlice));
+            cudaSlice.Arena.Retain();
         }
 
         Position = position;
         NextTokenId = nextTokenId;
         _layers = validated;
         _cohortSlice = cohortSlice;
+        _cudaCohortSlice = cudaCohortSlice;
         _lifetimeAnchor = lifetimeAnchor;
     }
 
@@ -195,6 +227,18 @@ public sealed class DecoderOrtState : IDisposable
         return false;
     }
 
+    internal bool TryGetCudaCohortSlice(out DecoderOrtCudaCohortSlice slice)
+    {
+        if (!IsDisposed && _cudaCohortSlice is { } current)
+        {
+            slice = current;
+            return true;
+        }
+
+        slice = default;
+        return false;
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -214,10 +258,76 @@ public sealed class DecoderOrtState : IDisposable
             slice.Arena.Release();
         }
 
+        if (_cudaCohortSlice is { } cudaSlice)
+        {
+            _cudaCohortSlice = null;
+            cudaSlice.Arena.Release();
+        }
+
         var lifetimeAnchor = Interlocked.Exchange(ref _lifetimeAnchor, null);
         if (lifetimeAnchor is IDecoderOrtOwnedLifetimeAnchor ownedAnchor)
         {
             ownedAnchor.Release();
+        }
+    }
+
+    private static void ValidateCohortSlice(
+        DecoderOrtCohortArena arena,
+        int row,
+        int position,
+        int layerCount,
+        string parameterName)
+    {
+        ArgumentNullException.ThrowIfNull(arena);
+        if (arena.Position != position)
+        {
+            throw new ArgumentException(
+                "Decoder cohort arena position must match the state position.",
+                parameterName);
+        }
+
+        if (arena.LayerCount != layerCount)
+        {
+            throw new ArgumentException(
+                "Decoder cohort arena layer count must match the state payload.",
+                parameterName);
+        }
+
+        if (row < 0 || row >= arena.BatchSize)
+        {
+            throw new ArgumentOutOfRangeException(
+                parameterName,
+                "Decoder cohort row is outside the arena batch.");
+        }
+    }
+
+    private static void ValidateCudaCohortSlice(
+        CudaDecoderOrtCohortArena arena,
+        int row,
+        int position,
+        int layerCount,
+        string parameterName)
+    {
+        ArgumentNullException.ThrowIfNull(arena);
+        if (arena.Position != position)
+        {
+            throw new ArgumentException(
+                "CUDA decoder cohort arena position must match the state position.",
+                parameterName);
+        }
+
+        if (arena.LayerCount != layerCount)
+        {
+            throw new ArgumentException(
+                "CUDA decoder cohort arena layer count must match the state payload.",
+                parameterName);
+        }
+
+        if (row < 0 || row >= arena.BatchSize)
+        {
+            throw new ArgumentOutOfRangeException(
+                parameterName,
+                "CUDA decoder cohort row is outside the arena batch.");
         }
     }
 }
