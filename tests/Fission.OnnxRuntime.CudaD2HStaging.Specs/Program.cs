@@ -6,9 +6,7 @@ using Fission.Backends.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 
-static void Require(
-    [DoesNotReturnIf(false)] bool condition,
-    string message)
+static void Require([DoesNotReturnIf(false)] bool condition, string message)
 {
     if (!condition)
     {
@@ -19,23 +17,19 @@ static void Require(
 await RunAsyncExportAndPoolReuseAsync();
 await RunCancellationKeepsNativeLifetimesAsync();
 await RunNonPageLockedDestinationRejectedAsync();
-
 Console.WriteLine("Fission ONNX Runtime CUDA D2H staging specs passed.");
 
 static async Task RunAsyncExportAndPoolReuseAsync()
 {
     var cuda = new FakeCudaAsyncCopyApi();
-    await using var copyEngine = new CudaAsyncCopyEngine(
-        cuda,
-        new CudaAsyncCopyEngineOptions
-        {
-            StreamCount = 2,
-            CompletionPollInterval = TimeSpan.FromMilliseconds(1)
-        });
-    var allocator = new FakeCudaPageLockedAllocator();
+    await using var copyEngine = new CudaAsyncCopyEngine(cuda, new CudaAsyncCopyEngineOptions
+    {
+        StreamCount = 2,
+        CompletionPollInterval = TimeSpan.FromMilliseconds(1)
+    });
     using var exporter = new CudaDeviceToHostStagingExporter(
         copyEngine,
-        allocator,
+        new FakeCudaPageLockedAllocator(),
         new PinnedHostStagingPoolOptions
         {
             MaxRetainedBuffersPerLength = 4,
@@ -51,55 +45,46 @@ static async Task RunAsyncExportAndPoolReuseAsync()
     using var binding = new FakeCudaResidentBinding(source, lifetime);
 
     var firstExport = exporter.ExportAsync(binding, source.State).AsTask();
-    await WaitUntilAsync(
-        () => cuda.EventRecordCalls == 2,
-        "D2H export must submit key and value copies before completion is released.");
-
-    Require(!firstExport.IsCompleted, "Host-staging payload must not publish before CUDA completion events.");
-    Require(lifetime.ActiveLeases == 1, "Source CUDA allocation retain must stay alive while D2H DMA is in flight.");
-    Require(cuda.MemcpyCalls.Count == 2, "One decoder layer must submit exactly two CUDA copies.");
-    Require(cuda.MemcpyCalls.All(static copy => copy.Kind == CudaMemcpyKind.DeviceToHost), "Every staging copy must use cudaMemcpyDeviceToHost.");
-    Require(exporter.HostStagingPoolStatistics.ReturnedBuffers == 0, "In-flight destination buffers must not return to the pool.");
+    await WaitUntilAsync(() => cuda.EventRecordCalls == 2, "D2H export did not submit both KV copies.");
+    Require(!firstExport.IsCompleted, "Payload must not publish before CUDA completion.");
+    Require(lifetime.ActiveLeases == 1, "Source CUDA retain must stay alive while DMA is in flight.");
+    Require(cuda.MemcpyCalls.Count == 2, "One layer must submit exactly key/value copies.");
+    Require(cuda.MemcpyCalls.All(static call => call.Kind == CudaMemcpyKind.DeviceToHost), "Every staging copy must be DeviceToHost.");
+    Require(exporter.HostStagingPoolStatistics.ReturnedBuffers == 0, "In-flight destinations must not return to the pool.");
 
     cuda.CompleteAllRecordedEvents();
     var firstPayload = await firstExport;
-    Require(lifetime.ActiveLeases == 0 && lifetime.ReleaseCount == 1, "Source CUDA retain must release only after all D2H copies complete.");
-    Require(firstPayload.Position == 2 && firstPayload.NextTokenId == 19, "D2H staging must preserve the decoder causal frontier.");
-    Require(firstPayload.SourceCudaFormatId == binding.CudaResidentStateFormatId, "D2H payload must attest its source CUDA layout format.");
-    Require(firstPayload.FormatId == CudaDeviceToHostStagingExporter.BuildHostStagingFormatId(binding.CudaResidentStateFormatId), "D2H payload format must derive deterministically from the CUDA layout format.");
-    Require(firstPayload.ByteLength == 40, "D2H payload accounting must include two 16-byte tensors plus causal metadata.");
-    Require(firstPayload.GetKeyMemory(0).Span.SequenceEqual(new[] { 1f, 2f, 3f, 4f }), "D2H key payload must preserve source bytes.");
-    Require(firstPayload.GetValueMemory(0).Span.SequenceEqual(new[] { 5f, 6f, 7f, 8f }), "D2H value payload must preserve source bytes.");
-    Require(firstPayload.GetKeyShape(0).SequenceEqual(source.Shape), "D2H key shape must preserve source tensor geometry.");
-    Require(firstPayload.GetValueShape(0).SequenceEqual(source.Shape), "D2H value shape must preserve source tensor geometry.");
-
+    Require(lifetime.ActiveLeases == 0 && lifetime.ReleaseCount == 1, "Source retain must release after D2H completion.");
+    Require(firstPayload.Position == 2 && firstPayload.NextTokenId == 19, "D2H staging must preserve causal frontier.");
+    Require(firstPayload.SourceCudaFormatId == binding.CudaResidentStateFormatId, "Payload must preserve source CUDA format id.");
+    Require(firstPayload.FormatId == CudaDeviceToHostStagingExporter.BuildHostStagingFormatId(binding.CudaResidentStateFormatId), "Host format id must be deterministic.");
+    Require(firstPayload.ByteLength == 40, "Payload bytes must include two 16-byte tensors plus metadata.");
+    Require(firstPayload.GetKeyMemory(0).Span.SequenceEqual(new[] { 1f, 2f, 3f, 4f }), "Key bytes must survive D2H staging.");
+    Require(firstPayload.GetValueMemory(0).Span.SequenceEqual(new[] { 5f, 6f, 7f, 8f }), "Value bytes must survive D2H staging.");
+    Require(firstPayload.GetKeyShape(0).SequenceEqual(source.Shape), "Key shape must survive staging.");
     firstPayload.Dispose();
+
     var returned = exporter.HostStagingPoolStatistics;
-    Require(returned.ReturnedBuffers == 2 && returned.RetainedBuffers == 2, "Payload disposal must return both page-locked buffers to the staging pool.");
+    Require(returned.ReturnedBuffers == 2 && returned.RetainedBuffers == 2, "Payload disposal must return both staging buffers.");
 
     var secondExport = exporter.ExportAsync(binding, source.State).AsTask();
-    await WaitUntilAsync(
-        () => cuda.EventRecordCalls == 4,
-        "Second D2H export must submit another key/value pair.");
+    await WaitUntilAsync(() => cuda.EventRecordCalls == 4, "Second export did not submit both copies.");
     cuda.CompleteAllRecordedEvents();
     var secondPayload = await secondExport;
     var reused = exporter.HostStagingPoolStatistics;
-    Require(reused.AllocatedBuffers == 2 && reused.ReusedBuffers == 2, "Repeated same-shape D2H export must reuse page-locked staging allocations.");
+    Require(reused.AllocatedBuffers == 2 && reused.ReusedBuffers == 2, "Same-shape export must reuse page-locked buffers.");
     secondPayload.Dispose();
 }
 
 static async Task RunCancellationKeepsNativeLifetimesAsync()
 {
     var cuda = new FakeCudaAsyncCopyApi();
-    await using var copyEngine = new CudaAsyncCopyEngine(
-        cuda,
-        new CudaAsyncCopyEngineOptions
-        {
-            StreamCount = 2,
-            CompletionPollInterval = TimeSpan.FromMilliseconds(1)
-        });
-    var allocator = new FakeCudaPageLockedAllocator();
-    using var exporter = new CudaDeviceToHostStagingExporter(copyEngine, allocator);
+    await using var copyEngine = new CudaAsyncCopyEngine(cuda, new CudaAsyncCopyEngineOptions
+    {
+        StreamCount = 2,
+        CompletionPollInterval = TimeSpan.FromMilliseconds(1)
+    });
+    using var exporter = new CudaDeviceToHostStagingExporter(copyEngine, new FakeCudaPageLockedAllocator());
     using var source = SyntheticCudaState.Create(
         new[] { 11f, 12f, 13f, 14f },
         new[] { 21f, 22f, 23f, 24f },
@@ -109,19 +94,13 @@ static async Task RunCancellationKeepsNativeLifetimesAsync()
     using var binding = new FakeCudaResidentBinding(source, lifetime);
     using var cancellation = new CancellationTokenSource();
 
-    var export = exporter.ExportAsync(
-        binding,
-        source.State,
-        cancellation.Token).AsTask();
-    await WaitUntilAsync(
-        () => cuda.EventRecordCalls == 2,
-        "Cancellation test requires both D2H copies to reach native submission.");
-
+    var export = exporter.ExportAsync(binding, source.State, cancellation.Token).AsTask();
+    await WaitUntilAsync(() => cuda.EventRecordCalls == 2, "Cancellation test requires submitted DMA.");
     cancellation.Cancel();
     await Task.Delay(20);
-    Require(!export.IsCompleted, "Cancellation after cudaMemcpyAsync submission must wait for native completion.");
-    Require(lifetime.ActiveLeases == 1, "Canceled D2H export must retain source CUDA allocations while native work is incomplete.");
-    Require(exporter.HostStagingPoolStatistics.ReturnedBuffers == 0, "Canceled in-flight D2H destinations must not return to the pool early.");
+    Require(!export.IsCompleted, "Post-submit cancellation must wait for native completion.");
+    Require(lifetime.ActiveLeases == 1, "Canceled in-flight export must retain CUDA source allocations.");
+    Require(exporter.HostStagingPoolStatistics.ReturnedBuffers == 0, "Canceled in-flight destinations must stay leased.");
 
     cuda.CompleteAllRecordedEvents();
     var canceled = false;
@@ -134,25 +113,21 @@ static async Task RunCancellationKeepsNativeLifetimesAsync()
         canceled = true;
     }
 
-    Require(canceled, "Caller cancellation must surface after submitted D2H copies complete.");
-    Require(lifetime.ActiveLeases == 0 && lifetime.ReleaseCount == 1, "Canceled D2H export must release source CUDA retain after native completion.");
-    var statistics = exporter.HostStagingPoolStatistics;
-    Require(statistics.ReturnedBuffers == 2 && statistics.RetainedBuffers == 2, "Canceled D2H export must reclaim both page-locked destinations after DMA drains.");
+    Require(canceled, "Cancellation must surface after native completion.");
+    Require(lifetime.ActiveLeases == 0 && lifetime.ReleaseCount == 1, "Canceled export must release source retain after drain.");
+    var stats = exporter.HostStagingPoolStatistics;
+    Require(stats.ReturnedBuffers == 2 && stats.RetainedBuffers == 2, "Canceled export must reclaim both destinations after drain.");
 }
 
 static async Task RunNonPageLockedDestinationRejectedAsync()
 {
     var cuda = new FakeCudaAsyncCopyApi();
-    await using var copyEngine = new CudaAsyncCopyEngine(
-        cuda,
-        new CudaAsyncCopyEngineOptions
-        {
-            StreamCount = 1,
-            CompletionPollInterval = TimeSpan.FromMilliseconds(1)
-        });
-    using var exporter = new CudaDeviceToHostStagingExporter(
-        copyEngine,
-        new FakeStableButNotCudaPageLockedAllocator());
+    await using var copyEngine = new CudaAsyncCopyEngine(cuda, new CudaAsyncCopyEngineOptions
+    {
+        StreamCount = 1,
+        CompletionPollInterval = TimeSpan.FromMilliseconds(1)
+    });
+    using var exporter = new CudaDeviceToHostStagingExporter(copyEngine, new FakeStableHostAllocator());
     using var source = SyntheticCudaState.Create(
         new[] { 31f, 32f, 33f, 34f },
         new[] { 41f, 42f, 43f, 44f },
@@ -171,19 +146,19 @@ static async Task RunNonPageLockedDestinationRejectedAsync()
         observed = exception;
     }
 
-    Require(observed is InvalidOperationException, "D2H exporter must reject a stable host pointer that is not explicitly CUDA page-locked.");
-    Require(cuda.MemcpyAsyncCalls == 0, "No CUDA DMA may be submitted when the destination lacks the page-locked capability.");
-    Require(lifetime.ActiveLeases == 0 && lifetime.ReleaseCount == 1, "Pre-submission destination validation failure must release the source CUDA retain.");
+    Require(observed is InvalidOperationException, "Stable but non-CUDA-page-locked destination must be rejected.");
+    Require(cuda.MemcpyAsyncCalls == 0, "No CUDA DMA may be submitted to a non-page-locked destination.");
+    Require(lifetime.ActiveLeases == 0 && lifetime.ReleaseCount == 1, "Pre-submit validation failure must release source retain.");
 }
 
-static async Task WaitUntilAsync(Func<bool> predicate, string failureMessage)
+static async Task WaitUntilAsync(Func<bool> predicate, string message)
 {
     var timeout = Stopwatch.StartNew();
     while (!predicate())
     {
         if (timeout.Elapsed >= TimeSpan.FromSeconds(3))
         {
-            throw new InvalidOperationException(failureMessage);
+            throw new InvalidOperationException(message);
         }
 
         await Task.Delay(1);
@@ -195,9 +170,7 @@ sealed class FakeCudaResidentBinding : IDecoderOrtCudaResidentStateBinding
     private readonly SyntheticCudaState _source;
     private readonly LifetimeProbe _lifetime;
 
-    public FakeCudaResidentBinding(
-        SyntheticCudaState source,
-        LifetimeProbe lifetime)
+    public FakeCudaResidentBinding(SyntheticCudaState source, LifetimeProbe lifetime)
     {
         _source = source;
         _lifetime = lifetime;
@@ -220,27 +193,18 @@ sealed class FakeCudaResidentBinding : IDecoderOrtCudaResidentStateBinding
         return DecoderOrtCudaResidentStateLease.Create(
             CudaResidentStateFormatId,
             state,
-            deviceId: 0,
+            0,
             _source.CreateLayerViews(),
             _lifetime.Retain());
     }
 
-    public DecoderOrtStepResult ExecutePrefill(
-        InferenceSession session,
-        PrefillItem item,
-        CancellationToken cancellationToken = default) =>
+    public DecoderOrtStepResult ExecutePrefill(InferenceSession session, PrefillItem item, CancellationToken cancellationToken = default) =>
         throw new NotSupportedException();
 
-    public DecoderOrtStepResult ExecuteDecode(
-        InferenceSession session,
-        DecodeItem item,
-        DecoderOrtState priorState,
-        CancellationToken cancellationToken = default) =>
+    public DecoderOrtStepResult ExecuteDecode(InferenceSession session, DecodeItem item, DecoderOrtState priorState, CancellationToken cancellationToken = default) =>
         throw new NotSupportedException();
 
-    public void Dispose()
-    {
-    }
+    public void Dispose() { }
 }
 
 sealed class SyntheticCudaState : IDisposable
@@ -270,59 +234,30 @@ sealed class SyntheticCudaState : IDisposable
     public long[] Shape { get; }
     public DecoderOrtState State { get; }
 
-    public static SyntheticCudaState Create(
-        float[] keyValues,
-        float[] valueValues,
-        int position,
-        int? nextTokenId)
+    public static SyntheticCudaState Create(float[] keys, float[] values, int position, int? nextTokenId)
     {
-        ArgumentNullException.ThrowIfNull(keyValues);
-        ArgumentNullException.ThrowIfNull(valueValues);
-        if (keyValues.Length != valueValues.Length || keyValues.Length == 0)
+        if (keys.Length == 0 || keys.Length != values.Length)
         {
-            throw new ArgumentException("Synthetic key/value buffers must have the same non-zero length.");
+            throw new ArgumentException("Synthetic key/value buffers must have equal non-zero length.");
         }
 
-        var shape = new long[] { 1, 1, 1, keyValues.Length };
-        var byteLength = checked(keyValues.Length * (long)sizeof(float));
-        var keyPointer = Marshal.AllocHGlobal(checked((int)byteLength));
-        var valuePointer = Marshal.AllocHGlobal(checked((int)byteLength));
-        Marshal.Copy(keyValues, 0, keyPointer, keyValues.Length);
-        Marshal.Copy(valueValues, 0, valuePointer, valueValues.Length);
-        var memoryInfo = new OrtMemoryInfo(
-            "Cuda",
-            OrtAllocatorType.DeviceAllocator,
-            0,
-            OrtMemType.Default);
+        var shape = new long[] { 1, 1, 1, keys.Length };
+        var bytes = checked(keys.Length * (long)sizeof(float));
+        var keyPointer = Marshal.AllocHGlobal(checked((int)bytes));
+        var valuePointer = Marshal.AllocHGlobal(checked((int)bytes));
+        Marshal.Copy(keys, 0, keyPointer, keys.Length);
+        Marshal.Copy(values, 0, valuePointer, values.Length);
+        var memoryInfo = new OrtMemoryInfo("Cuda", OrtAllocatorType.DeviceAllocator, 0, OrtMemType.Default);
         OrtValue? key = null;
         OrtValue? value = null;
         try
         {
-            key = OrtValue.CreateTensorValueWithData(
-                memoryInfo,
-                TensorElementType.Float,
-                shape,
-                keyPointer,
-                byteLength);
-            value = OrtValue.CreateTensorValueWithData(
-                memoryInfo,
-                TensorElementType.Float,
-                shape,
-                valuePointer,
-                byteLength);
-            var state = new DecoderOrtState(
-                position,
-                new[] { new DecoderOrtLayerState(key, value) },
-                nextTokenId);
+            key = OrtValue.CreateTensorValueWithData(memoryInfo, TensorElementType.Float, shape, keyPointer, bytes);
+            value = OrtValue.CreateTensorValueWithData(memoryInfo, TensorElementType.Float, shape, valuePointer, bytes);
+            var state = new DecoderOrtState(position, new[] { new DecoderOrtLayerState(key, value) }, nextTokenId);
             key = null;
             value = null;
-            return new SyntheticCudaState(
-                memoryInfo,
-                keyPointer,
-                valuePointer,
-                byteLength,
-                shape,
-                state);
+            return new SyntheticCudaState(memoryInfo, keyPointer, valuePointer, bytes, shape, state);
         }
         catch
         {
@@ -336,22 +271,11 @@ sealed class SyntheticCudaState : IDisposable
     }
 
     public DecoderOrtCudaLayerView[] CreateLayerViews() =>
-        new[]
-        {
-            new DecoderOrtCudaLayerView(
-                new CudaDeviceTensorView(
-                    KeyPointer,
-                    ByteLength,
-                    TensorElementType.Float,
-                    Shape,
-                    0),
-                new CudaDeviceTensorView(
-                    ValuePointer,
-                    ByteLength,
-                    TensorElementType.Float,
-                    Shape,
-                    0))
-        };
+    [
+        new DecoderOrtCudaLayerView(
+            new CudaDeviceTensorView(KeyPointer, ByteLength, TensorElementType.Float, Shape, 0),
+            new CudaDeviceTensorView(ValuePointer, ByteLength, TensorElementType.Float, Shape, 0))
+    ];
 
     public void Dispose()
     {
@@ -369,49 +293,38 @@ sealed class SyntheticCudaState : IDisposable
 
 sealed class LifetimeProbe
 {
-    private int _activeLeases;
-    private int _releaseCount;
-
-    public int ActiveLeases => Volatile.Read(ref _activeLeases);
-    public int ReleaseCount => Volatile.Read(ref _releaseCount);
+    private int _active;
+    private int _released;
+    public int ActiveLeases => Volatile.Read(ref _active);
+    public int ReleaseCount => Volatile.Read(ref _released);
 
     public IDisposable Retain()
     {
-        Interlocked.Increment(ref _activeLeases);
+        Interlocked.Increment(ref _active);
         return new Lease(this);
     }
 
     private void Release()
     {
-        Interlocked.Decrement(ref _activeLeases);
-        Interlocked.Increment(ref _releaseCount);
+        Interlocked.Decrement(ref _active);
+        Interlocked.Increment(ref _released);
     }
 
-    private sealed class Lease : IDisposable
+    private sealed class Lease(LifetimeProbe owner) : IDisposable
     {
-        private LifetimeProbe? _owner;
-
-        public Lease(LifetimeProbe owner)
-        {
-            _owner = owner;
-        }
-
-        public void Dispose()
-        {
-            Interlocked.Exchange(ref _owner, null)?.Release();
-        }
+        private LifetimeProbe? _owner = owner;
+        public void Dispose() => Interlocked.Exchange(ref _owner, null)?.Release();
     }
 }
 
 sealed class FakeCudaPageLockedAllocator : IHostStagingFloatBufferAllocator
 {
-    public IHostStagingFloatBuffer Allocate(int length) =>
-        new Buffer(length);
+    public IHostStagingFloatBuffer Allocate(int length) => new Buffer(length);
 
     private sealed class Buffer : ICudaPageLockedHostStagingFloatBuffer
     {
-        private readonly float[] _buffer;
-        private GCHandle _handle;
+        private readonly float[] _buffer = new float[length];
+        private GCHandle _handle = GCHandle.Alloc(new float[0]);
         private int _disposed;
 
         public Buffer(int length)
@@ -440,26 +353,19 @@ sealed class FakeCudaPageLockedAllocator : IHostStagingFloatBufferAllocator
 
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _disposed, 1) != 0)
-            {
-                return;
-            }
-
-            if (_handle.IsAllocated)
+            if (Interlocked.Exchange(ref _disposed, 1) == 0 && _handle.IsAllocated)
             {
                 _handle.Free();
             }
         }
 
-        private void ThrowIfDisposed() =>
-            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
     }
 }
 
-sealed class FakeStableButNotCudaPageLockedAllocator : IHostStagingFloatBufferAllocator
+sealed class FakeStableHostAllocator : IHostStagingFloatBufferAllocator
 {
-    public IHostStagingFloatBuffer Allocate(int length) =>
-        new Buffer(length);
+    public IHostStagingFloatBuffer Allocate(int length) => new Buffer(length);
 
     private sealed class Buffer : IHostStagingFloatBuffer
     {
@@ -497,42 +403,31 @@ sealed class FakeCudaAsyncCopyApi : ICudaAsyncCopyApi
     private readonly object _gate = new();
     private readonly HashSet<nint> _streams = new();
     private readonly Dictionary<nint, EventState> _events = new();
-    private readonly List<MemcpyCall> _memcpyCalls = new();
+    private readonly List<MemcpyCall> _copies = new();
     private long _nextHandle = 100;
-    private int _memcpyAsyncCalls;
-    private int _eventRecordCalls;
+    private int _memcpyCalls;
+    private int _recordCalls;
 
-    public int MemcpyAsyncCalls => Volatile.Read(ref _memcpyAsyncCalls);
-    public int EventRecordCalls => Volatile.Read(ref _eventRecordCalls);
-
+    public int MemcpyAsyncCalls => Volatile.Read(ref _memcpyCalls);
+    public int EventRecordCalls => Volatile.Read(ref _recordCalls);
     public IReadOnlyList<MemcpyCall> MemcpyCalls
     {
-        get
-        {
-            lock (_gate)
-            {
-                return _memcpyCalls.ToArray();
-            }
-        }
+        get { lock (_gate) { return _copies.ToArray(); } }
     }
 
     public int StreamCreateWithFlags(out nint stream, uint flags)
     {
         lock (_gate)
         {
-            stream = (nint)++_nextHandle;
+            stream = (nint)(++_nextHandle);
             _streams.Add(stream);
         }
-
         return 0;
     }
 
     public int StreamDestroy(nint stream)
     {
-        lock (_gate)
-        {
-            return _streams.Remove(stream) ? 0 : 17;
-        }
+        lock (_gate) { return _streams.Remove(stream) ? 0 : 17; }
     }
 
     public int StreamSynchronize(nint stream)
@@ -544,32 +439,21 @@ sealed class FakeCudaAsyncCopyApi : ICudaAsyncCopyApi
                 state.Completed = true;
             }
         }
-
         return 0;
     }
 
-    public int MemcpyAsync(
-        nint destination,
-        nint source,
-        nuint byteLength,
-        CudaMemcpyKind kind,
-        nint stream)
+    public int MemcpyAsync(nint destination, nint source, nuint byteLength, CudaMemcpyKind kind, nint stream)
     {
-        Interlocked.Increment(ref _memcpyAsyncCalls);
+        Interlocked.Increment(ref _memcpyCalls);
         lock (_gate)
         {
-            if (!_streams.Contains(stream))
-            {
-                return 17;
-            }
-
-            _memcpyCalls.Add(new MemcpyCall(destination, source, byteLength, kind, stream));
+            if (!_streams.Contains(stream)) return 17;
+            _copies.Add(new MemcpyCall(destination, source, byteLength, kind, stream));
         }
 
-        var count = checked((int)byteLength);
-        var bytes = new byte[count];
-        Marshal.Copy(source, bytes, 0, count);
-        Marshal.Copy(bytes, 0, destination, count);
+        var bytes = new byte[checked((int)byteLength)];
+        Marshal.Copy(source, bytes, 0, bytes.Length);
+        Marshal.Copy(bytes, 0, destination, bytes.Length);
         return 0;
     }
 
@@ -577,10 +461,9 @@ sealed class FakeCudaAsyncCopyApi : ICudaAsyncCopyApi
     {
         lock (_gate)
         {
-            completionEvent = (nint)++_nextHandle;
+            completionEvent = (nint)(++_nextHandle);
             _events.Add(completionEvent, new EventState());
         }
-
         return 0;
     }
 
@@ -588,17 +471,11 @@ sealed class FakeCudaAsyncCopyApi : ICudaAsyncCopyApi
     {
         lock (_gate)
         {
-            if (!_events.TryGetValue(completionEvent, out var state) ||
-                !_streams.Contains(stream))
-            {
-                return 17;
-            }
-
+            if (!_events.TryGetValue(completionEvent, out var state) || !_streams.Contains(stream)) return 17;
             state.Stream = stream;
             state.Recorded = true;
         }
-
-        Interlocked.Increment(ref _eventRecordCalls);
+        Interlocked.Increment(ref _recordCalls);
         return 0;
     }
 
@@ -606,23 +483,14 @@ sealed class FakeCudaAsyncCopyApi : ICudaAsyncCopyApi
     {
         lock (_gate)
         {
-            if (!_events.TryGetValue(completionEvent, out var state) || !state.Recorded)
-            {
-                return 17;
-            }
-
-            return state.Completed
-                ? 0
-                : CudaAsyncCopyEngine.CudaErrorNotReady;
+            if (!_events.TryGetValue(completionEvent, out var state) || !state.Recorded) return 17;
+            return state.Completed ? 0 : CudaAsyncCopyEngine.CudaErrorNotReady;
         }
     }
 
     public int EventDestroy(nint completionEvent)
     {
-        lock (_gate)
-        {
-            return _events.Remove(completionEvent) ? 0 : 17;
-        }
+        lock (_gate) { return _events.Remove(completionEvent) ? 0 : 17; }
     }
 
     public string? GetErrorString(int errorCode) => $"fake-cuda-error-{errorCode}";
@@ -631,20 +499,11 @@ sealed class FakeCudaAsyncCopyApi : ICudaAsyncCopyApi
     {
         lock (_gate)
         {
-            foreach (var state in _events.Values.Where(static state => state.Recorded))
-            {
-                state.Completed = true;
-            }
+            foreach (var state in _events.Values.Where(static item => item.Recorded)) state.Completed = true;
         }
     }
 
-    public readonly record struct MemcpyCall(
-        nint Destination,
-        nint Source,
-        nuint ByteLength,
-        CudaMemcpyKind Kind,
-        nint Stream);
-
+    public readonly record struct MemcpyCall(nint Destination, nint Source, nuint ByteLength, CudaMemcpyKind Kind, nint Stream);
     private sealed class EventState
     {
         public nint Stream { get; set; }
