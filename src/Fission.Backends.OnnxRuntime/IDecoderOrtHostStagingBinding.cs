@@ -170,3 +170,20 @@ public interface IDecoderOrtHostStagingBinding : IDecoderOrtModelBinding
         DecoderOrtHostStagingPayload payload,
         CancellationToken cancellationToken = default);
 }
+
+/// <summary>
+/// Optional extension for host-staging codecs whose source export has a real
+/// asynchronous completion boundary, such as CUDA device-to-host DMA.
+///
+/// The migration adapter awaits this method before publishing a transfer token.
+/// Implementations must not return a payload until all native operations that can
+/// mutate its host buffers have reached terminal completion. On failure or caller
+/// cancellation, implementations must likewise wait for already-submitted native
+/// work before releasing source/destination allocations.
+/// </summary>
+public interface IDecoderOrtAsyncHostStagingBinding : IDecoderOrtHostStagingBinding
+{
+    ValueTask<DecoderOrtHostStagingPayload> ExportHostStagingStateAsync(
+        DecoderOrtState state,
+        CancellationToken cancellationToken = default);
+}

@@ -7,5 +7,6 @@
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.30.0" />
     <InternalsVisibleTo Include="Fission.OnnxRuntime.PinnedStaging.Specs" />
     <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaCopy.Specs" />
+    <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaD2HStaging.Specs" />
   </ItemGroup>
 </Project>

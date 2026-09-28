@@ -89,7 +89,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
         return ValueTask.FromResult(bytes);
     }
 
-    ValueTask<SequenceMigrationTransfer>
+    async ValueTask<SequenceMigrationTransfer>
         IOnnxRuntimeSequenceMigrationAdapter.PrepareSequenceMigrationAsync(
             ModelId modelId,
             DeviceId sourceDevice,
@@ -114,7 +114,11 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
             ValidateTransportPlan(modelId, binding, expectedBytes, transportPlan);
         }
 
-        var payload = binding.ExportHostStagingState(state, cancellationToken);
+        var payload = binding is IDecoderOrtAsyncHostStagingBinding asyncBinding
+            ? await asyncBinding.ExportHostStagingStateAsync(
+                state,
+                cancellationToken).ConfigureAwait(false)
+            : binding.ExportHostStagingState(state, cancellationToken);
         ArgumentNullException.ThrowIfNull(payload);
         try
         {
@@ -137,7 +141,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
                     $"Decoder host-staging payload contains {payload.ByteLength} byte(s), but prepare estimated {expectedBytes}.");
             }
 
-            SequenceMigrationTransfer transfer = new DecoderOrtHostStagingTransfer(
+            return new DecoderOrtHostStagingTransfer(
                 Guid.NewGuid(),
                 sequenceId,
                 sourceDevice,
@@ -145,7 +149,6 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
                 modelId,
                 payload,
                 transportPlan);
-            return ValueTask.FromResult(transfer);
         }
         catch
         {

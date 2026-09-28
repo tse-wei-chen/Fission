@@ -157,7 +157,8 @@ public sealed class CudaPageLockedHostStagingFloatBufferAllocator :
             new CudaPageLockedFloatMemoryManager(handle, length));
     }
 
-    private sealed class CudaPageLockedHostStagingFloatBuffer : IHostStagingFloatBuffer
+    private sealed class CudaPageLockedHostStagingFloatBuffer :
+        ICudaPageLockedHostStagingFloatBuffer
     {
         private CudaPageLockedFloatMemoryManager? _memoryManager;
 
@@ -169,6 +170,10 @@ public sealed class CudaPageLockedHostStagingFloatBufferAllocator :
 
         public Memory<float> Memory =>
             _memoryManager?.Memory ??
+            throw new ObjectDisposedException(nameof(CudaPageLockedHostStagingFloatBuffer));
+
+        public nint Pointer =>
+            _memoryManager?.Pointer ??
             throw new ObjectDisposedException(nameof(CudaPageLockedHostStagingFloatBuffer));
 
         public void Dispose()
@@ -193,6 +198,15 @@ public sealed class CudaPageLockedHostStagingFloatBufferAllocator :
         {
             _handle = handle;
             _length = length;
+        }
+
+        public nint Pointer
+        {
+            get
+            {
+                ThrowIfDisposed();
+                return _handle.DangerousGetHandle();
+            }
         }
 
         public override Span<float> GetSpan()

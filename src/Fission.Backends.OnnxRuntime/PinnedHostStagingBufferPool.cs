@@ -23,6 +23,20 @@ public interface IHostStagingFloatBuffer : IDisposable
 }
 
 /// <summary>
+/// Optional physical capability for a host-staging buffer that is CUDA page-locked
+/// and can therefore be used directly as a cudaMemcpyAsync host endpoint.
+///
+/// Implementations must keep <see cref="Pointer"/> stable and valid for the same
+/// lifetime as <see cref="IHostStagingFloatBuffer.Memory"/>. Ordinary GC-pinned
+/// buffers deliberately do not implement this capability: a stable managed address
+/// is not equivalent to a CUDA page-locked host allocation.
+/// </summary>
+public interface ICudaPageLockedHostStagingFloatBuffer : IHostStagingFloatBuffer
+{
+    nint Pointer { get; }
+}
+
+/// <summary>
 /// Default allocator used by the ONNX staging path. Buffers are exact-length arrays
 /// allocated directly into the pinned object heap so their managed address is stable.
 /// </summary>
@@ -249,6 +263,25 @@ internal sealed class PinnedFloatBufferPool : IDisposable
 
         public Memory<float> Memory => _buffer.Memory;
         public Span<float> Span => _buffer.Memory.Span;
+
+        internal nint GetCudaPageLockedPointer()
+        {
+            ObjectDisposedException.ThrowIf(
+                Volatile.Read(ref _owner) is null,
+                this);
+
+            var cudaBuffer = _buffer as ICudaPageLockedHostStagingFloatBuffer ??
+                throw new InvalidOperationException(
+                    $"Host-staging buffer {_buffer.GetType().Name} is not CUDA page-locked and cannot be used for asynchronous CUDA DMA.");
+            var pointer = cudaBuffer.Pointer;
+            if (pointer == 0)
+            {
+                throw new InvalidOperationException(
+                    "CUDA page-locked host-staging buffer exposed a null native pointer.");
+            }
+
+            return pointer;
+        }
 
         public void Dispose()
         {
