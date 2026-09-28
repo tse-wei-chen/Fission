@@ -33,6 +33,7 @@
   <Project Path="tests/Fission.OnnxRuntime.CudaMigrationCodec.Specs/Fission.OnnxRuntime.CudaMigrationCodec.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.CudaKvArena.Specs/Fission.OnnxRuntime.CudaKvArena.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.CudaPresentKv.Specs/Fission.OnnxRuntime.CudaPresentKv.Specs.csproj" />
+  <Project Path="tests/Fission.OnnxRuntime.CudaPastKv.Specs/Fission.OnnxRuntime.CudaPastKv.Specs.csproj" />
   <Project Path="tests/Fission.BackendTransactions.Specs/Fission.BackendTransactions.Specs.csproj" />
   <Project Path="tests/Fission.Migration.Specs/Fission.Migration.Specs.csproj" />
   <Project Path="tests/Fission.MultiDevice.Specs/Fission.MultiDevice.Specs.csproj" />
