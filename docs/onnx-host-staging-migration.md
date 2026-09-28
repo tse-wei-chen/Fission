@@ -46,29 +46,46 @@ Prepare also disposes a newly exported payload if format/frontier/byte validatio
 
 - preserves the existing prefill/decode/batched execution behavior;
 - estimates transfer bytes from decoder geometry;
-- deep-copies FP32 key/value tensors into exact-length GC-pinned managed arrays on export;
-- pools returned staging arrays by exact element length so repeated same-shape migrations avoid fresh pinned allocations;
+- deep-copies FP32 key/value tensors into exact-length pooled host buffers on export;
+- uses GC-pinned managed arrays by default;
+- pools returned staging buffers by exact element length so repeated same-shape migrations avoid fresh physical allocations;
 - bounds retention by both buffers-per-length and total retained bytes;
 - clears returned buffers by default before retaining them in the pool;
 - validates layer count, geometry, byte count, format id, position, and next-token frontier;
-- creates distinct target `OrtValue` instances over the staged arrays on import;
+- creates distinct target `OrtValue` instances over the staged `Memory<float>` on import;
 - advertises a format-specific host-staging transport id so incompatible source/target bindings fail transport negotiation before export.
 
 `PinnedHostStagingPoolOptions` controls retention and clear-on-return policy. `PinnedHostStagingPoolStatistics` exposes allocation, reuse, return/drop, and retained-buffer counters so production tests and telemetry can distinguish allocation pressure from transport bytes.
 
 The transport id includes model identity and decoder geometry/format. Host staging therefore participates in the same deterministic transport planner, byte/concurrency admission control, timeout classification, and migration tracing as future CUDA P2P, IPC, NIXL, or RDMA transports.
 
-## What “pinned” means here
+## Physical host-allocation boundary
 
-The current pool uses `.NET` GC-pinned managed arrays (`GC.AllocateUninitializedArray<T>(..., pinned: true)`). The array object has a stable managed address for its lifetime and can back existing `OrtValue.CreateTensorValueFromMemory` calls without another managed copy.
+The pool no longer assumes that a staging allocation is a managed `float[]`.
 
-This is **not** yet CUDA page-locked host memory allocated with CUDA host-allocation/registration APIs, and this milestone does not claim asynchronous GPU DMA. It establishes the ownership, pooling, stable-address, retention, and rollback lifetime model that a later CUDA-specific allocator can implement behind the same staging boundary.
+`IHostStagingFloatBufferAllocator` creates exact-length `IHostStagingFloatBuffer` instances, and each buffer exposes a `Memory<float>` whose lifetime is controlled by the existing payload lease. `OptimumLegacyFloatHostStagingBinding` imports that memory through ONNX Runtime's `OrtValue.CreateTensorValueFromMemory(Memory<T>, ...)` path.
+
+The default `GcPinnedHostStagingFloatBufferAllocator` keeps the current behavior by allocating exact-length pinned-object-heap arrays. A later CUDA implementation can instead expose page-locked native host memory through a custom `MemoryManager<float>` while preserving:
+
+- exact-length pooling and retention accounting;
+- transfer-owner and imported-state reference lifetimes;
+- rollback reconstruction semantics;
+- transport admission and tracing;
+- the decoder host-staging payload format.
+
+Allocator implementations own only individual physical buffers. The pool owns reuse policy; the migration payload owns active buffer leases. This separation prevents CUDA allocation/release rules from leaking into the transaction protocol.
+
+## What “pinned” means today
+
+The default allocator uses `.NET` GC-pinned managed arrays (`GC.AllocateUninitializedArray<T>(..., pinned: true)`). The array object has a stable managed address for its lifetime and can back `OrtValue.CreateTensorValueFromMemory` without another managed copy.
+
+This is **not** yet CUDA page-locked host memory allocated with CUDA host-allocation/registration APIs, and this milestone does not claim asynchronous GPU DMA. The allocator boundary is the insertion point for that implementation.
 
 ## Scope and performance
 
-This path remains a correctness-first physical transport, but repeated Optimum same-shape migrations no longer require fresh managed K/V arrays for every staged transfer. GC-pinned pooling also avoids moving the backing arrays while imported `OrtValue` views are alive.
+This path remains a correctness-first physical transport, but repeated Optimum same-shape migrations no longer require fresh managed K/V arrays for every staged transfer. The allocator/pool split also means physical allocation strategy can change without duplicating transaction, rollback, and payload-lifetime machinery.
 
-The next GPU-specific step is to introduce a native page-locked allocator / registration layer and asynchronous device-copy primitive, then advertise a measured transport capability. CUDA P2P/IPC, NIXL/RDMA, topology measurement, and cross-process failure recovery remain separate transport milestones.
+The next GPU-specific step is to implement a page-locked allocator (for example around CUDA host allocation or registration) plus an asynchronous device-copy primitive, then advertise a measured transport capability. CUDA P2P/IPC, NIXL/RDMA, topology measurement, and cross-process failure recovery remain separate transport milestones.
 
 ## Executable specs
 
@@ -87,4 +104,5 @@ The next GPU-specific step is to introduce a native page-locked allocator / regi
 - deterministic final payload reclamation after `OrtValue` disposal;
 - exact-length pinned buffer allocation and same-shape reuse;
 - retained-byte/buffer accounting;
-- bounded pool retention and dropped-buffer accounting.
+- bounded pool retention and dropped-buffer accounting;
+- custom allocator injection, exact-length allocation requests, and deterministic physical-buffer disposal after the final imported-state lease ends.

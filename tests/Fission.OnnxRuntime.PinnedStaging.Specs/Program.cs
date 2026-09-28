@@ -13,6 +13,7 @@ static void Require(bool condition, string message)
 RunPayloadLifetimeLease();
 RunPinnedPoolReuse();
 RunPinnedPoolRetentionLimit();
+RunAllocatorBoundary();
 
 Console.WriteLine("Fission ONNX Runtime pinned host-staging specs passed.");
 
@@ -162,6 +163,60 @@ static void RunPinnedPoolRetentionLimit()
     Require(stats.DroppedBuffers == 1, "The second returned buffer must be dropped when retention is full.");
 }
 
+static void RunAllocatorBoundary()
+{
+    var profile = OptimumLegacyDecoderProfile.CreateLlamaLike(
+        numHiddenLayers: 1,
+        numKvHeads: 1,
+        headDim: 2,
+        vocabularySize: 16,
+        kvElementType: TensorElementType.Float);
+    var allocator = new TrackingHostStagingAllocator();
+    using var binding = new OptimumLegacyFloatHostStagingBinding(
+        new OptimumLegacyFloatDecoderBinding(profile),
+        new PinnedHostStagingPoolOptions
+        {
+            MaxRetainedBuffersPerLength = 0,
+            MaxRetainedBytes = 0,
+            ClearOnReturn = false
+        },
+        allocator);
+
+    var keyData = new[] { 2f, 4f, 6f, 8f };
+    var valueData = new[] { 1f, 3f, 5f, 7f };
+    var shape = profile.Geometry.GetPastKvShape(batchSize: 1, pastSequenceLength: 2);
+    using var source = new DecoderOrtState(
+        position: 2,
+        new[]
+        {
+            new DecoderOrtLayerState(
+                OrtValue.CreateTensorValueFromMemory(keyData, shape),
+                OrtValue.CreateTensorValueFromMemory(valueData, shape))
+        },
+        nextTokenId: 9);
+
+    var payload = binding.ExportHostStagingState(source);
+    Require(allocator.AllocationCalls == 2, "Custom allocator must own fresh key/value host allocations.");
+    Require(allocator.RequestedLengths.SequenceEqual(new[] { 4, 4 }), "Allocator must receive exact tensor element lengths.");
+
+    var imported = binding.ImportHostStagingState(payload);
+    payload.Dispose();
+    Require(allocator.DisposeCalls == 0, "Transfer-owner release must not dispose custom buffers while imported OrtValues retain them.");
+    Require(
+        imported.GetLayer(0).Key.GetTensorDataAsSpan<float>().SequenceEqual(keyData),
+        "Memory-backed custom allocator must preserve staged key data through OrtValue import.");
+    Require(
+        imported.GetLayer(0).Value.GetTensorDataAsSpan<float>().SequenceEqual(valueData),
+        "Memory-backed custom allocator must preserve staged value data through OrtValue import.");
+
+    imported.Dispose();
+    Require(allocator.DisposeCalls == 2, "Final imported-state release must return and dispose both custom buffers when retention is disabled.");
+
+    var stats = binding.HostStagingPoolStatistics;
+    Require(stats.AllocatedBuffers == 2, "Pool statistics must count custom physical allocations.");
+    Require(stats.ReturnedBuffers == 2 && stats.DroppedBuffers == 2, "Disabled retention must return then physically drop custom buffers.");
+}
+
 sealed class CountingPayload : DecoderOrtHostStagingPayload
 {
     public CountingPayload()
@@ -180,5 +235,43 @@ sealed class CountingPayload : DecoderOrtHostStagingPayload
         DisposeCoreCalls++;
         Array.Clear(Key);
         Array.Clear(Value);
+    }
+}
+
+sealed class TrackingHostStagingAllocator : IHostStagingFloatBufferAllocator
+{
+    private readonly List<int> _requestedLengths = new();
+
+    public int AllocationCalls { get; private set; }
+    public int DisposeCalls { get; private set; }
+    public IReadOnlyList<int> RequestedLengths => _requestedLengths;
+
+    public IHostStagingFloatBuffer Allocate(int length)
+    {
+        AllocationCalls++;
+        _requestedLengths.Add(length);
+        return new TrackingBuffer(length, this);
+    }
+
+    private sealed class TrackingBuffer : IHostStagingFloatBuffer
+    {
+        private readonly TrackingHostStagingAllocator _owner;
+        private int _disposed;
+
+        public TrackingBuffer(int length, TrackingHostStagingAllocator owner)
+        {
+            _owner = owner;
+            Memory = new float[length];
+        }
+
+        public Memory<float> Memory { get; }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                _owner.DisposeCalls++;
+            }
+        }
     }
 }
