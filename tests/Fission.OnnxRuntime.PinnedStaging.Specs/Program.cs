@@ -1,9 +1,12 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using Fission.Backends.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 
-static void Require(bool condition, string message)
+static void Require(
+    [DoesNotReturnIf(false)] bool condition,
+    string message)
 {
     if (!condition)
     {
