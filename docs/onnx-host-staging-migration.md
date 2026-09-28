@@ -90,13 +90,30 @@ The allocator dynamically loads the CUDA Runtime instead of adding a mandatory C
 
 Page-locked memory is a scarce system resource. The same exact-length pool and `MaxRetainedBytes` bound therefore remain in force for CUDA-backed staging, rather than retaining native pinned allocations without limit.
 
-This milestone changes physical host memory only. Export still copies K/V bytes synchronously from the current `OrtValue` state into host staging, and import still constructs CPU-memory `OrtValue` views. It does **not** yet call `cudaMemcpyAsync`, manage CUDA streams/events, or claim overlapped GPU DMA.
+## CUDA asynchronous copy primitive
+
+`CudaAsyncCopyEngine` provides the low-level asynchronous DMA ownership primitive needed by a later GPU-resident KV transport. It is intentionally separate from the current ONNX host-staging binding until that binding can expose actual device-memory pointers.
+
+The engine:
+
+- owns a bounded pool of reusable `cudaStreamNonBlocking` streams;
+- submits `cudaMemcpyAsync` with explicit CUDA memcpy direction;
+- records `cudaEventDisableTiming` completion events;
+- uses one completion pump and `cudaEventQuery` instead of blocking one managed thread per transfer;
+- treats `cudaErrorNotReady` as an in-flight state rather than a failure;
+- holds a stream slot until the completion event reaches a terminal state;
+- if caller cancellation arrives after native submission, delays caller-visible cancellation until the CUDA work has completed, preserving source/destination lifetime safety;
+- synchronizes an already-submitted stream when event completion tracking itself fails before allowing stream reuse;
+- drains all in-flight work before `DisposeAsync` destroys reusable streams;
+- dynamically loads cudart and offers `TryCreate` for a non-throwing runtime availability probe.
+
+This primitive does not by itself make the current decoder KV state GPU-resident. `OptimumLegacyFloatHostStagingBinding` still exports from CPU-visible `OrtValue` state and imports CPU-memory views. End-to-end asynchronous GPU migration requires a backend/binding that exposes device-resident KV pointers (or an equivalent device-memory abstraction) and retains those allocations through copy completion.
 
 ## Scope and performance
 
-Repeated same-shape migrations can now reuse either GC-pinned or CUDA page-locked physical staging allocations through the same pool. Payload reference counting still prevents a returned buffer from being reused while any imported `OrtValue` aliases it.
+Repeated same-shape migrations can reuse either GC-pinned or CUDA page-locked physical staging allocations through the same pool. Payload reference counting still prevents a returned buffer from being reused while any imported `OrtValue` aliases it.
 
-The next GPU-specific step is an asynchronous copy primitive (`cudaMemcpyAsync` plus stream/event completion ownership) and a transport binding that uses it without weakening the current transaction/rollback semantics. CUDA P2P/IPC, NIXL/RDMA, topology measurement, and cross-process failure recovery remain separate transport milestones.
+The CUDA copy engine now supplies bounded asynchronous stream/event completion ownership independently of migration transactions. The next integration step is a GPU-resident decoder-state boundary that can feed real device pointers into this engine, followed by a transport binding that advertises measured CUDA host-staging capability. CUDA P2P/IPC, NIXL/RDMA, topology measurement, and cross-process failure recovery remain separate transport milestones.
 
 ## Executable specs
 
@@ -121,3 +138,14 @@ The next GPU-specific step is an asynchronous copy primitive (`cudaMemcpyAsync` 
 - native `Memory<float>` import through ONNX Runtime while payload ownership remains alive;
 - deterministic `cudaFreeHost` lifetime after final imported-state disposal;
 - CUDA allocation-error propagation and non-throwing cudart availability probing.
+
+`tests/Fission.OnnxRuntime.CudaCopy.Specs` covers the GPU-free control/lifetime contract for the async copy engine:
+
+- non-blocking stream creation and disable-timing completion events;
+- `cudaErrorNotReady` polling before completion;
+- bounded stream concurrency and queued-copy admission;
+- cancellation after submission remaining pending until native completion;
+- synchronous `cudaMemcpyAsync` failure cleanup and stream reuse;
+- event-query failure synchronization/cleanup and stream reuse;
+- `DisposeAsync` draining in-flight work before stream destruction;
+- non-throwing cudart availability probing.

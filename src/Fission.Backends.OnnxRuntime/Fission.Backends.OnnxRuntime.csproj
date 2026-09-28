@@ -6,5 +6,6 @@
     <ProjectReference Include="../Fission.Abstractions/Fission.Abstractions.csproj" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.30.0" />
     <InternalsVisibleTo Include="Fission.OnnxRuntime.PinnedStaging.Specs" />
+    <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaCopy.Specs" />
   </ItemGroup>
 </Project>
