@@ -12,6 +12,7 @@ namespace Fission.Backends.OnnxRuntime;
 /// </summary>
 public sealed class CudaHostToDeviceStateImporter
 {
+    private const long MetadataBytes = sizeof(int) * 2L;
     private readonly CudaDeviceMemoryAllocator _allocator;
     private readonly CudaDeviceBoundAsyncCopyEngine _copyEngine;
 
@@ -72,6 +73,8 @@ public sealed class CudaHostToDeviceStateImporter
             checked(payload.LayerCount * 2));
         var hostPins = new List<MemoryHandle>(checked(payload.LayerCount * 2));
         var copies = new List<CopyPlan>(checked(payload.LayerCount * 2));
+        var keyMemories = new Memory<float>[payload.LayerCount];
+        var valueMemories = new Memory<float>[payload.LayerCount];
         var keyShapes = new long[payload.LayerCount][];
         var valueShapes = new long[payload.LayerCount][];
         var keyBytes = new long[payload.LayerCount];
@@ -81,33 +84,49 @@ public sealed class CudaHostToDeviceStateImporter
 
         try
         {
+            // Validate the entire payload before touching target device memory. A
+            // malformed later layer must not leave earlier cudaMalloc allocations.
+            var validatedBytes = MetadataBytes;
+            for (var layer = 0; layer < payload.LayerCount; layer++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                keyMemories[layer] = payload.GetKeyMemory(layer);
+                valueMemories[layer] = payload.GetValueMemory(layer);
+                keyShapes[layer] = payload.GetKeyShape(layer).ToArray();
+                valueShapes[layer] = payload.GetValueShape(layer).ToArray();
+                keyBytes[layer] = ValidateFp32HostTensor(
+                    keyMemories[layer],
+                    keyShapes[layer],
+                    layer,
+                    "key");
+                valueBytes[layer] = ValidateFp32HostTensor(
+                    valueMemories[layer],
+                    valueShapes[layer],
+                    layer,
+                    "value");
+                validatedBytes = checked(
+                    validatedBytes + keyBytes[layer] + valueBytes[layer]);
+            }
+
+            if (payload.ByteLength != validatedBytes)
+            {
+                throw new InvalidOperationException(
+                    $"CUDA host-staging payload reports {payload.ByteLength} byte(s), " +
+                    $"but tensor geometry plus metadata requires {validatedBytes}.");
+            }
+
             // Complete all cudaMalloc operations before submitting any native copy.
             // This keeps allocation failure out of the partially-submitted DMA state.
             for (var layer = 0; layer < payload.LayerCount; layer++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var keyMemory = payload.GetKeyMemory(layer);
-                var valueMemory = payload.GetValueMemory(layer);
-                keyShapes[layer] = payload.GetKeyShape(layer).ToArray();
-                valueShapes[layer] = payload.GetValueShape(layer).ToArray();
-                keyBytes[layer] = ValidateFp32HostTensor(
-                    keyMemory,
-                    keyShapes[layer],
-                    layer,
-                    "key");
-                valueBytes[layer] = ValidateFp32HostTensor(
-                    valueMemory,
-                    valueShapes[layer],
-                    layer,
-                    "value");
-
                 var keyAllocation = _allocator.Allocate(keyBytes[layer]);
                 allocations.Add(keyAllocation);
                 var valueAllocation = _allocator.Allocate(valueBytes[layer]);
                 allocations.Add(valueAllocation);
 
-                var keyPin = keyMemory.Pin();
+                var keyPin = keyMemories[layer].Pin();
                 hostPins.Add(keyPin);
                 var keyPointer = GetPointer(keyPin);
                 if (keyPointer == 0)
@@ -116,7 +135,7 @@ public sealed class CudaHostToDeviceStateImporter
                         $"CUDA host-staging layer {layer} key exposed a null host pointer.");
                 }
 
-                var valuePin = valueMemory.Pin();
+                var valuePin = valueMemories[layer].Pin();
                 hostPins.Add(valuePin);
                 var valuePointer = GetPointer(valuePin);
                 if (valuePointer == 0)
