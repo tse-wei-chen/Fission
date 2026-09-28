@@ -187,3 +187,19 @@ public interface IDecoderOrtAsyncHostStagingBinding : IDecoderOrtHostStagingBind
         DecoderOrtState state,
         CancellationToken cancellationToken = default);
 }
+
+/// <summary>
+/// Optional extension for host-staging codecs whose target import has a real
+/// asynchronous completion boundary, such as CUDA host-to-device DMA.
+///
+/// The migration adapter awaits this method before publishing target state to the
+/// decoder store. Implementations must not return a state until every submitted
+/// native operation that can mutate its backing memory has reached terminal
+/// completion. The same rule applies to destructive-source rollback imports.
+/// </summary>
+public interface IDecoderOrtAsyncHostStagingImportBinding : IDecoderOrtHostStagingBinding
+{
+    ValueTask<DecoderOrtState> ImportHostStagingStateAsync(
+        DecoderOrtHostStagingPayload payload,
+        CancellationToken cancellationToken = default);
+}
