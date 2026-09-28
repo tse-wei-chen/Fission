@@ -2,7 +2,21 @@
 
 Fission has a concrete host-staging transaction path for decoder state owned by the ONNX Runtime backend, plus reusable CUDA primitives for asynchronously moving real device-resident KV state through page-locked host memory.
 
-The feature remains opt-in. `OnnxRuntimeBackend` keeps its existing non-transactional behavior. `OnnxRuntimeMigratableBackend` requires an execution adapter that implements `IOnnxRuntimeSequenceMigrationAdapter`, and the decoder adapter enables physical migration only when its binding implements `IDecoderOrtHostStagingBinding`.
+The feature remains opt-in. `OnnxRuntimeBackend` keeps its existing non-transactional behavior. `OnnxRuntimeMigratableBackend` requires an execution adapter that implements `IOnnxRuntimeSequenceMigrationAdapter`. `DecoderOnlyOnnxExecutionAdapter` enables physical migration when it has an `IDecoderOrtHostStagingCodec`: either because the model binding also implements the backward-compatible combined `IDecoderOrtHostStagingBinding`, or because a standalone codec was injected separately.
+
+## Execution and migration capabilities
+
+Model execution and physical migration are separate capabilities.
+
+`IDecoderOrtModelBinding` continues to own model/export execution, including optional interfaces such as batch decode, batch prefill and chunked prefill. `IDecoderOrtHostStagingCodec` owns only physical state migration: format identity, byte estimation, export and import.
+
+The two-argument `DecoderOnlyOnnxExecutionAdapter` constructor accepts an execution binding plus a standalone codec without wrapping or replacing the execution binding. This is important for high-throughput bindings because runtime type checks for `IDecoderOrtBatchModelBinding`, `IDecoderOrtBatchPrefillModelBinding` and `IDecoderOrtChunkedPrefillModelBinding` still see the original binding and therefore keep their fast paths.
+
+For compatibility, `IDecoderOrtHostStagingBinding` inherits both `IDecoderOrtModelBinding` and `IDecoderOrtHostStagingCodec`. Existing bindings that combine execution and migration therefore continue to work with the original one-argument adapter constructor.
+
+A separately injected codec is caller-owned. The adapter stores and uses it but does not dispose it. The caller must keep the codec and any native resources it owns, such as CUDA copy engines, allocators or staging pools, alive for at least as long as the adapter can perform migration.
+
+`IDecoderOrtAsyncHostStagingCodec` gives prepare an awaitable export boundary. `IDecoderOrtAsyncHostStagingImportCodec` gives target import and destructive-source rollback an awaitable import boundary. The older combined async binding interfaces remain compatible forms that inherit the corresponding codec capabilities.
 
 ## Transaction data path
 
@@ -11,13 +25,13 @@ The generic migration protocol remains:
 ```text
 source DecoderOrtState
         |
-        | prepare / physical export
+        | prepare / codec export
         v
 host-staging payload
         |
         | transport-plan attestation
         v
-target binding import
+target codec import
         |
         | publish distinct target state
         v
@@ -26,11 +40,9 @@ target DecoderOrtState
 
 Prepare exports a physical copy plus the decoder causal frontier (`Position` and `NextTokenId`). Target import must finish before the target state is published. Source commit retires source physical state only after target import succeeds. Abort removes target state and, if a destructive source commit needs rollback, reconstructs source state from the staged payload.
 
-`IDecoderOrtAsyncHostStagingBinding` gives prepare an awaitable export boundary. `IDecoderOrtAsyncHostStagingImportBinding` gives target import and destructive-source rollback an awaitable import boundary. Existing synchronous CPU bindings continue to use the original methods unchanged.
-
 ## Payload ownership
 
-`DecoderOrtHostStagingPayload` is reference-counted. The migration transfer owns the initial reference. A binding whose imported `OrtValue` objects alias payload memory retains the payload and passes the returned lease to `DecoderOrtState` as a Fission-owned lifetime anchor.
+`DecoderOrtHostStagingPayload` is reference-counted. The migration transfer owns the initial reference. A codec whose imported `OrtValue` objects alias payload memory retains the payload and passes the returned lease to `DecoderOrtState` as a Fission-owned lifetime anchor.
 
 The source-side terminal operation owns release of the transfer reference:
 
@@ -42,7 +54,7 @@ The source-side terminal operation owns release of the transfer reference:
 
 ## Optimum legacy FP32 CPU codec
 
-`OptimumLegacyFloatHostStagingBinding` decorates `OptimumLegacyFloatDecoderBinding` and remains the first production-shaped CPU codec. It:
+`OptimumLegacyFloatHostStagingBinding` decorates `OptimumLegacyFloatDecoderBinding` and remains the first production-shaped CPU combined execution+codec implementation. It:
 
 - preserves existing prefill/decode/batched execution behavior;
 - estimates KV transfer bytes from decoder geometry;
@@ -167,7 +179,7 @@ The returned `DecoderOrtState` owns a Fission lifetime anchor containing the tar
 
 Cancellation after H2D submission follows the same native-lifetime rule as D2H: caller-visible cancellation waits for every submitted copy to become terminal, after which failed/canceled imports release target allocations. No device pointer is freed while DMA may still reference it.
 
-`DecoderOnlyOnnxExecutionAdapter` detects `IDecoderOrtAsyncHostStagingImportBinding` and awaits it both for normal target import and for destructive-source rollback. Target state is not inserted into `DecoderStateStore` until the async import returns successfully.
+`DecoderOnlyOnnxExecutionAdapter` detects `IDecoderOrtAsyncHostStagingImportCodec` and awaits it both for normal target import and for destructive-source rollback. Target state is not inserted into `DecoderStateStore` until the async import returns successfully.
 
 ## What is complete and what is not
 
@@ -182,13 +194,17 @@ CUDA source KV
    -> target CUDA allocations + CUDA OrtValues
 ```
 
-This does **not** yet mean Fission has a complete production GPU decoder binding. A real model/export binding still has to own CUDA-resident inference state, implement `IDecoderOrtCudaResidentStateBinding`, and compose the D2H exporter/H2D importer through the async host-staging binding interfaces.
+The migration capability can now be composed independently with an existing high-performance execution binding, so adding migration does not require wrapping that binding and hiding its batch or chunked-prefill interfaces.
+
+This does **not** yet mean Fission has a complete production GPU decoder integration. A real CUDA execution binding still has to own device-resident inference state and implement `IDecoderOrtCudaResidentStateBinding`; a standalone CUDA host-staging codec can then compose the D2H exporter and H2D importer through `IDecoderOrtAsyncHostStagingCodec` / `IDecoderOrtAsyncHostStagingImportCodec` without changing the execution binding's runtime type.
 
 Direct CUDA P2P/IPC, NIXL/RDMA, topology measurement, peer-access policy, GPU allocator pooling, and cross-process failure recovery remain separate transport/runtime milestones.
 
 ## Executable specs
 
 `tests/Fission.OnnxRuntime.Migration.Specs` covers the generic end-to-end host-staging transaction: transport negotiation, source commit ordering, target decode continuation, admission release, incompatible codec rejection, and CPU Optimum round-trip behavior.
+
+`tests/Fission.OnnxRuntime.MigrationCodec.Specs` covers capability separation explicitly: a batch-only model binding is paired with a separate async migration codec, migration succeeds through that codec, synchronous codec fallbacks are not used, and batch prefill/decode remain active before and after migration.
 
 `tests/Fission.OnnxRuntime.PinnedStaging.Specs` covers payload reference counting, exact-length pool reuse/bounds, custom physical allocators, CUDA page-locked allocation, deterministic `cudaFreeHost`, and CUDA runtime availability/error handling.
 
@@ -209,4 +225,4 @@ Direct CUDA P2P/IPC, NIXL/RDMA, topology measurement, peer-access policy, GPU al
 - cancellation after submission draining before `cudaFree`;
 - allocation failure before any H2D submission;
 - format and allocator/copy-engine device mismatch rejection;
-- adapter dispatch to `IDecoderOrtAsyncHostStagingImportBinding`; the H2D cancellation spec separately proves that post-submit asynchronous completion is awaited before native lifetimes are released.
+- adapter dispatch to the async import codec capability; the H2D cancellation spec separately proves that post-submit asynchronous completion is awaited before native lifetimes are released.
