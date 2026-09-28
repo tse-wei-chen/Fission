@@ -107,13 +107,39 @@ The engine:
 - drains all in-flight work before `DisposeAsync` destroys reusable streams;
 - dynamically loads cudart and offers `TryCreate` for a non-throwing runtime availability probe.
 
-This primitive does not by itself make the current decoder KV state GPU-resident. `OptimumLegacyFloatHostStagingBinding` still exports from CPU-visible `OrtValue` state and imports CPU-memory views. End-to-end asynchronous GPU migration requires a backend/binding that exposes device-resident KV pointers (or an equivalent device-memory abstraction) and retains those allocations through copy completion.
+This primitive does not by itself make the current decoder KV state GPU-resident. `OptimumLegacyFloatHostStagingBinding` still exports from CPU-visible `OrtValue` state and imports CPU-memory views.
+
+## CUDA-resident decoder-state boundary
+
+`IDecoderOrtCudaResidentStateBinding` is the explicit capability boundary for bindings that truly own CUDA device-resident K/V tensors. A binding must not implement this interface unless it can expose stable raw CUDA tensor addresses and retain their underlying native allocations independently for the duration of a borrow.
+
+The capability returns a `DecoderOrtCudaResidentStateLease`. Each layer contains `CudaDeviceTensorView` key/value descriptors with:
+
+- the exact CUDA device pointer for the start of the tensor region;
+- exact logical byte length;
+- tensor element type and shape;
+- CUDA device ordinal.
+
+`DecoderOrtCudaResidentStateLease.Create` validates every descriptor against the matching `DecoderOrtState` `OrtValue` before any physical transport is allowed to consume the pointer. Validation requires:
+
+- ONNX Runtime allocator name `Cuda`, rejecting CPU and `CudaPinned` host allocations;
+- the same CUDA device ordinal in ORT memory metadata and the raw-pointer descriptor;
+- device-default ORT memory rather than host-accessible/pinned memory;
+- identical tensor element type and shape;
+- exact tensor byte length;
+- the same decoder layer count and a non-disposed source state.
+
+The binding transfers an independent `IDisposable` native-allocation retain into the CUDA-resident lease. Validation failure releases that retain immediately. Successful disposal releases it exactly once. The device pointers are only valid while the lease remains alive.
+
+This boundary deliberately does not attempt to recover a CUDA address by reflecting into ONNX Runtime internals. The binding that allocated or otherwise owns the device memory must provide the pointer explicitly; ONNX Runtime's public tensor-memory metadata is used to attest that the associated `OrtValue` is actually a compatible CUDA device tensor.
+
+The GPU-free specs construct synthetic `OrtValue` tensors over unmanaged memory carrying CUDA memory metadata. They validate the contract only; they do not claim the host allocations are real GPU memory and do not execute CUDA DMA or CUDA inference.
 
 ## Scope and performance
 
 Repeated same-shape migrations can reuse either GC-pinned or CUDA page-locked physical staging allocations through the same pool. Payload reference counting still prevents a returned buffer from being reused while any imported `OrtValue` aliases it.
 
-The CUDA copy engine now supplies bounded asynchronous stream/event completion ownership independently of migration transactions. The next integration step is a GPU-resident decoder-state boundary that can feed real device pointers into this engine, followed by a transport binding that advertises measured CUDA host-staging capability. CUDA P2P/IPC, NIXL/RDMA, topology measurement, and cross-process failure recovery remain separate transport milestones.
+The CUDA copy engine now supplies bounded asynchronous stream/event completion ownership, and the CUDA-resident binding capability supplies a validated raw-device-pointer/lifetime source. The next integration step is a host-staging bridge that borrows a `DecoderOrtCudaResidentStateLease`, copies each device K/V tensor into CUDA page-locked payload buffers with `CudaAsyncCopyEngine`, and does not publish the migration transfer until every submitted DMA completes. A symmetric target-side device import can then replace the remaining CPU `OrtValue` import. CUDA P2P/IPC, NIXL/RDMA, topology measurement, and cross-process failure recovery remain separate transport milestones.
 
 ## Executable specs
 
@@ -149,3 +175,13 @@ The CUDA copy engine now supplies bounded asynchronous stream/event completion o
 - event-query failure synchronization/cleanup and stream reuse;
 - `DisposeAsync` draining in-flight work before stream destruction;
 - non-throwing cudart availability probing.
+
+`tests/Fission.OnnxRuntime.CudaResidentState.Specs` covers the GPU-free device-state capability contract:
+
+- validated CUDA allocator/device/type/shape/byte metadata;
+- causal-frontier, device-id, layer-count, and total-byte preservation;
+- rejection of `CudaPinned` host memory as device-resident KV;
+- rejection of device-ordinal, shape, byte-length, and element-type mismatches;
+- deterministic native lifetime release on both validation failure and successful lease disposal;
+- disposed-state and disposed-lease guards;
+- defensive copying of shape metadata.
