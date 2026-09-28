@@ -61,31 +61,42 @@ The transport id includes model identity and decoder geometry/format. Host stagi
 
 ## Physical host-allocation boundary
 
-The pool no longer assumes that a staging allocation is a managed `float[]`.
+The pool does not assume that a staging allocation is a managed `float[]`.
 
 `IHostStagingFloatBufferAllocator` creates exact-length `IHostStagingFloatBuffer` instances, and each buffer exposes a `Memory<float>` whose lifetime is controlled by the existing payload lease. `OptimumLegacyFloatHostStagingBinding` imports that memory through ONNX Runtime's `OrtValue.CreateTensorValueFromMemory(Memory<T>, ...)` path.
 
-The default `GcPinnedHostStagingFloatBufferAllocator` keeps the current behavior by allocating exact-length pinned-object-heap arrays. A later CUDA implementation can instead expose page-locked native host memory through a custom `MemoryManager<float>` while preserving:
+Allocator implementations own only individual physical buffers. The pool owns reuse policy; the migration payload owns active buffer leases. This separation prevents physical allocation/release rules from leaking into the transaction protocol.
 
-- exact-length pooling and retention accounting;
-- transfer-owner and imported-state reference lifetimes;
-- rollback reconstruction semantics;
-- transport admission and tracing;
-- the decoder host-staging payload format.
+## GC-pinned default allocator
 
-Allocator implementations own only individual physical buffers. The pool owns reuse policy; the migration payload owns active buffer leases. This separation prevents CUDA allocation/release rules from leaking into the transaction protocol.
+`GcPinnedHostStagingFloatBufferAllocator` remains the default. It uses `.NET` pinned-object-heap arrays (`GC.AllocateUninitializedArray<T>(..., pinned: true)`) so existing users do not acquire a CUDA runtime dependency.
 
-## What “pinned” means today
+This allocator gives the managed array a stable address but does not make the allocation CUDA page-locked and does not by itself enable asynchronous GPU DMA.
 
-The default allocator uses `.NET` GC-pinned managed arrays (`GC.AllocateUninitializedArray<T>(..., pinned: true)`). The array object has a stable managed address for its lifetime and can back `OrtValue.CreateTensorValueFromMemory` without another managed copy.
+## CUDA page-locked allocator
 
-This is **not** yet CUDA page-locked host memory allocated with CUDA host-allocation/registration APIs, and this milestone does not claim asynchronous GPU DMA. The allocator boundary is the insertion point for that implementation.
+`CudaPageLockedHostStagingFloatBufferAllocator` is an opt-in physical allocator backed by the CUDA Runtime API:
+
+- `cudaHostAlloc` allocates exact-length page-locked host memory;
+- `cudaFreeHost` releases each physical allocation;
+- a custom `MemoryManager<float>` exposes the native allocation as `Memory<float>` without an intermediate managed array;
+- a `SafeHandle` owns the native allocation so deterministic payload teardown is backed by a finalizer-safe native resource boundary;
+- `CudaHostAllocationFlags.Portable` is the default because migration staging can cross CUDA contexts/devices;
+- `Mapped` and `WriteCombined` remain explicit opt-ins;
+- `TryCreate` provides a non-throwing cudart availability probe;
+- native allocation failures surface as `CudaRuntimeException` with the CUDA error code and, when available, CUDA error text.
+
+The allocator dynamically loads the CUDA Runtime instead of adding a mandatory CUDA package/runtime dependency to normal Fission builds. Callers can also provide an explicit runtime-library path/name through `CudaPageLockedHostStagingAllocatorOptions`.
+
+Page-locked memory is a scarce system resource. The same exact-length pool and `MaxRetainedBytes` bound therefore remain in force for CUDA-backed staging, rather than retaining native pinned allocations without limit.
+
+This milestone changes physical host memory only. Export still copies K/V bytes synchronously from the current `OrtValue` state into host staging, and import still constructs CPU-memory `OrtValue` views. It does **not** yet call `cudaMemcpyAsync`, manage CUDA streams/events, or claim overlapped GPU DMA.
 
 ## Scope and performance
 
-This path remains a correctness-first physical transport, but repeated Optimum same-shape migrations no longer require fresh managed K/V arrays for every staged transfer. The allocator/pool split also means physical allocation strategy can change without duplicating transaction, rollback, and payload-lifetime machinery.
+Repeated same-shape migrations can now reuse either GC-pinned or CUDA page-locked physical staging allocations through the same pool. Payload reference counting still prevents a returned buffer from being reused while any imported `OrtValue` aliases it.
 
-The next GPU-specific step is to implement a page-locked allocator (for example around CUDA host allocation or registration) plus an asynchronous device-copy primitive, then advertise a measured transport capability. CUDA P2P/IPC, NIXL/RDMA, topology measurement, and cross-process failure recovery remain separate transport milestones.
+The next GPU-specific step is an asynchronous copy primitive (`cudaMemcpyAsync` plus stream/event completion ownership) and a transport binding that uses it without weakening the current transaction/rollback semantics. CUDA P2P/IPC, NIXL/RDMA, topology measurement, and cross-process failure recovery remain separate transport milestones.
 
 ## Executable specs
 
@@ -105,4 +116,8 @@ The next GPU-specific step is to implement a page-locked allocator (for example 
 - exact-length pinned buffer allocation and same-shape reuse;
 - retained-byte/buffer accounting;
 - bounded pool retention and dropped-buffer accounting;
-- custom allocator injection, exact-length allocation requests, and deterministic physical-buffer disposal after the final imported-state lease ends.
+- custom allocator injection and deterministic physical-buffer disposal;
+- CUDA page-locked allocator byte/flag forwarding through a fake CUDA Runtime boundary;
+- native `Memory<float>` import through ONNX Runtime while payload ownership remains alive;
+- deterministic `cudaFreeHost` lifetime after final imported-state disposal;
+- CUDA allocation-error propagation and non-throwing cudart availability probing.
