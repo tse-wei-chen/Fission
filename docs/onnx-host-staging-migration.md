@@ -90,9 +90,11 @@ The allocator dynamically loads the CUDA Runtime instead of adding a mandatory C
 
 Page-locked memory is a scarce system resource. The same exact-length pool and `MaxRetainedBytes` bound therefore remain in force for CUDA-backed staging, rather than retaining native pinned allocations without limit.
 
+For asynchronous CUDA DMA, a staging allocation must additionally implement `ICudaPageLockedHostStagingFloatBuffer`. That capability exposes the stable native host pointer only for buffers whose allocator explicitly promises CUDA page-locked semantics. The ordinary GC-pinned allocator deliberately does not implement it: a stable managed address is not sufficient proof that `cudaMemcpyAsync` may safely use the allocation as an asynchronous host endpoint.
+
 ## CUDA asynchronous copy primitive
 
-`CudaAsyncCopyEngine` provides the low-level asynchronous DMA ownership primitive needed by a later GPU-resident KV transport. It is intentionally separate from the current ONNX host-staging binding until that binding can expose actual device-memory pointers.
+`CudaAsyncCopyEngine` provides the low-level asynchronous DMA ownership primitive needed by a GPU-resident KV transport.
 
 The engine:
 
@@ -107,7 +109,7 @@ The engine:
 - drains all in-flight work before `DisposeAsync` destroys reusable streams;
 - dynamically loads cudart and offers `TryCreate` for a non-throwing runtime availability probe.
 
-This primitive does not by itself make the current decoder KV state GPU-resident. `OptimumLegacyFloatHostStagingBinding` still exports from CPU-visible `OrtValue` state and imports CPU-memory views.
+The copy primitive is now used by the source-side CUDA D2H staging exporter described below. It still does not, by itself, make a decoder binding GPU-resident.
 
 ## CUDA-resident decoder-state boundary
 
@@ -133,13 +135,44 @@ The binding transfers an independent `IDisposable` native-allocation retain into
 
 This boundary deliberately does not attempt to recover a CUDA address by reflecting into ONNX Runtime internals. The binding that allocated or otherwise owns the device memory must provide the pointer explicitly; ONNX Runtime's public tensor-memory metadata is used to attest that the associated `OrtValue` is actually a compatible CUDA device tensor.
 
-The GPU-free specs construct synthetic `OrtValue` tensors over unmanaged memory carrying CUDA memory metadata. They validate the contract only; they do not claim the host allocations are real GPU memory and do not execute CUDA DMA or CUDA inference.
+The GPU-free specs construct synthetic `OrtValue` tensors over unmanaged memory carrying CUDA memory metadata. They validate the contract only; they do not claim the host allocations are real GPU memory and do not execute CUDA inference.
+
+## Asynchronous CUDA device-to-host staging export
+
+`CudaDeviceToHostStagingExporter` is the first physical bridge from validated device-resident KV state into the existing host-staging transaction protocol.
+
+```text
+source DecoderOrtState
+        |
+        | IDecoderOrtCudaResidentStateBinding.AcquireCudaResidentState
+        v
+validated CUDA K/V pointers + native allocation retain
+        |
+        | cudaMemcpyAsync(DeviceToHost)
+        | bounded non-blocking streams + completion events
+        v
+exact-length CUDA page-locked pooled host buffers
+        |
+        | after every DMA reaches terminal completion
+        v
+DecoderOrtCudaHostStagingPayload
+```
+
+The exporter currently supports FP32 KV tensors. It first rents every destination buffer before submitting any native copy, so allocation or page-lock capability failures cannot leave a partially submitted transfer. Every destination must expose `ICudaPageLockedHostStagingFloatBuffer`; stable but ordinary pinned managed memory is rejected before the first `cudaMemcpyAsync` call.
+
+The binding-owned `DecoderOrtCudaResidentStateLease` remains alive until every submitted key/value copy has reached its CUDA completion event. `DecoderOrtCudaHostStagingPayload` is published only after `Task.WhenAll` reaches a terminal state for all copies. This preserves pointer and buffer lifetime on success, native failure, and cancellation. In particular, cancellation after CUDA submission is not allowed to return source device allocations or destination staging buffers while the GPU may still access them.
+
+The payload retains the source CUDA layout format id, exact K/V shapes, causal frontier, and exact transfer-byte accounting. Its page-locked buffers use the existing exact-length staging pool, so repeated same-shape D2H exports can reuse physical host allocations.
+
+`IDecoderOrtAsyncHostStagingBinding` extends the existing host-staging binding contract with an awaitable source export. `DecoderOnlyOnnxExecutionAdapter` detects this capability during migration prepare and awaits it before validating/publishing the transfer. Existing synchronous CPU host-staging bindings continue to use `ExportHostStagingState` unchanged.
+
+This milestone is source-side only. A complete GPU-to-GPU-via-host migration still requires a target-side CUDA H2D importer that allocates target device KV storage, copies the staged buffers with `cudaMemcpyAsync(HostToDevice)`, and publishes a target `DecoderOrtState` only after all H2D completions are terminal.
 
 ## Scope and performance
 
 Repeated same-shape migrations can reuse either GC-pinned or CUDA page-locked physical staging allocations through the same pool. Payload reference counting still prevents a returned buffer from being reused while any imported `OrtValue` aliases it.
 
-The CUDA copy engine now supplies bounded asynchronous stream/event completion ownership, and the CUDA-resident binding capability supplies a validated raw-device-pointer/lifetime source. The next integration step is a host-staging bridge that borrows a `DecoderOrtCudaResidentStateLease`, copies each device K/V tensor into CUDA page-locked payload buffers with `CudaAsyncCopyEngine`, and does not publish the migration transfer until every submitted DMA completes. A symmetric target-side device import can then replace the remaining CPU `OrtValue` import. CUDA P2P/IPC, NIXL/RDMA, topology measurement, and cross-process failure recovery remain separate transport milestones.
+Fission now has all three source-side primitives for an asynchronous GPU host-staging path: a validated CUDA-resident state borrow, bounded event-driven async copy ownership, and a D2H exporter that does not publish partially copied payloads. The next integration step is the symmetric target-side H2D allocation/import boundary. CUDA P2P/IPC, NIXL/RDMA, topology measurement, and cross-process failure recovery remain separate transport milestones.
 
 ## Executable specs
 
@@ -185,3 +218,14 @@ The CUDA copy engine now supplies bounded asynchronous stream/event completion o
 - deterministic native lifetime release on both validation failure and successful lease disposal;
 - disposed-state and disposed-lease guards;
 - defensive copying of shape metadata.
+
+`tests/Fission.OnnxRuntime.CudaD2HStaging.Specs` covers the source-side asynchronous staging contract without requiring a GPU:
+
+- D2H export remains incomplete until both key/value CUDA completion events are terminal;
+- every native copy is submitted as `cudaMemcpyDeviceToHost`;
+- the binding-owned source CUDA allocation retain remains alive for the entire in-flight DMA interval;
+- destination page-locked buffers cannot return to the pool while native copies are in flight;
+- completed payloads preserve KV bytes, tensor shape, source CUDA format, and causal frontier;
+- payload disposal returns exact-length page-locked buffers and repeated same-shape export reuses them;
+- cancellation after submission waits native completion before releasing source or destination lifetimes;
+- a stable host allocation without the explicit CUDA page-locked capability is rejected before any DMA submission.
