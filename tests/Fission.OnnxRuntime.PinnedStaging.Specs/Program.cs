@@ -1,5 +1,6 @@
 using Fission.Backends.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime;
+using Microsoft.ML.OnnxRuntime.Tensors;
 
 static void Require(bool condition, string message)
 {
