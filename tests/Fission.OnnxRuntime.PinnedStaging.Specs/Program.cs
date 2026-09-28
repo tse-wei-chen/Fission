@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Fission.Backends.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -14,6 +15,9 @@ RunPayloadLifetimeLease();
 RunPinnedPoolReuse();
 RunPinnedPoolRetentionLimit();
 RunAllocatorBoundary();
+RunCudaPageLockedAllocatorBoundary();
+RunCudaAllocatorFailureSurface();
+RunCudaRuntimeProbeFailure();
 
 Console.WriteLine("Fission ONNX Runtime pinned host-staging specs passed.");
 
@@ -217,6 +221,102 @@ static void RunAllocatorBoundary()
     Require(stats.ReturnedBuffers == 2 && stats.DroppedBuffers == 2, "Disabled retention must return then physically drop custom buffers.");
 }
 
+static void RunCudaPageLockedAllocatorBoundary()
+{
+    var profile = OptimumLegacyDecoderProfile.CreateLlamaLike(
+        numHiddenLayers: 1,
+        numKvHeads: 1,
+        headDim: 2,
+        vocabularySize: 16,
+        kvElementType: TensorElementType.Float);
+    var cuda = new FakeCudaHostMemoryApi();
+    var allocator = new CudaPageLockedHostStagingFloatBufferAllocator(
+        cuda,
+        new CudaPageLockedHostStagingAllocatorOptions
+        {
+            Flags = CudaHostAllocationFlags.Portable | CudaHostAllocationFlags.Mapped
+        });
+    using var binding = new OptimumLegacyFloatHostStagingBinding(
+        new OptimumLegacyFloatDecoderBinding(profile),
+        new PinnedHostStagingPoolOptions
+        {
+            MaxRetainedBuffersPerLength = 0,
+            MaxRetainedBytes = 0,
+            ClearOnReturn = false
+        },
+        allocator);
+
+    var keyData = new[] { 10f, 20f, 30f, 40f };
+    var valueData = new[] { 50f, 60f, 70f, 80f };
+    var shape = profile.Geometry.GetPastKvShape(batchSize: 1, pastSequenceLength: 2);
+    using var source = new DecoderOrtState(
+        position: 2,
+        new[]
+        {
+            new DecoderOrtLayerState(
+                OrtValue.CreateTensorValueFromMemory(keyData, shape),
+                OrtValue.CreateTensorValueFromMemory(valueData, shape))
+        },
+        nextTokenId: 11);
+
+    var payload = binding.ExportHostStagingState(source);
+    Require(cuda.HostAllocCalls == 2, "CUDA staging must allocate one native key and value buffer.");
+    Require(cuda.RequestedByteLengths.SequenceEqual(new nuint[] { 16, 16 }), "CUDA staging must request exact FP32 byte counts.");
+    Require(
+        cuda.RequestedFlags.All(static flags => flags == 0x03),
+        "Configured CUDA host-allocation flags must flow to cudaHostAlloc unchanged.");
+
+    var imported = binding.ImportHostStagingState(payload);
+    payload.Dispose();
+    Require(cuda.FreeHostCalls == 0, "CUDA buffers must remain allocated while imported OrtValues retain the payload.");
+    Require(
+        imported.GetLayer(0).Key.GetTensorDataAsSpan<float>().SequenceEqual(keyData),
+        "Native page-locked Memory must remain readable through imported key OrtValue.");
+    Require(
+        imported.GetLayer(0).Value.GetTensorDataAsSpan<float>().SequenceEqual(valueData),
+        "Native page-locked Memory must remain readable through imported value OrtValue.");
+
+    imported.Dispose();
+    Require(cuda.FreeHostCalls == 2, "Final imported-state disposal must release both native CUDA host allocations.");
+    Require(cuda.LiveAllocationCount == 0, "All fake CUDA page-locked allocations must be reclaimed deterministically.");
+}
+
+static void RunCudaAllocatorFailureSurface()
+{
+    var cuda = new FakeCudaHostMemoryApi
+    {
+        NextHostAllocResult = 2
+    };
+    var allocator = new CudaPageLockedHostStagingFloatBufferAllocator(cuda);
+
+    CudaRuntimeException? observed = null;
+    try
+    {
+        using var ignored = allocator.Allocate(8);
+    }
+    catch (CudaRuntimeException exception)
+    {
+        observed = exception;
+    }
+
+    Require(observed is not null, "cudaHostAlloc failures must surface as CudaRuntimeException.");
+    Require(observed.Operation == "cudaHostAlloc" && observed.ErrorCode == 2, "CUDA failure must preserve operation and native error code.");
+    Require(observed.ErrorDescription == "fake-cuda-error-2", "CUDA failure must preserve native error text when available.");
+    Require(cuda.LiveAllocationCount == 0, "Failed cudaHostAlloc must not publish a native allocation.");
+}
+
+static void RunCudaRuntimeProbeFailure()
+{
+    var created = CudaPageLockedHostStagingFloatBufferAllocator.TryCreate(
+        out var allocator,
+        new CudaPageLockedHostStagingAllocatorOptions
+        {
+            RuntimeLibraryPath = "__fission_missing_cuda_runtime_library__"
+        });
+
+    Require(!created && allocator is null, "TryCreate must provide a non-throwing CUDA-runtime availability probe.");
+}
+
 sealed class CountingPayload : DecoderOrtHostStagingPayload
 {
     public CountingPayload()
@@ -274,4 +374,51 @@ sealed class TrackingHostStagingAllocator : IHostStagingFloatBufferAllocator
             }
         }
     }
+}
+
+sealed class FakeCudaHostMemoryApi : ICudaHostMemoryApi
+{
+    private readonly HashSet<nint> _liveAllocations = new();
+    private readonly List<nuint> _requestedByteLengths = new();
+    private readonly List<uint> _requestedFlags = new();
+
+    public int HostAllocCalls { get; private set; }
+    public int FreeHostCalls { get; private set; }
+    public int NextHostAllocResult { get; set; }
+    public int LiveAllocationCount => _liveAllocations.Count;
+    public IReadOnlyList<nuint> RequestedByteLengths => _requestedByteLengths;
+    public IReadOnlyList<uint> RequestedFlags => _requestedFlags;
+
+    public int HostAlloc(out nint pointer, nuint byteLength, uint flags)
+    {
+        HostAllocCalls++;
+        _requestedByteLengths.Add(byteLength);
+        _requestedFlags.Add(flags);
+
+        if (NextHostAllocResult != 0)
+        {
+            var result = NextHostAllocResult;
+            NextHostAllocResult = 0;
+            pointer = 0;
+            return result;
+        }
+
+        pointer = Marshal.AllocHGlobal(checked((nint)byteLength));
+        _liveAllocations.Add(pointer);
+        return 0;
+    }
+
+    public int FreeHost(nint pointer)
+    {
+        FreeHostCalls++;
+        if (!_liveAllocations.Remove(pointer))
+        {
+            return 17;
+        }
+
+        Marshal.FreeHGlobal(pointer);
+        return 0;
+    }
+
+    public string? GetErrorString(int errorCode) => $"fake-cuda-error-{errorCode}";
 }
