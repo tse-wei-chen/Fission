@@ -53,7 +53,7 @@ public sealed class CudaHostStagingMigrationCodec :
 
         using var residentState = _residentBinding.AcquireCudaResidentState(state);
         ArgumentNullException.ThrowIfNull(residentState);
-        ValidateResidentFormat(residentState);
+        ValidateResidentState(state, residentState);
         return CudaDeviceToHostStagingExporter.EstimateHostStagingBytes(
             residentState);
     }
@@ -109,7 +109,8 @@ public sealed class CudaHostStagingMigrationCodec :
             cancellationToken).ConfigureAwait(false);
     }
 
-    private void ValidateResidentFormat(
+    private void ValidateResidentState(
+        DecoderOrtState sourceState,
         DecoderOrtCudaResidentStateLease residentState)
     {
         if (!StringComparer.Ordinal.Equals(
@@ -119,6 +120,13 @@ public sealed class CudaHostStagingMigrationCodec :
             throw new InvalidOperationException(
                 $"CUDA-resident binding '{_residentBinding.Name}' acquired format " +
                 $"'{residentState.FormatId}', but codec expects '{_cudaFormatId}'.");
+        }
+
+        if (residentState.Position != sourceState.Position ||
+            residentState.NextTokenId != sourceState.NextTokenId)
+        {
+            throw new InvalidOperationException(
+                "CUDA-resident state acquisition changed the decoder causal frontier during byte estimation.");
         }
     }
 }
