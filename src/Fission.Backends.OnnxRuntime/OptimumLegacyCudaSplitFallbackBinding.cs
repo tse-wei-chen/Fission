@@ -347,21 +347,42 @@ public sealed class OptimumLegacyCudaSplitFallbackBinding :
     {
         if (produced.Count != cohort.Count)
         {
-            foreach (var result in produced)
-            {
-                result?.State?.Dispose();
-            }
-
+            DisposeResultStates(produced);
             throw new InvalidOperationException(
                 $"CUDA split fallback inner binding returned {produced.Count} results for {cohort.Count} items.");
         }
 
+        // Validate the entire returned collection before transferring any state
+        // into the wrapper's cross-cohort ownership tracker. That keeps handoff
+        // atomic even if a buggy/custom inner binding violates its result contract.
+        for (var index = 0; index < produced.Count; index++)
+        {
+            if (produced[index] is null || produced[index].State is null)
+            {
+                DisposeResultStates(produced);
+                throw new InvalidOperationException(
+                    "CUDA split fallback inner binding returned a null decoder result/state.");
+            }
+        }
+
         for (var index = 0; index < cohort.Count; index++)
         {
-            var result = produced[index] ?? throw new InvalidOperationException(
-                "CUDA split fallback inner binding returned a null decoder result.");
+            var result = produced[index];
             destination[cohort[index]] = result;
             producedStates.Add(result.State);
+        }
+    }
+
+    private static void DisposeResultStates(
+        IReadOnlyList<DecoderOrtStepResult> results)
+    {
+        var seen = new HashSet<DecoderOrtState>(ReferenceEqualityComparer.Instance);
+        foreach (var result in results)
+        {
+            if (result?.State is { } state && seen.Add(state))
+            {
+                state.Dispose();
+            }
         }
     }
 
