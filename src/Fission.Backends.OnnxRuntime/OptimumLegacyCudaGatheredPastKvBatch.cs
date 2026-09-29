@@ -271,6 +271,17 @@ internal sealed class OptimumLegacyCudaGatheredPastKvBatch : IDisposable
         }
     }
 
+    /// <summary>
+    /// Creates one independently retained row view over the gathered dense arena.
+    /// This is used by gather-aware execution wrappers to feed the existing CUDA
+    /// binding without copying KV again. The returned state may outlive this batch.
+    /// </summary>
+    public DecoderOrtState CreateRowState(int row, int? nextTokenId)
+    {
+        ThrowIfDisposed();
+        return _arena.CreateRowState(row, nextTokenId);
+    }
+
     public void AppendInputs(
         ICollection<string> inputNames,
         ICollection<OrtValue> inputValues)
