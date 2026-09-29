@@ -35,6 +35,7 @@
   <Project Path="tests/Fission.OnnxRuntime.CudaPresentKv.Specs/Fission.OnnxRuntime.CudaPresentKv.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.CudaPastKv.Specs/Fission.OnnxRuntime.CudaPastKv.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.CudaBinding.Specs/Fission.OnnxRuntime.CudaBinding.Specs.csproj" />
+  <Project Path="tests/Fission.OnnxRuntime.CudaSplitFallback.Specs/Fission.OnnxRuntime.CudaSplitFallback.Specs.csproj" />
   <Project Path="tests/Fission.OnnxRuntime.CudaGather.Specs/Fission.OnnxRuntime.CudaGather.Specs.csproj" />
   <Project Path="tests/Fission.BackendTransactions.Specs/Fission.BackendTransactions.Specs.csproj" />
   <Project Path="tests/Fission.Migration.Specs/Fission.Migration.Specs.csproj" />
