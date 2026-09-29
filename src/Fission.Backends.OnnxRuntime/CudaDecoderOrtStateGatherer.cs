@@ -130,6 +130,12 @@ public sealed class CudaDecoderOrtStateGatherer
             ?? throw new ArgumentException(
                 "CUDA decoder gather source row cannot be null.",
                 nameof(sourceStates));
+        if (position == 0)
+        {
+            throw new InvalidOperationException(
+                "CUDA decoder gather requires a non-empty past frontier.");
+        }
+
         var expectedShape = _geometry.GetPastKvShape(
             batchSize: 1,
             pastSequenceLength: position);
@@ -238,11 +244,12 @@ public sealed class CudaDecoderOrtStateGatherer
             // valid throughout cleanup even on cancellation/failure.
             await Task.WhenAll(copies).ConfigureAwait(false);
 
-            success = true;
-            return new CudaGatheredDecoderStateBatch(
+            var batch = new CudaGatheredDecoderStateBatch(
                 position,
                 DeviceId,
                 targetStates);
+            success = true;
+            return batch;
         }
         finally
         {
