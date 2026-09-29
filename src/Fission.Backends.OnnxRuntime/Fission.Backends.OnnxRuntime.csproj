@@ -14,5 +14,6 @@
     <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaKvArena.Specs" />
     <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaPresentKv.Specs" />
     <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaPastKv.Specs" />
+    <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaBinding.Specs" />
   </ItemGroup>
 </Project>
