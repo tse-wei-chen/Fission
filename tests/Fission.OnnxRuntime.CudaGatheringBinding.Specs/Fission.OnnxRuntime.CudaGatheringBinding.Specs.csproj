@@ -1,5 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <ItemGroup>
-    <ProjectReference Include="../../src/Fission.Backends.OnnxRuntime/Fission.Backends.OnnxRuntime.csproj" />
-  </ItemGroup>
-</Project>
