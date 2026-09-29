@@ -48,7 +48,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
         Volatile.Write(ref _initialized, 1);
     }
 
-    public ValueTask<IReadOnlyList<BackendStepResult>> PrefillAsync(
+    public async ValueTask<IReadOnlyList<BackendStepResult>> PrefillAsync(
         InferenceSession session,
         PrefillBatch batch,
         CancellationToken cancellationToken = default)
@@ -60,8 +60,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
 
         if (batch.Items.Count == 0)
         {
-            return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(
-                Array.Empty<BackendStepResult>());
+            return Array.Empty<BackendStepResult>();
         }
 
         var priorStates = new DecoderOrtState?[batch.Items.Count];
@@ -119,27 +118,47 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
             }
         }
 
+        var asyncBatchPrefillBinding = _binding as IDecoderOrtAsyncBatchPrefillModelBinding;
         var batchPrefillBinding = _binding as IDecoderOrtBatchPrefillModelBinding;
         var chunkedBinding = _binding as IDecoderOrtChunkedPrefillModelBinding;
-        if (needsContinuationCapability && batchPrefillBinding is null && chunkedBinding is null)
+        if (needsContinuationCapability &&
+            asyncBatchPrefillBinding is null &&
+            batchPrefillBinding is null &&
+            chunkedBinding is null)
         {
             throw new NotSupportedException(
                 $"Decoder binding '{_binding.Name}' does not support chunked prefill continuation.");
         }
 
-        var pending = batchPrefillBinding is not null
-            ? ExecuteBatchedPrefill(
+        DecoderOrtStepResult[] pending;
+        if (asyncBatchPrefillBinding is not null)
+        {
+            pending = await ExecuteAsyncBatchedPrefill(
+                    asyncBatchPrefillBinding,
+                    session,
+                    normalizedItems,
+                    priorStates,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else if (batchPrefillBinding is not null)
+        {
+            pending = ExecuteBatchedPrefill(
                 batchPrefillBinding,
                 session,
                 normalizedItems,
                 priorStates,
-                cancellationToken)
-            : ExecuteScalarPrefill(
+                cancellationToken);
+        }
+        else
+        {
+            pending = ExecuteScalarPrefill(
                 session,
                 normalizedItems,
                 priorStates,
                 chunkedBinding,
                 cancellationToken);
+        }
 
         // All model work and state-shape validation has completed. Calls are
         // serialized by the device actor, so the prevalidated sequence set cannot
@@ -147,6 +166,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
         var committed = 0;
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             for (; committed < normalizedItems.Length; committed++)
             {
                 var sequenceId = normalizedItems[committed].SequenceId;
@@ -172,8 +192,26 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
             throw;
         }
 
-        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(
-            ToBackendResults(batch.Items, pending));
+        return ToBackendResults(batch.Items, pending);
+    }
+
+    private async ValueTask<DecoderOrtStepResult[]> ExecuteAsyncBatchedPrefill(
+        IDecoderOrtAsyncBatchPrefillModelBinding batchBinding,
+        InferenceSession session,
+        IReadOnlyList<PrefillItem> items,
+        IReadOnlyList<DecoderOrtState?> priorStates,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var produced = await batchBinding.ExecutePrefillBatchAsync(
+                session,
+                items,
+                priorStates,
+                cancellationToken)
+            .ConfigureAwait(false) ?? throw new InvalidOperationException(
+                "Async decoder prefill batch binding returned a null result collection.");
+
+        return ValidatePrefillBatchResults(produced, items, priorStates);
     }
 
     private DecoderOrtStepResult[] ExecuteBatchedPrefill(
@@ -191,6 +229,14 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
             cancellationToken) ?? throw new InvalidOperationException(
                 "Decoder prefill batch binding returned a null result collection.");
 
+        return ValidatePrefillBatchResults(produced, items, priorStates);
+    }
+
+    private static DecoderOrtStepResult[] ValidatePrefillBatchResults(
+        IReadOnlyList<DecoderOrtStepResult> produced,
+        IReadOnlyList<PrefillItem> items,
+        IReadOnlyList<DecoderOrtState?> priorStates)
+    {
         if (produced.Count != items.Count)
         {
             DisposeProducedStates(produced);
@@ -261,7 +307,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
         }
     }
 
-    public ValueTask<IReadOnlyList<BackendStepResult>> DecodeAsync(
+    public async ValueTask<IReadOnlyList<BackendStepResult>> DecodeAsync(
         InferenceSession session,
         DecodeBatch batch,
         CancellationToken cancellationToken = default)
@@ -273,8 +319,7 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
 
         if (batch.Items.Count == 0)
         {
-            return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(
-                Array.Empty<BackendStepResult>());
+            return Array.Empty<BackendStepResult>();
         }
 
         var priorStates = new DecoderOrtState[batch.Items.Count];
@@ -306,7 +351,17 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
         }
 
         DecoderOrtStepResult[] pending;
-        if (_binding is IDecoderOrtBatchModelBinding batchBinding)
+        if (_binding is IDecoderOrtAsyncBatchModelBinding asyncBatchBinding)
+        {
+            pending = await ExecuteAsyncBatchedDecode(
+                    asyncBatchBinding,
+                    session,
+                    batch.Items,
+                    priorStates,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else if (_binding is IDecoderOrtBatchModelBinding batchBinding)
         {
             pending = ExecuteBatchedDecode(
                 batchBinding,
@@ -326,7 +381,13 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
 
         // All failure-prone model work has completed. Calls are serialized by the
         // device actor, so the prevalidated sequence set cannot change before this
-        // commit phase.
+        // commit phase. Cancellation before commit keeps the prior store intact.
+        if (cancellationToken.IsCancellationRequested)
+        {
+            DisposeProducedStates(pending);
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
         for (var index = 0; index < batch.Items.Count; index++)
         {
             _states.ReplaceSequence(
@@ -334,8 +395,26 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
                 pending[index].State);
         }
 
-        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(
-            ToBackendResults(batch.Items, pending));
+        return ToBackendResults(batch.Items, pending);
+    }
+
+    private async ValueTask<DecoderOrtStepResult[]> ExecuteAsyncBatchedDecode(
+        IDecoderOrtAsyncBatchModelBinding batchBinding,
+        InferenceSession session,
+        IReadOnlyList<DecodeItem> items,
+        IReadOnlyList<DecoderOrtState> priorStates,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var produced = await batchBinding.ExecuteDecodeBatchAsync(
+                session,
+                items,
+                priorStates,
+                cancellationToken)
+            .ConfigureAwait(false) ?? throw new InvalidOperationException(
+                "Async decoder batch binding returned a null result collection.");
+
+        return ValidateDecodeBatchResults(produced, items, priorStates);
     }
 
     private DecoderOrtStepResult[] ExecuteBatchedDecode(
@@ -353,6 +432,14 @@ public sealed partial class DecoderOnlyOnnxExecutionAdapter :
             cancellationToken) ?? throw new InvalidOperationException(
                 "Decoder batch binding returned a null result collection.");
 
+        return ValidateDecodeBatchResults(produced, items, priorStates);
+    }
+
+    private static DecoderOrtStepResult[] ValidateDecodeBatchResults(
+        IReadOnlyList<DecoderOrtStepResult> produced,
+        IReadOnlyList<DecodeItem> items,
+        IReadOnlyList<DecoderOrtState> priorStates)
+    {
         if (produced.Count != items.Count)
         {
             DisposeProducedStates(produced);
