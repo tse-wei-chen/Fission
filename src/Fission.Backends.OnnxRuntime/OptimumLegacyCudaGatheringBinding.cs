@@ -64,10 +64,10 @@ public sealed class OptimumLegacyCudaGatheringBinding :
                 nameof(copyEngine));
         }
 
-        if (profile.Geometry != inner.Geometry || profile.SessionContract != inner.SessionContract)
+        if (profile.Geometry != inner.Geometry)
         {
             throw new ArgumentException(
-                "CUDA gather binding profile must match the inner binding profile.",
+                "CUDA gather binding profile geometry must match the inner binding geometry.",
                 nameof(inner));
         }
 
