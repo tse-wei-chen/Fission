@@ -325,20 +325,6 @@ public sealed class OptimumLegacyCudaSplitFallbackBinding :
         return rows.All(static present => present);
     }
 
-    private static bool CanReuseDenseCudaCohort(
-        IReadOnlyList<DecoderOrtState> priorStates,
-        IReadOnlyList<int> cohort,
-        int position)
-    {
-        var nullable = new DecoderOrtState?[priorStates.Count];
-        for (var index = 0; index < priorStates.Count; index++)
-        {
-            nullable[index] = priorStates[index];
-        }
-
-        return CanReuseDenseCudaCohort(nullable, cohort, position);
-    }
-
     private static void AssignResults(
         DecoderOrtStepResult[] destination,
         List<DecoderOrtState> producedStates,
