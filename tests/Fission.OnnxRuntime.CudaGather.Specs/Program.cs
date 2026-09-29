@@ -106,7 +106,7 @@ static async Task RunMixedReorderedDuplicateGatherAsync()
     Require(cuda.MemcpyCalls.Count == 6 &&
             cuda.MemcpyCalls.All(static call =>
                 call.Kind == CudaMemcpyKind.DeviceToDevice && call.ByteLength == 8),
-        "Gather must issue exactly six 8-byte D2D row copies.");
+        "Mixed/reordered/duplicate gather must retain six independent 8-byte D2D row copies.");
 
     var destinationPointers = cuda.ActiveAllocationPointers.Skip(4).ToArray();
     Require(destinationPointers.Length == 2,
@@ -176,8 +176,11 @@ static async Task RunCancellationLifetimeAsync()
         .AsTask();
 
     await WaitUntilAsync(
-        () => cuda.MemcpyCalls.Count == 4,
-        "Cancellation lifetime test requires all four D2D copies to be submitted.");
+        () => cuda.MemcpyCalls.Count == 2,
+        "Cancellation lifetime test requires both coalesced D2D copies to be submitted.");
+    Require(cuda.MemcpyCalls.All(static call =>
+            call.Kind == CudaMemcpyKind.DeviceToDevice && call.ByteLength == 16),
+        "Two contiguous source rows must coalesce into one 16-byte key copy and one 16-byte value copy.");
     Require(cuda.MallocCalls == 4 && cuda.FreeCalls == 0,
         "Source and destination allocations must all be alive while D2D copies are pending.");
 
