@@ -17,5 +17,6 @@
     <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaBinding.Specs" />
     <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaSplitFallback.Specs" />
     <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaGather.Specs" />
+    <InternalsVisibleTo Include="Fission.OnnxRuntime.CudaGatheringBinding.Specs" />
   </ItemGroup>
 </Project>
