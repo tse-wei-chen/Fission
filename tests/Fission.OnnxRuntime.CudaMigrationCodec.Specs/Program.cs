@@ -125,10 +125,36 @@ Require(targetPointers.Count == 2, "Imported codec state must own one target key
 Require(targetCuda.ReadFloats(targetPointers[0], 4).SequenceEqual(new[] { 1f, 2f, 3f, 4f }), "Round-trip key bytes must match the source CUDA state.");
 Require(targetCuda.ReadFloats(targetPointers[1], 4).SequenceEqual(new[] { 11f, 12f, 13f, 14f }), "Round-trip value bytes must match the source CUDA state.");
 
+var wrongFormatRejected = false;
+try
+{
+    _ = imported.AcquireCudaResidentState("cuda-kv:wrong-format");
+}
+catch (InvalidOperationException)
+{
+    wrongFormatRejected = true;
+}
+Require(wrongFormatRejected, "Imported CUDA state must reject a resident borrow with a different physical-layout format id.");
+Require(targetCuda.FreeCalls == 0, "Rejected resident borrow must not release target CUDA allocations.");
+
+var importedBorrow = imported.AcquireCudaResidentState(cudaFormat);
+Require(importedBorrow.FormatId == cudaFormat, "Imported resident borrow must preserve CUDA physical-layout format id.");
+Require(importedBorrow.DeviceId == targetDevice, "Imported resident borrow must preserve target CUDA ordinal.");
+Require(importedBorrow.Position == 4 && importedBorrow.NextTokenId == 19, "Imported resident borrow must preserve causal frontier.");
+Require(importedBorrow.ByteLength == 32, "Imported resident borrow must expose exact key/value device bytes.");
+var borrowedLayer = importedBorrow.GetLayer(0);
+Require(borrowedLayer.Key.DevicePointer == targetPointers[0], "Imported resident borrow must expose the target key allocation pointer.");
+Require(borrowedLayer.Value.DevicePointer == targetPointers[1], "Imported resident borrow must expose the target value allocation pointer.");
+
 payload.Dispose();
 Require(targetCuda.FreeCalls == 0, "Releasing host staging after import must not release target CUDA state.");
 imported.Dispose();
-Require(targetCuda.FreeCalls == 2 && targetCuda.ActiveAllocationPointers.Count == 0, "Imported state disposal must release target CUDA allocations exactly once.");
+Require(targetCuda.FreeCalls == 0 && targetCuda.ActiveAllocationPointers.Count == 2, "Imported state disposal must retain target CUDA allocations while an independent resident borrow is alive.");
+Require(targetCuda.ReadFloats(borrowedLayer.Key.DevicePointer, 4).SequenceEqual(new[] { 1f, 2f, 3f, 4f }), "Resident borrow key pointer must remain valid after imported state disposal.");
+Require(targetCuda.ReadFloats(borrowedLayer.Value.DevicePointer, 4).SequenceEqual(new[] { 11f, 12f, 13f, 14f }), "Resident borrow value pointer must remain valid after imported state disposal.");
+
+importedBorrow.Dispose();
+Require(targetCuda.FreeCalls == 2 && targetCuda.ActiveAllocationPointers.Count == 0, "Final imported resident-borrow release must release target CUDA allocations exactly once.");
 Require(binding.DisposeCount == 0, "Using the standalone codec must not dispose its execution/resident binding.");
 
 Console.WriteLine(
