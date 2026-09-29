@@ -6,14 +6,10 @@ namespace Fission.Backends.OnnxRuntime;
 
 /// <summary>
 /// Async continuous-batching policy over <see cref="OptimumLegacyCudaFloatDecoderBinding"/>.
-///
-/// Complete dense CUDA cohorts and singleton states keep the existing zero-copy
-/// path. Multi-row subsets, duplicate/forked rows, mixed arenas, and migrated
-/// standalone states are first gathered device-to-device into a new dense CUDA
-/// cohort, then executed by the existing binding as one batched ORT run.
-///
-/// The allocator, copy engine, and their native runtime dependencies remain
-/// caller-owned. This wrapper owns and disposes only its inner model binding.
+/// Complete dense CUDA cohorts and singleton states keep the direct zero-copy path.
+/// Unsupported multi-row layouts are gathered device-to-device into one temporary
+/// dense cohort and then executed by the existing CUDA binding as one ORT batch.
+/// The allocator and copy engine remain caller-owned; this wrapper owns its inner binding.
 /// </summary>
 public sealed class OptimumLegacyCudaGatheringBinding :
     IDecoderOrtAsyncBatchPrefillModelBinding,
@@ -60,16 +56,15 @@ public sealed class OptimumLegacyCudaGatheringBinding :
         ArgumentNullException.ThrowIfNull(allocator);
         ArgumentNullException.ThrowIfNull(copyEngine);
         ArgumentNullException.ThrowIfNull(inner);
-        if (allocator.DeviceId != copyEngine.DeviceId ||
-            allocator.DeviceId != inner.DeviceId)
+
+        if (allocator.DeviceId != copyEngine.DeviceId || allocator.DeviceId != inner.DeviceId)
         {
             throw new ArgumentException(
                 "CUDA gather binding allocator, copy engine, and inner binding must target the same device.",
                 nameof(copyEngine));
         }
 
-        if (profile.Geometry != inner.Geometry ||
-            profile.SessionContract != inner.SessionContract)
+        if (profile.Geometry != inner.Geometry || profile.SessionContract != inner.SessionContract)
         {
             throw new ArgumentException(
                 "CUDA gather binding profile must match the inner binding profile.",
@@ -125,11 +120,7 @@ public sealed class OptimumLegacyCudaGatheringBinding :
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        return _inner.ExecutePrefillChunk(
-            session,
-            item,
-            priorState,
-            cancellationToken);
+        return _inner.ExecutePrefillChunk(session, item, priorState, cancellationToken);
     }
 
     public DecoderOrtStepResult ExecuteDecode(
@@ -139,11 +130,7 @@ public sealed class OptimumLegacyCudaGatheringBinding :
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        return _inner.ExecuteDecode(
-            session,
-            item,
-            priorState,
-            cancellationToken);
+        return _inner.ExecuteDecode(session, item, priorState, cancellationToken);
     }
 
     public async ValueTask<IReadOnlyList<DecoderOrtStepResult>> ExecutePrefillBatchAsync(
@@ -175,13 +162,13 @@ public sealed class OptimumLegacyCudaGatheringBinding :
         {
             var position = items[index].Position ?? priorStates[index]?.Position ?? 0;
             var key = (position, items[index].Tokens.Length);
-            if (!cohorts.TryGetValue(key, out var indices))
+            if (!cohorts.TryGetValue(key, out var cohort))
             {
-                indices = new List<int>();
-                cohorts.Add(key, indices);
+                cohort = new List<int>();
+                cohorts.Add(key, cohort);
             }
 
-            indices.Add(index);
+            cohort.Add(index);
         }
 
         var results = new DecoderOrtStepResult[items.Count];
@@ -205,13 +192,10 @@ public sealed class OptimumLegacyCudaGatheringBinding :
                 }
                 else if (position > 0 && cohortPrior.All(static state => state is not null))
                 {
-                    var sourceStates = cohortPrior
-                        .Select(static state => state!)
-                        .ToArray();
                     produced = await ExecuteGatheredPrefillCohortAsync(
                             session,
                             cohortItems,
-                            sourceStates,
+                            cohortPrior.Select(static state => state!).ToArray(),
                             cancellationToken)
                         .ConfigureAwait(false);
                 }
@@ -263,13 +247,13 @@ public sealed class OptimumLegacyCudaGatheringBinding :
         var cohorts = new SortedDictionary<int, List<int>>();
         for (var index = 0; index < items.Count; index++)
         {
-            if (!cohorts.TryGetValue(items[index].Position, out var indices))
+            if (!cohorts.TryGetValue(items[index].Position, out var cohort))
             {
-                indices = new List<int>();
-                cohorts.Add(items[index].Position, indices);
+                cohort = new List<int>();
+                cohorts.Add(items[index].Position, cohort);
             }
 
-            indices.Add(index);
+            cohort.Add(index);
         }
 
         var results = new DecoderOrtStepResult[items.Count];
@@ -342,13 +326,10 @@ public sealed class OptimumLegacyCudaGatheringBinding :
         var gatheredStates = CreateGatheredStates(gathered, sourceStates);
         try
         {
-            var nullableStates = gatheredStates
-                .Select(static state => (DecoderOrtState?)state)
-                .ToArray();
             var produced = _inner.ExecutePrefillBatch(
                 session,
                 items,
-                nullableStates,
+                gatheredStates.Select(static state => (DecoderOrtState?)state).ToArray(),
                 cancellationToken);
             RecordGather(gathered);
             return produced;
@@ -551,11 +532,28 @@ public sealed class OptimumLegacyCudaGatheringBinding :
                 $"CUDA gather binding returned {produced.Count} results for {cohort.Count} cohort items.");
         }
 
+        var uniqueStates = new HashSet<DecoderOrtState>(ReferenceEqualityComparer.Instance);
         for (var index = 0; index < produced.Count; index++)
         {
-            var result = produced[index] ?? throw new InvalidOperationException(
-                "CUDA gather binding inner decoder returned a null result.");
-            ArgumentNullException.ThrowIfNull(result.State);
+            var result = produced[index];
+            if (result is null || result.State is null)
+            {
+                DisposeResultStates(produced, produced.Count);
+                throw new InvalidOperationException(
+                    "CUDA gather binding inner decoder returned a null result/state.");
+            }
+
+            if (!uniqueStates.Add(result.State))
+            {
+                DisposeResultStates(produced, produced.Count);
+                throw new InvalidOperationException(
+                    "CUDA gather binding inner decoder returned the same physical state for multiple rows.");
+            }
+        }
+
+        for (var index = 0; index < produced.Count; index++)
+        {
+            var result = produced[index];
             destination[cohort[index]] = result;
             producedStates.Add(result.State);
         }
