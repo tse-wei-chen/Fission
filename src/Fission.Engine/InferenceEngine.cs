@@ -513,57 +513,107 @@ public sealed class InferenceEngine : IDisposable
         IReadOnlyList<SchedulingCandidate> candidates,
         CancellationToken cancellationToken)
     {
-        if (_options.MaxDeviceBytes is null)
+        if (_options.MaxDeviceBytes is not { } maxDeviceBytes)
         {
             return false;
         }
 
-        var deviceBySequence = candidates
-            .Where(static candidate => candidate.ExecutionDevice.HasValue)
-            .ToDictionary(
-                static candidate => candidate.SequenceId,
-                static candidate => candidate.ExecutionDevice!.Value);
-        var blockedDevices = decision.Deferred
-            .Where(static deferred =>
-                deferred.Reason == SchedulingDeferralReason.DeviceMemoryBudget)
-            .Select(deferred => deviceBySequence[deferred.SequenceId])
-            .Distinct()
-            .ToArray();
+        var candidateBySequence = candidates.ToDictionary(
+            static candidate => candidate.SequenceId);
+        var selectedTransientByDevice = new Dictionary<DeviceId, long>();
+        foreach (var item in decision.Batch.Items)
+        {
+            if (!candidateBySequence.TryGetValue(item.SequenceId, out var candidate) ||
+                candidate.ExecutionDevice is not { } device)
+            {
+                continue;
+            }
 
-        if (blockedDevices.Length == 0)
+            selectedTransientByDevice.TryGetValue(device, out var usedBytes);
+            selectedTransientByDevice[device] = checked(
+                usedBytes + item.TransientKvByteGrant);
+        }
+
+        var firstBlockedByDevice = new Dictionary<DeviceId, SchedulingCandidate>();
+        foreach (var deferred in decision.Deferred)
+        {
+            if (deferred.Reason != SchedulingDeferralReason.DeviceMemoryBudget ||
+                !candidateBySequence.TryGetValue(deferred.SequenceId, out var candidate) ||
+                candidate.ExecutionDevice is not { } device)
+            {
+                continue;
+            }
+
+            firstBlockedByDevice.TryAdd(device, candidate);
+        }
+
+        if (firstBlockedByDevice.Count == 0)
         {
             return false;
         }
 
         var pressureByDevice = _runtime.GetDeviceMemoryPressure()
             .ToDictionary(static pressure => pressure.Device);
-        var reclaimed = false;
+        var shouldReschedule = false;
 
-        foreach (var device in blockedDevices)
+        foreach (var (device, blockedCandidate) in firstBlockedByDevice)
         {
-            if (!pressureByDevice.TryGetValue(device, out var pressure) ||
-                pressure.ReclaimableBytes == 0)
+            if (!pressureByDevice.TryGetValue(device, out var pressure))
             {
                 continue;
             }
+
+            selectedTransientByDevice.TryGetValue(device, out var selectedTransientBytes);
+            var minimumBlockedTransientBytes = checked(
+                ((long)blockedCandidate.Position + 1L) *
+                blockedCandidate.KvBytesPerToken);
+            var requiredTransientBytes = checked(
+                selectedTransientBytes + minimumBlockedTransientBytes);
+
+            var releaseNeeded = pressure.ReservedBytes >= maxDeviceBytes
+                ? checked(
+                    pressure.ReservedBytes - maxDeviceBytes +
+                    requiredTransientBytes)
+                : Math.Max(
+                    0L,
+                    requiredTransientBytes -
+                    (maxDeviceBytes - pressure.ReservedBytes));
+
+            if (releaseNeeded <= 0)
+            {
+                // Pressure may have improved since the scheduler snapshot (for
+                // example another owner released VRAM). Re-run admission once even
+                // when this engine does not need to issue a reclaim control.
+                shouldReschedule = true;
+                continue;
+            }
+
+            if (pressure.ReclaimableBytes == 0)
+            {
+                continue;
+            }
+
+            var targetReclaimableBytes = releaseNeeded >= pressure.ReclaimableBytes
+                ? 0L
+                : pressure.ReclaimableBytes - releaseNeeded;
 
             try
             {
                 await _runtime.ReclaimDeviceMemoryAsync(
                         device,
-                        targetReclaimableBytes: 0,
+                        targetReclaimableBytes,
                         cancellationToken)
                     .ConfigureAwait(false);
-                reclaimed = true;
+                shouldReschedule = true;
             }
             catch (NotSupportedException)
             {
-                // Reclaim is optional. Keep idle-resident bytes charged to physical
-                // headroom and preserve the scheduler's conservative deferral.
+                // Reclaim is optional. Keep unreleased residency charged to
+                // physical headroom and preserve conservative scheduler deferral.
             }
         }
 
-        return reclaimed;
+        return shouldReschedule;
     }
 
     private long GetAvailableKvBytes(RequestView[] active)
