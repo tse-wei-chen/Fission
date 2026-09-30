@@ -508,7 +508,15 @@ public sealed class InferenceEngine : IDisposable
                 null);
         }
 
+        var admissionDevices = candidates
+            .Select(static candidate => candidate.ExecutionDevice)
+            .Where(static device => device.HasValue)
+            .Select(static device => device!.Value)
+            .Distinct()
+            .OrderBy(static device => device.Value, StringComparer.Ordinal)
+            .ToArray();
         using var admission = await _runtime.EnterDeviceMemoryAdmissionAsync(
+                admissionDevices,
                 cancellationToken)
             .ConfigureAwait(false);
 
