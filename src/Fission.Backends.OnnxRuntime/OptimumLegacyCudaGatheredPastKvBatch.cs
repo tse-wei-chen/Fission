@@ -191,13 +191,20 @@ internal sealed class OptimumLegacyCudaGatheredPastKvBatch : IDisposable
                 targetLeases[row] = targetState.AcquireCudaResidentState(cudaFormatId);
             }
 
-            var copyTasks = new Task[checked(states.Count * geometry.NumHiddenLayers * 2)];
+            // Adjacent rows of one CUDA cohort arena are physically contiguous in
+            // every layer allocation. Coalesce maximal forward-contiguous source
+            // runs so one cudaMemcpyAsync/event pair moves many rows at once. A
+            // duplicate, reorder, mixed arena, or standalone imported state starts
+            // a new run and therefore retains the exact arbitrary-gather semantics.
+            var copyRuns = BuildCopyRuns(states);
+            var copyTasks = new Task[checked(copyRuns.Count * geometry.NumHiddenLayers * 2)];
             var copyIndex = 0;
-            for (var row = 0; row < states.Count; row++)
+            foreach (var run in copyRuns)
             {
-                var source = sourceLeases[row];
-                var target = targetLeases[row]
+                var source = sourceLeases[run.StartRow];
+                var target = targetLeases[run.StartRow]
                     ?? throw new InvalidOperationException("CUDA gather target lease was not created.");
+                var runBytes = checked(expectedBytes * run.RowCount);
                 for (var layer = 0; layer < geometry.NumHiddenLayers; layer++)
                 {
                     var sourceLayer = source.GetLayer(layer);
@@ -205,14 +212,14 @@ internal sealed class OptimumLegacyCudaGatheredPastKvBatch : IDisposable
                     copyTasks[copyIndex++] = copyEngine.CopyAsync(
                             targetLayer.Key.DevicePointer,
                             sourceLayer.Key.DevicePointer,
-                            checked((nuint)expectedBytes),
+                            checked((nuint)runBytes),
                             CudaMemcpyKind.DeviceToDevice,
                             cancellationToken)
                         .AsTask();
                     copyTasks[copyIndex++] = copyEngine.CopyAsync(
                             targetLayer.Value.DevicePointer,
                             sourceLayer.Value.DevicePointer,
-                            checked((nuint)expectedBytes),
+                            checked((nuint)runBytes),
                             CudaMemcpyKind.DeviceToDevice,
                             cancellationToken)
                         .AsTask();
@@ -311,6 +318,34 @@ internal sealed class OptimumLegacyCudaGatheredPastKvBatch : IDisposable
         _arena.Release();
     }
 
+    private static List<CopyRun> BuildCopyRuns(IReadOnlyList<DecoderOrtState> states)
+    {
+        var runs = new List<CopyRun>(states.Count);
+        var startRow = 0;
+        while (startRow < states.Count)
+        {
+            var rowCount = 1;
+            if (states[startRow].TryGetCudaCohortSlice(out var firstSlice))
+            {
+                var arena = firstSlice.Arena;
+                var expectedSourceRow = checked(firstSlice.Row + 1);
+                while (startRow + rowCount < states.Count &&
+                       states[startRow + rowCount].TryGetCudaCohortSlice(out var nextSlice) &&
+                       ReferenceEquals(nextSlice.Arena, arena) &&
+                       nextSlice.Row == expectedSourceRow)
+                {
+                    rowCount++;
+                    expectedSourceRow = checked(expectedSourceRow + 1);
+                }
+            }
+
+            runs.Add(new CopyRun(startRow, rowCount));
+            startRow += rowCount;
+        }
+
+        return runs;
+    }
+
     private static void ValidateLease(
         DecoderOrtCudaResidentStateLease lease,
         int row,
@@ -376,4 +411,6 @@ internal sealed class OptimumLegacyCudaGatheredPastKvBatch : IDisposable
         ObjectDisposedException.ThrowIf(
             Volatile.Read(ref _disposed) != 0,
             this);
+
+    private readonly record struct CopyRun(int StartRow, int RowCount);
 }
