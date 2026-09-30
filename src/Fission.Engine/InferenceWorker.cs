@@ -134,8 +134,15 @@ public sealed class InferenceWorker : IAsyncDisposable
 
                 if (cycle.Batch.Items.Count == 0 && _engine.ActiveRequestCount != 0)
                 {
-                    throw new InvalidOperationException(
-                        "Inference worker made no scheduling progress while active requests remain.");
+                    var backpressureWait = _engine.GetDeviceMemoryBackpressureWait(cycle);
+                    if (backpressureWait is null)
+                    {
+                        throw new InvalidOperationException(
+                            "Inference worker made no scheduling progress while active requests remain.");
+                    }
+
+                    await WaitForBackpressureOrWorkAsync(backpressureWait)
+                        .ConfigureAwait(false);
                 }
             }
         }
@@ -155,12 +162,17 @@ public sealed class InferenceWorker : IAsyncDisposable
     private bool HasImmediatelyAvailableWork() =>
         _admission.Reader.TryPeek(out _) || _cancellation.Reader.TryPeek(out _);
 
-    private async ValueTask<bool> WaitForWorkAsync()
+    private async ValueTask<bool> WaitForWorkAsync(
+        CancellationToken cancellationToken = default)
     {
         while (true)
         {
-            var admissionWait = _admission.Reader.WaitToReadAsync().AsTask();
-            var cancellationWait = _cancellation.Reader.WaitToReadAsync().AsTask();
+            var admissionWait = _admission.Reader
+                .WaitToReadAsync(cancellationToken)
+                .AsTask();
+            var cancellationWait = _cancellation.Reader
+                .WaitToReadAsync(cancellationToken)
+                .AsTask();
             var completed = await Task.WhenAny(admissionWait, cancellationWait)
                 .ConfigureAwait(false);
 
@@ -174,6 +186,53 @@ public sealed class InferenceWorker : IAsyncDisposable
             {
                 return false;
             }
+        }
+    }
+
+    private async Task WaitForBackpressureOrWorkAsync(Task backpressureWait)
+    {
+        if (backpressureWait.IsCompleted)
+        {
+            await backpressureWait.ConfigureAwait(false);
+            return;
+        }
+
+        using var workWaitCancellation = new CancellationTokenSource();
+        var workWait = WaitForWorkAsync(workWaitCancellation.Token).AsTask();
+        var completed = await Task.WhenAny(backpressureWait, workWait)
+            .ConfigureAwait(false);
+
+        if (ReferenceEquals(completed, backpressureWait))
+        {
+            workWaitCancellation.Cancel();
+            await backpressureWait.ConfigureAwait(false);
+            await SuppressExpectedCancellationAsync(workWait).ConfigureAwait(false);
+            return;
+        }
+
+        var hasWork = await workWait.ConfigureAwait(false);
+        workWaitCancellation.Cancel();
+        if (hasWork)
+        {
+            return;
+        }
+
+        // Both control channels are closed (typically worker disposal), but an
+        // already-admitted request still owns the worker. Let the shared-runtime
+        // reservation resolve rather than spinning on completed channel waits.
+        await backpressureWait.ConfigureAwait(false);
+    }
+
+    private static async Task SuppressExpectedCancellationAsync(Task workWait)
+    {
+        try
+        {
+            await workWait.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation only stops the losing channel-readiness wait after the
+            // reservation-release signal won Task.WhenAny.
         }
     }
 
