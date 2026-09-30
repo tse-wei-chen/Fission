@@ -31,6 +31,56 @@ public sealed record CudaDeviceMemoryPoolStatistics(
     long Returns,
     long Drops,
     int RetainedBuffers,
+    long RetainedBytes)
+{
+    /// <summary>
+    /// Allocations currently leased to callers.
+    /// </summary>
+    public int ActiveBuffers { get; init; }
+
+    /// <summary>
+    /// CUDA bytes currently leased to callers.
+    /// </summary>
+    public long ActiveBytes { get; init; }
+
+    /// <summary>
+    /// Active plus idle-retained allocations still resident on the CUDA device.
+    /// </summary>
+    public int ReservedBuffers => checked(ActiveBuffers + RetainedBuffers);
+
+    /// <summary>
+    /// Active plus idle-retained bytes still resident on the CUDA device.
+    /// </summary>
+    public long ReservedBytes => checked(ActiveBytes + RetainedBytes);
+
+    /// <summary>
+    /// Maximum simultaneously active bytes observed by this pool.
+    /// </summary>
+    public long PeakActiveBytes { get; init; }
+
+    /// <summary>
+    /// Maximum active plus retained bytes observed by this pool.
+    /// </summary>
+    public long PeakReservedBytes { get; init; }
+
+    /// <summary>
+    /// Number of idle buffers released by explicit trim operations.
+    /// </summary>
+    public long TrimmedBuffers { get; init; }
+
+    /// <summary>
+    /// Number of idle bytes released by explicit trim operations.
+    /// </summary>
+    public long TrimmedBytes { get; init; }
+}
+
+/// <summary>
+/// Result of one explicit idle-retention trim.
+/// </summary>
+public readonly record struct CudaDeviceMemoryPoolTrimResult(
+    int ReleasedBuffers,
+    long ReleasedBytes,
+    int RetainedBuffers,
     long RetainedBytes);
 
 /// <summary>
@@ -54,6 +104,12 @@ public sealed class CudaPooledDeviceMemoryAllocator :
     private long _drops;
     private long _retainedBytes;
     private int _retainedBuffers;
+    private long _activeBytes;
+    private int _activeBuffers;
+    private long _peakActiveBytes;
+    private long _peakReservedBytes;
+    private long _trimmedBuffers;
+    private long _trimmedBytes;
     private int _disposed;
 
     public CudaPooledDeviceMemoryAllocator(
@@ -84,12 +140,20 @@ public sealed class CudaPooledDeviceMemoryAllocator :
             lock (_gate)
             {
                 return new CudaDeviceMemoryPoolStatistics(
-                    NativeAllocations: Interlocked.Read(ref _nativeAllocations),
-                    Reuses: Interlocked.Read(ref _reuses),
-                    Returns: Interlocked.Read(ref _returns),
-                    Drops: Interlocked.Read(ref _drops),
+                    NativeAllocations: _nativeAllocations,
+                    Reuses: _reuses,
+                    Returns: _returns,
+                    Drops: _drops,
                     RetainedBuffers: _retainedBuffers,
-                    RetainedBytes: _retainedBytes);
+                    RetainedBytes: _retainedBytes)
+                {
+                    ActiveBuffers = _activeBuffers,
+                    ActiveBytes = _activeBytes,
+                    PeakActiveBytes = _peakActiveBytes,
+                    PeakReservedBytes = _peakReservedBytes,
+                    TrimmedBuffers = _trimmedBuffers,
+                    TrimmedBytes = _trimmedBytes
+                };
             }
         }
     }
@@ -99,31 +163,119 @@ public sealed class CudaPooledDeviceMemoryAllocator :
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(byteLength);
         ThrowIfDisposed();
 
-        CudaDeviceAllocationHandle? handle = null;
         lock (_gate)
         {
             ThrowIfDisposed();
             if (_buckets.TryGetValue(byteLength, out var bucket) && bucket.Count > 0)
             {
-                handle = bucket.Pop();
+                var reused = bucket.Pop();
                 _retainedBuffers--;
                 _retainedBytes = checked(_retainedBytes - byteLength);
                 if (bucket.Count == 0)
                 {
                     _buckets.Remove(byteLength);
                 }
+
+                _reuses = checked(_reuses + 1);
+                MarkLeaseIssued(byteLength);
+                return CreateLease(reused, byteLength);
             }
         }
 
-        if (handle is not null)
+        var handle = AllocateHandle(byteLength);
+        var rejectBecauseDisposed = false;
+        lock (_gate)
         {
-            Interlocked.Increment(ref _reuses);
-            return CreateLease(handle, byteLength);
+            _nativeAllocations = checked(_nativeAllocations + 1);
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                rejectBecauseDisposed = true;
+            }
+            else
+            {
+                MarkLeaseIssued(byteLength);
+            }
         }
 
-        handle = AllocateHandle(byteLength);
-        Interlocked.Increment(ref _nativeAllocations);
+        if (rejectBecauseDisposed)
+        {
+            handle.Dispose();
+            throw new ObjectDisposedException(nameof(CudaPooledDeviceMemoryAllocator));
+        }
+
         return CreateLease(handle, byteLength);
+    }
+
+    /// <summary>
+    /// Releases currently idle allocations until retained bytes are at or below
+    /// <paramref name="targetRetainedBytes"/>. Largest exact-size buckets are
+    /// released first to reduce cudaFree submissions for a requested byte target.
+    /// Active caller leases are never revoked. Leases returned after this snapshot
+    /// may be retained again under the configured pool bounds.
+    /// </summary>
+    public CudaDeviceMemoryPoolTrimResult TrimRetained(
+        long targetRetainedBytes = 0)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(targetRetainedBytes);
+        ThrowIfDisposed();
+
+        List<CudaDeviceAllocationHandle>? released = null;
+        long releasedBytes = 0;
+        CudaDeviceMemoryPoolTrimResult result;
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (_retainedBytes > targetRetainedBytes)
+            {
+                var sizes = _buckets.Keys.ToArray();
+                Array.Sort(sizes);
+                released = new List<CudaDeviceAllocationHandle>();
+
+                for (var sizeIndex = sizes.Length - 1;
+                     sizeIndex >= 0 && _retainedBytes > targetRetainedBytes;
+                     sizeIndex--)
+                {
+                    var byteLength = sizes[sizeIndex];
+                    if (!_buckets.TryGetValue(byteLength, out var bucket))
+                    {
+                        continue;
+                    }
+
+                    while (bucket.Count > 0 && _retainedBytes > targetRetainedBytes)
+                    {
+                        released.Add(bucket.Pop());
+                        _retainedBuffers--;
+                        _retainedBytes = checked(_retainedBytes - byteLength);
+                        releasedBytes = checked(releasedBytes + byteLength);
+                    }
+
+                    if (bucket.Count == 0)
+                    {
+                        _buckets.Remove(byteLength);
+                    }
+                }
+
+                _trimmedBuffers = checked(_trimmedBuffers + released.Count);
+                _trimmedBytes = checked(_trimmedBytes + releasedBytes);
+            }
+
+            result = new CudaDeviceMemoryPoolTrimResult(
+                ReleasedBuffers: released?.Count ?? 0,
+                ReleasedBytes: releasedBytes,
+                RetainedBuffers: _retainedBuffers,
+                RetainedBytes: _retainedBytes);
+        }
+
+        if (released is not null)
+        {
+            foreach (var handle in released)
+            {
+                handle.Dispose();
+            }
+        }
+
+        return result;
     }
 
     public void Dispose()
@@ -165,14 +317,27 @@ public sealed class CudaPooledDeviceMemoryAllocator :
             DeviceId,
             Return);
 
+    private void MarkLeaseIssued(long byteLength)
+    {
+        _activeBuffers = checked(_activeBuffers + 1);
+        _activeBytes = checked(_activeBytes + byteLength);
+        _peakActiveBytes = Math.Max(_peakActiveBytes, _activeBytes);
+        _peakReservedBytes = Math.Max(
+            _peakReservedBytes,
+            checked(_activeBytes + _retainedBytes));
+    }
+
     private void Return(
         CudaDeviceAllocationHandle handle,
         long byteLength)
     {
-        Interlocked.Increment(ref _returns);
         var retained = false;
         lock (_gate)
         {
+            _returns = checked(_returns + 1);
+            _activeBuffers--;
+            _activeBytes = checked(_activeBytes - byteLength);
+
             if (Volatile.Read(ref _disposed) == 0 &&
                 _poolOptions.MaxRetainedBytes > 0 &&
                 _poolOptions.MaxRetainedBuffersPerSize > 0 &&
@@ -192,15 +357,17 @@ public sealed class CudaPooledDeviceMemoryAllocator :
                     retained = true;
                 }
             }
+
+            if (!retained)
+            {
+                _drops = checked(_drops + 1);
+            }
         }
 
-        if (retained)
+        if (!retained)
         {
-            return;
+            handle.Dispose();
         }
-
-        Interlocked.Increment(ref _drops);
-        handle.Dispose();
     }
 
     private void ThrowIfDisposed() =>
