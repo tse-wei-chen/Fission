@@ -1,3 +1,5 @@
+using Fission.Abstractions.Execution;
+
 namespace Fission.Backends.OnnxRuntime;
 
 /// <summary>
@@ -93,6 +95,7 @@ public readonly record struct CudaDeviceMemoryPoolTrimResult(
 /// </summary>
 public sealed class CudaPooledDeviceMemoryAllocator :
     CudaDeviceMemoryAllocator,
+    IInferenceDeviceMemoryPressureSource,
     IDisposable
 {
     private readonly object _gate = new();
@@ -155,6 +158,32 @@ public sealed class CudaPooledDeviceMemoryAllocator :
                     TrimmedBytes = _trimmedBytes
                 };
             }
+        }
+    }
+
+    public bool TryGetDeviceMemoryPressure(
+        out InferenceDeviceMemoryPressure pressure)
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            pressure = default;
+            return false;
+        }
+
+        lock (_gate)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                pressure = default;
+                return false;
+            }
+
+            pressure = new InferenceDeviceMemoryPressure(
+                ActiveBytes: _activeBytes,
+                ReclaimableBytes: _retainedBytes,
+                ReservedBytes: checked(_activeBytes + _retainedBytes),
+                PeakReservedBytes: _peakReservedBytes);
+            return true;
         }
     }
 
