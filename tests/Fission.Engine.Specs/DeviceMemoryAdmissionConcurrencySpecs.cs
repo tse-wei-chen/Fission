@@ -43,6 +43,13 @@ internal static class DeviceMemoryAdmissionConcurrencySpecs
 
     private static async Task RunAsync()
     {
+        await RunAdmissionSerializationAsync();
+        await RunUntilCompleteBackpressureAsync();
+        await RunWorkerBackpressureAsync();
+    }
+
+    private static async Task RunAdmissionSerializationAsync()
+    {
         var deviceId = new DeviceId("cpu:shared-memory-admission");
         var modelId = new ModelId("shared-memory-admission-model");
         var backend = new BlockingPressureBackend(deviceId, kvBytesPerToken: 128);
@@ -54,14 +61,7 @@ internal static class DeviceMemoryAdmissionConcurrencySpecs
             device,
             kvPagePool: new KvPagePool(capacity: 8, tokensPerPage: 4));
 
-        var options = new InferenceEngineOptions(
-            MaxBatchTokens: 1,
-            MaxBatchSequences: 1,
-            Scheduling: new SchedulingPolicyOptions(
-                DecodeTokenReserve: 0,
-                MaxPrefillChunkTokens: 1,
-                DeadlineUrgencyWindow: TimeSpan.Zero),
-            MaxDeviceBytes: 128);
+        var options = CreateOptions();
         using var firstEngine = new InferenceEngine(
             runtime,
             new SchedulingKernel(),
@@ -138,33 +138,191 @@ internal static class DeviceMemoryAdmissionConcurrencySpecs
         }
         finally
         {
-            // A failed assertion or timeout must not leave the fake backend blocked,
-            // otherwise actor disposal would hide the real regression by hanging CI.
-            backend.ReleaseFirstPrefill();
+            await ReleaseAndDrainAsync(backend, firstCycleTask, secondCycleTask);
+        }
+    }
 
-            if (firstCycleTask is not null)
+    private static async Task RunUntilCompleteBackpressureAsync()
+    {
+        var deviceId = new DeviceId("cpu:run-until-memory-backpressure");
+        var modelId = new ModelId("run-until-memory-backpressure-model");
+        var backend = new BlockingPressureBackend(deviceId, kvBytesPerToken: 128);
+        await using var device = await ContinuousBatchExecutor.CreateAsync(
+            backend,
+            capacity: 8,
+            maxBatchSize: 4);
+        using var runtime = new ExecutionPlanExecutor(
+            device,
+            kvPagePool: new KvPagePool(capacity: 8, tokensPerPage: 4));
+        using var blocker = new InferenceEngine(
+            runtime,
+            new SchedulingKernel(),
+            CreateOptions(),
+            kvMemoryProfile: backend);
+        using var waiter = new InferenceEngine(
+            runtime,
+            new SchedulingKernel(),
+            CreateOptions(),
+            kvMemoryProfile: backend);
+
+        var now = new DateTimeOffset(2026, 9, 30, 12, 10, 0, TimeSpan.Zero);
+        var blockingSequence = blocker.Submit(
+            modelId,
+            new[] { 11 },
+            maxNewTokens: 4,
+            enqueuedAt: now);
+        var waitingSequence = waiter.Submit(
+            modelId,
+            new[] { 12 },
+            maxNewTokens: 1,
+            enqueuedAt: now.AddMilliseconds(1));
+
+        Task<InferenceCycleResult>? blockerCycle = null;
+        try
+        {
+            blockerCycle = blocker.RunCycleAsync(now.AddMilliseconds(2)).AsTask();
+            await backend.FirstPrefillStarted.Task
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            var runUntilComplete = waiter.RunUntilCompleteAsync(maxCycles: 8).AsTask();
+            var premature = await Task.WhenAny(
+                runUntilComplete,
+                Task.Delay(TimeSpan.FromMilliseconds(150)));
+            Require(
+                !ReferenceEquals(premature, runUntilComplete),
+                "RunUntilCompleteAsync must wait instead of failing or completing while another engine owns the only device-memory quantum.");
+            Require(
+                backend.PrefillCalls == 1,
+                "RunUntilCompleteAsync must remain behind the outstanding reservation before relief is signaled.");
+
+            backend.ReleaseFirstPrefill();
+            await blockerCycle.WaitAsync(TimeSpan.FromSeconds(5));
+            var cycles = await runUntilComplete.WaitAsync(TimeSpan.FromSeconds(5));
+            Require(
+                cycles.Count >= 2 && cycles.Any(static cycle => cycle.Batch.Items.Count == 0),
+                "RunUntilCompleteAsync should preserve the blocked empty cycle and retry after reservation release.");
+            Require(
+                waiter.GetSnapshot(waitingSequence).IsCompleted,
+                "RunUntilCompleteAsync must resume and complete the waiting request after device-memory relief.");
+
+            await blocker.CancelAsync(blockingSequence);
+            Require(runtime.SequenceCount == 0,
+                "RunUntilComplete backpressure spec must release all runtime sequences.");
+        }
+        finally
+        {
+            await ReleaseAndDrainAsync(backend, blockerCycle);
+        }
+    }
+
+    private static async Task RunWorkerBackpressureAsync()
+    {
+        var deviceId = new DeviceId("cpu:worker-memory-backpressure");
+        var modelId = new ModelId("worker-memory-backpressure-model");
+        var backend = new BlockingPressureBackend(deviceId, kvBytesPerToken: 128);
+        await using var device = await ContinuousBatchExecutor.CreateAsync(
+            backend,
+            capacity: 8,
+            maxBatchSize: 4);
+        using var runtime = new ExecutionPlanExecutor(
+            device,
+            kvPagePool: new KvPagePool(capacity: 8, tokensPerPage: 4));
+        using var blocker = new InferenceEngine(
+            runtime,
+            new SchedulingKernel(),
+            CreateOptions(),
+            kvMemoryProfile: backend);
+        using var workerEngine = new InferenceEngine(
+            runtime,
+            new SchedulingKernel(),
+            CreateOptions(),
+            kvMemoryProfile: backend);
+        await using var worker = new InferenceWorker(
+            workerEngine,
+            new InferenceWorkerOptions(AdmissionCapacity: 4));
+
+        var now = new DateTimeOffset(2026, 9, 30, 12, 20, 0, TimeSpan.Zero);
+        var blockingSequence = blocker.Submit(
+            modelId,
+            new[] { 21 },
+            maxNewTokens: 4,
+            enqueuedAt: now);
+
+        Task<InferenceCycleResult>? blockerCycle = null;
+        try
+        {
+            blockerCycle = blocker.RunCycleAsync(now.AddMilliseconds(1)).AsTask();
+            await backend.FirstPrefillStarted.Task
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            var stream = await worker.SubmitAsync(
+                modelId,
+                new[] { 22 },
+                maxNewTokens: 1,
+                enqueuedAt: now.AddMilliseconds(2));
+            var premature = await Task.WhenAny(
+                stream.Completion,
+                Task.Delay(TimeSpan.FromMilliseconds(150)));
+            Require(
+                !ReferenceEquals(premature, stream.Completion),
+                "InferenceWorker must remain alive and wait while shared-runtime memory is transiently reserved elsewhere.");
+            Require(
+                backend.PrefillCalls == 1,
+                "Worker backpressure must prevent a second prefill from reaching the device actor before reservation release.");
+
+            backend.ReleaseFirstPrefill();
+            await blockerCycle.WaitAsync(TimeSpan.FromSeconds(5));
+            var completed = await stream.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+            Require(
+                completed.IsCompleted &&
+                completed.FinishReason == InferenceFinishReason.Length,
+                "InferenceWorker must resume scheduling and finish the waiting request after reservation release.");
+            Require(
+                backend.PrefillCalls == 2,
+                "Worker request should reach backend prefill exactly once after the blocking reservation is released.");
+
+            await blocker.CancelAsync(blockingSequence);
+            Require(runtime.SequenceCount == 0,
+                "Worker backpressure spec must release all runtime sequences.");
+        }
+        finally
+        {
+            await ReleaseAndDrainAsync(backend, blockerCycle);
+        }
+    }
+
+    private static InferenceEngineOptions CreateOptions() =>
+        new(
+            MaxBatchTokens: 1,
+            MaxBatchSequences: 1,
+            Scheduling: new SchedulingPolicyOptions(
+                DecodeTokenReserve: 0,
+                MaxPrefillChunkTokens: 1,
+                DeadlineUrgencyWindow: TimeSpan.Zero),
+            MaxDeviceBytes: 128);
+
+    private static async Task ReleaseAndDrainAsync(
+        BlockingPressureBackend backend,
+        params Task<InferenceCycleResult>?[] cycles)
+    {
+        // A failed assertion or timeout must not leave the fake backend blocked,
+        // otherwise actor disposal would hide the real regression by hanging CI.
+        backend.ReleaseFirstPrefill();
+
+        foreach (var cycle in cycles)
+        {
+            if (cycle is null)
             {
-                try
-                {
-                    await firstCycleTask.WaitAsync(TimeSpan.FromSeconds(5));
-                }
-                catch
-                {
-                    // Preserve the original failure while making cleanup progress.
-                }
+                continue;
             }
 
-            if (secondCycleTask is not null)
+            try
             {
-                try
-                {
-                    await secondCycleTask.WaitAsync(TimeSpan.FromSeconds(5));
-                }
-                catch
-                {
-                    // Same cleanup-only behavior for a competing cycle that may
-                    // have incorrectly reached the actor.
-                }
+                await cycle.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            catch
+            {
+                // Preserve the original failure while making cleanup progress.
             }
         }
     }
