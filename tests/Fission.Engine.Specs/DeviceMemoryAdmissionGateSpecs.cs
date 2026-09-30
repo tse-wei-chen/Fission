@@ -142,6 +142,7 @@ internal static class DeviceMemoryAdmissionGateSpecs
             .WaitAsync(TimeSpan.FromSeconds(5));
 
         await VerifyReservationReleaseSignalsAsync(runtime, gpu0, gpu1);
+        await VerifyReservationWaiterDisposalAsync(device, gpu0);
     }
 
     private static async Task VerifyReservationReleaseSignalsAsync(
@@ -226,6 +227,47 @@ internal static class DeviceMemoryAdmissionGateSpecs
         {
             multiGpu1?.Dispose();
             multiGpu0?.Dispose();
+        }
+    }
+
+    private static async Task VerifyReservationWaiterDisposalAsync(
+        ContinuousBatchExecutor device,
+        DeviceId gpu0)
+    {
+        var runtime = new ExecutionPlanExecutor(device);
+        var reservation = runtime.ReserveDeviceMemory(
+            [new RuntimeDeviceMemoryReservationRequest(gpu0, 8)]);
+
+        try
+        {
+            var state = runtime.GetDeviceMemoryReservationState();
+            var snapshot = state.Reservations.Single(
+                current => current.Device == gpu0);
+            var wait = runtime.WaitForDeviceMemoryReservationReleaseAsync(
+                [new RuntimeDeviceMemoryReservationVersion(
+                    gpu0,
+                    snapshot.ReleaseVersion)]);
+
+            runtime.Dispose();
+
+            var disposed = false;
+            try
+            {
+                await wait.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            catch (ObjectDisposedException)
+            {
+                disposed = true;
+            }
+
+            Require(
+                disposed,
+                "Disposing the runtime must fault outstanding reservation waiters instead of leaving them pending.");
+        }
+        finally
+        {
+            reservation.Dispose();
+            runtime.Dispose();
         }
     }
 
