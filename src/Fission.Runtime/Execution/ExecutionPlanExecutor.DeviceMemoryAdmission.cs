@@ -23,12 +23,8 @@ public sealed partial class ExecutionPlanExecutor
 {
     private readonly ConcurrentDictionary<DeviceId, SemaphoreSlim>
         _deviceMemoryAdmissionGates = new();
-    private readonly object _deviceMemoryReservationGate = new();
-    private readonly Dictionary<DeviceId, long> _deviceMemoryReservations = new();
-    private readonly Dictionary<DeviceId, long>
-        _deviceMemoryReservationReleaseVersions = new();
-    private readonly Dictionary<DeviceId, TaskCompletionSource<long>>
-        _deviceMemoryReservationReleased = new();
+    private readonly ConcurrentDictionary<DeviceId, DeviceMemoryReservationLedger>
+        _deviceMemoryReservationLedgers = new();
 
     /// <summary>
     /// Serializes pressure observation, optional reclaim, scheduling, and transient
@@ -46,10 +42,7 @@ public sealed partial class ExecutionPlanExecutor
         ArgumentNullException.ThrowIfNull(devices);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        var normalized = devices
-            .Distinct()
-            .OrderBy(static device => device.Value, StringComparer.Ordinal)
-            .ToArray();
+        var normalized = NormalizeDevices(devices);
         if (normalized.Length == 0)
         {
             return EmptyAdmissionGateLease.Instance;
@@ -86,26 +79,59 @@ public sealed partial class ExecutionPlanExecutor
         GetDeviceMemoryReservations() =>
         GetDeviceMemoryReservationState().Reservations;
 
-    internal RuntimeDeviceMemoryReservationState GetDeviceMemoryReservationState()
+    internal IReadOnlyList<RuntimeDeviceMemoryReservationSnapshot>
+        GetDeviceMemoryReservations(IReadOnlyList<DeviceId> devices) =>
+        GetDeviceMemoryReservationState(devices).Reservations;
+
+    internal RuntimeDeviceMemoryReservationState GetDeviceMemoryReservationState() =>
+        SnapshotDeviceMemoryReservationState(
+            _deviceMemoryReservationLedgers.Values
+                .OrderBy(static ledger => ledger.Device.Value, StringComparer.Ordinal)
+                .ToArray());
+
+    internal RuntimeDeviceMemoryReservationState GetDeviceMemoryReservationState(
+        IReadOnlyList<DeviceId> devices)
     {
-        lock (_deviceMemoryReservationGate)
+        ArgumentNullException.ThrowIfNull(devices);
+        var ledgers = NormalizeDevices(devices)
+            .Select(device => _deviceMemoryReservationLedgers.TryGetValue(device, out var ledger)
+                ? ledger
+                : null)
+            .Where(static ledger => ledger is not null)
+            .Cast<DeviceMemoryReservationLedger>()
+            .ToArray();
+        return SnapshotDeviceMemoryReservationState(ledgers);
+    }
+
+    private static RuntimeDeviceMemoryReservationState SnapshotDeviceMemoryReservationState(
+        IReadOnlyList<DeviceMemoryReservationLedger> ledgers)
+    {
+        var reservations = new List<RuntimeDeviceMemoryReservationSnapshot>(ledgers.Count);
+        foreach (var ledger in ledgers)
         {
-            var reservations = _deviceMemoryReservations
-                .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal)
-                .Select(pair => new RuntimeDeviceMemoryReservationSnapshot(
-                    pair.Key,
-                    pair.Value,
-                    GetDeviceMemoryReservationReleaseVersionLocked(pair.Key)))
-                .ToArray();
-            return new RuntimeDeviceMemoryReservationState(reservations);
+            lock (ledger.Gate)
+            {
+                if (ledger.ReservedBytes == 0)
+                {
+                    continue;
+                }
+
+                reservations.Add(new RuntimeDeviceMemoryReservationSnapshot(
+                    ledger.Device,
+                    ledger.ReservedBytes,
+                    ledger.ReleaseVersion));
+            }
         }
+
+        return new RuntimeDeviceMemoryReservationState(reservations);
     }
 
     /// <summary>
     /// Waits until any observed physical device releases reservation bytes. Each
     /// observed version is device-scoped, so releases on unrelated GPUs do not
-    /// wake this waiter. Version comparison and signal capture share the ledger
-    /// lock, preserving the missed-wakeup protection used by admission retries.
+    /// wake this waiter. Version comparison and signal capture are serialized by
+    /// that device's ledger lock, preserving missed-wakeup protection without a
+    /// runtime-wide reservation lock.
     /// </summary>
     internal Task WaitForDeviceMemoryReservationReleaseAsync(
         IReadOnlyList<RuntimeDeviceMemoryReservationVersion> observedVersions,
@@ -119,38 +145,37 @@ public sealed partial class ExecutionPlanExecutor
             return Task.CompletedTask;
         }
 
-        Task<long>[] signals;
-        lock (_deviceMemoryReservationGate)
+        var normalized = new Dictionary<DeviceId, long>();
+        foreach (var observed in observedVersions)
         {
-            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-
-            var normalized = new Dictionary<DeviceId, long>();
-            foreach (var observed in observedVersions)
+            if (normalized.TryGetValue(observed.Device, out var existing) &&
+                existing != observed.ReleaseVersion)
             {
-                if (normalized.TryGetValue(observed.Device, out var existing) &&
-                    existing != observed.ReleaseVersion)
-                {
-                    throw new InvalidOperationException(
-                        $"Conflicting reservation release versions were supplied for {observed.Device}: " +
-                        $"{existing} and {observed.ReleaseVersion}.");
-                }
-
-                normalized[observed.Device] = observed.ReleaseVersion;
+                throw new InvalidOperationException(
+                    $"Conflicting reservation release versions were supplied for {observed.Device}: " +
+                    $"{existing} and {observed.ReleaseVersion}.");
             }
 
-            foreach (var (device, observedVersion) in normalized)
+            normalized[observed.Device] = observed.ReleaseVersion;
+        }
+
+        var signals = new Task<long>[normalized.Count];
+        var index = 0;
+        foreach (var (device, observedVersion) in normalized
+                     .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal))
+        {
+            var ledger = GetOrCreateDeviceMemoryReservationLedger(device);
+            lock (ledger.Gate)
             {
-                if (GetDeviceMemoryReservationReleaseVersionLocked(device) !=
-                    observedVersion)
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+                if (ledger.ReleaseVersion != observedVersion)
                 {
                     return Task.CompletedTask;
                 }
-            }
 
-            signals = normalized
-                .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal)
-                .Select(pair => GetOrCreateReservationReleaseSignalLocked(pair.Key).Task)
-                .ToArray();
+                ledger.ReleaseSignal ??= CreateReservationReleaseSignal();
+                signals[index++] = ledger.ReleaseSignal.Task;
+            }
         }
 
         return WaitForAnyReservationReleaseAsync(signals, cancellationToken);
@@ -162,6 +187,92 @@ public sealed partial class ExecutionPlanExecutor
         ArgumentNullException.ThrowIfNull(requests);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
+        var normalized = NormalizeReservationRequests(requests);
+        if (normalized.Count == 0)
+        {
+            return EmptyReservationLease.Instance;
+        }
+
+        var entries = normalized
+            .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal)
+            .Select(pair => new ReservationLedgerMutation(
+                GetOrCreateDeviceMemoryReservationLedger(pair.Key),
+                pair.Value))
+            .ToArray();
+
+        using (EnterReservationLedgerLocks(entries))
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+            var updatedBytes = new long[entries.Length];
+            for (var index = 0; index < entries.Length; index++)
+            {
+                updatedBytes[index] = checked(
+                    entries[index].Ledger.ReservedBytes + entries[index].Bytes);
+            }
+
+            for (var index = 0; index < entries.Length; index++)
+            {
+                entries[index].Ledger.ReservedBytes = updatedBytes[index];
+            }
+        }
+
+        return new DeviceMemoryReservationLease(this, normalized);
+    }
+
+    private void ReleaseDeviceMemoryReservations(
+        IReadOnlyDictionary<DeviceId, long> reservations)
+    {
+        var entries = reservations
+            .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal)
+            .Select(pair => new ReservationLedgerMutation(
+                GetExistingDeviceMemoryReservationLedger(pair.Key),
+                pair.Value))
+            .ToArray();
+        var releasedSignals = new List<(TaskCompletionSource<long> Signal, long Version)>(
+            entries.Length);
+
+        using (EnterReservationLedgerLocks(entries))
+        {
+            var remainingBytes = new long[entries.Length];
+            var releaseVersions = new long[entries.Length];
+            for (var index = 0; index < entries.Length; index++)
+            {
+                var entry = entries[index];
+                if (entry.Ledger.ReservedBytes < entry.Bytes)
+                {
+                    throw new InvalidOperationException(
+                        $"Device-memory reservation ledger underflow for {entry.Ledger.Device}: " +
+                        $"reserved={entry.Ledger.ReservedBytes}, releasing={entry.Bytes}.");
+                }
+
+                remainingBytes[index] = entry.Ledger.ReservedBytes - entry.Bytes;
+                releaseVersions[index] = checked(entry.Ledger.ReleaseVersion + 1);
+            }
+
+            for (var index = 0; index < entries.Length; index++)
+            {
+                var ledger = entries[index].Ledger;
+                ledger.ReservedBytes = remainingBytes[index];
+                ledger.ReleaseVersion = releaseVersions[index];
+
+                if (ledger.ReleaseSignal is { } signal)
+                {
+                    ledger.ReleaseSignal = null;
+                    releasedSignals.Add((signal, releaseVersions[index]));
+                }
+            }
+        }
+
+        foreach (var (signal, version) in releasedSignals)
+        {
+            signal.TrySetResult(version);
+        }
+    }
+
+    private static Dictionary<DeviceId, long> NormalizeReservationRequests(
+        IReadOnlyList<RuntimeDeviceMemoryReservationRequest> requests)
+    {
         var normalized = new Dictionary<DeviceId, long>();
         foreach (var request in requests)
         {
@@ -175,84 +286,56 @@ public sealed partial class ExecutionPlanExecutor
             normalized[request.Device] = checked(existing + request.Bytes);
         }
 
-        if (normalized.Count == 0)
-        {
-            return EmptyReservationLease.Instance;
-        }
-
-        lock (_deviceMemoryReservationGate)
-        {
-            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-            foreach (var (device, bytes) in normalized)
-            {
-                _deviceMemoryReservations.TryGetValue(device, out var existing);
-                _deviceMemoryReservations[device] = checked(existing + bytes);
-            }
-        }
-
-        return new DeviceMemoryReservationLease(this, normalized);
+        return normalized;
     }
 
-    private void ReleaseDeviceMemoryReservations(
-        IReadOnlyDictionary<DeviceId, long> reservations)
+    private DeviceMemoryReservationLedger GetOrCreateDeviceMemoryReservationLedger(
+        DeviceId device) =>
+        _deviceMemoryReservationLedgers.GetOrAdd(
+            device,
+            static key => new DeviceMemoryReservationLedger(key));
+
+    private DeviceMemoryReservationLedger GetExistingDeviceMemoryReservationLedger(
+        DeviceId device) =>
+        _deviceMemoryReservationLedgers.TryGetValue(device, out var ledger)
+            ? ledger
+            : throw new InvalidOperationException(
+                $"Device-memory reservation ledger does not exist for {device}.");
+
+    private static IDisposable EnterReservationLedgerLocks(
+        IReadOnlyList<ReservationLedgerMutation> entries)
     {
-        var releasedSignals = new List<(TaskCompletionSource<long> Signal, long Version)>();
-
-        lock (_deviceMemoryReservationGate)
+        var ledgers = entries
+            .Select(static entry => entry.Ledger)
+            .Distinct()
+            .OrderBy(static ledger => ledger.Device.Value, StringComparer.Ordinal)
+            .ToArray();
+        var acquiredCount = 0;
+        try
         {
-            foreach (var (device, bytes) in reservations)
+            foreach (var ledger in ledgers)
             {
-                if (!_deviceMemoryReservations.TryGetValue(device, out var existing) ||
-                    existing < bytes)
-                {
-                    throw new InvalidOperationException(
-                        $"Device-memory reservation ledger underflow for {device}: " +
-                        $"reserved={existing}, releasing={bytes}.");
-                }
-
-                var remaining = existing - bytes;
-                if (remaining == 0)
-                {
-                    _deviceMemoryReservations.Remove(device);
-                }
-                else
-                {
-                    _deviceMemoryReservations[device] = remaining;
-                }
-
-                var releaseVersion = checked(
-                    GetDeviceMemoryReservationReleaseVersionLocked(device) + 1);
-                _deviceMemoryReservationReleaseVersions[device] = releaseVersion;
-
-                if (_deviceMemoryReservationReleased.Remove(device, out var signal))
-                {
-                    releasedSignals.Add((signal, releaseVersion));
-                }
+                Monitor.Enter(ledger.Gate);
+                acquiredCount++;
             }
-        }
 
-        foreach (var (signal, version) in releasedSignals)
+            return new ReservationLedgerLockLease(ledgers);
+        }
+        catch
         {
-            signal.TrySetResult(version);
+            ReleaseReservationLedgerLocks(ledgers, acquiredCount);
+            throw;
         }
     }
 
-    private long GetDeviceMemoryReservationReleaseVersionLocked(DeviceId device) =>
-        _deviceMemoryReservationReleaseVersions.TryGetValue(device, out var version)
-            ? version
-            : 0L;
-
-    private TaskCompletionSource<long> GetOrCreateReservationReleaseSignalLocked(
-        DeviceId device)
+    private static void ReleaseReservationLedgerLocks(
+        IReadOnlyList<DeviceMemoryReservationLedger> ledgers,
+        int count)
     {
-        if (_deviceMemoryReservationReleased.TryGetValue(device, out var signal))
+        for (var index = count - 1; index >= 0; index--)
         {
-            return signal;
+            Monitor.Exit(ledgers[index].Gate);
         }
-
-        signal = CreateReservationReleaseSignal();
-        _deviceMemoryReservationReleased.Add(device, signal);
-        return signal;
     }
 
     private static async Task WaitForAnyReservationReleaseAsync(
@@ -267,11 +350,19 @@ public sealed partial class ExecutionPlanExecutor
 
     private void DisposeDeviceMemoryReservationWaiters()
     {
-        TaskCompletionSource<long>[] signals;
-        lock (_deviceMemoryReservationGate)
+        var signals = new List<TaskCompletionSource<long>>();
+        foreach (var ledger in _deviceMemoryReservationLedgers.Values)
         {
-            signals = _deviceMemoryReservationReleased.Values.ToArray();
-            _deviceMemoryReservationReleased.Clear();
+            lock (ledger.Gate)
+            {
+                if (ledger.ReleaseSignal is not { } signal)
+                {
+                    continue;
+                }
+
+                ledger.ReleaseSignal = null;
+                signals.Add(signal);
+            }
         }
 
         foreach (var signal in signals)
@@ -284,6 +375,12 @@ public sealed partial class ExecutionPlanExecutor
     private static TaskCompletionSource<long> CreateReservationReleaseSignal() =>
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    private static DeviceId[] NormalizeDevices(IReadOnlyList<DeviceId> devices) =>
+        devices
+            .Distinct()
+            .OrderBy(static device => device.Value, StringComparer.Ordinal)
+            .ToArray();
+
     private static void ReleaseAdmissionGates(
         IReadOnlyList<SemaphoreSlim> gates,
         int count)
@@ -291,6 +388,43 @@ public sealed partial class ExecutionPlanExecutor
         for (var index = count - 1; index >= 0; index--)
         {
             gates[index].Release();
+        }
+    }
+
+    private sealed class DeviceMemoryReservationLedger
+    {
+        public DeviceMemoryReservationLedger(DeviceId device)
+        {
+            Device = device;
+        }
+
+        public DeviceId Device { get; }
+        public object Gate { get; } = new();
+        public long ReservedBytes { get; set; }
+        public long ReleaseVersion { get; set; }
+        public TaskCompletionSource<long>? ReleaseSignal { get; set; }
+    }
+
+    private readonly record struct ReservationLedgerMutation(
+        DeviceMemoryReservationLedger Ledger,
+        long Bytes);
+
+    private sealed class ReservationLedgerLockLease : IDisposable
+    {
+        private DeviceMemoryReservationLedger[]? _ledgers;
+
+        public ReservationLedgerLockLease(DeviceMemoryReservationLedger[] ledgers)
+        {
+            _ledgers = ledgers;
+        }
+
+        public void Dispose()
+        {
+            var ledgers = Interlocked.Exchange(ref _ledgers, null);
+            if (ledgers is not null)
+            {
+                ReleaseReservationLedgerLocks(ledgers, ledgers.Length);
+            }
         }
     }
 
