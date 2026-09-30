@@ -12,6 +12,7 @@ namespace Fission.Backends.OnnxRuntime;
 /// </summary>
 public sealed class OnnxRuntimeMigratableBackend :
     IInferenceBackend,
+    IInferenceDeviceMemoryPressureSource,
     ISequenceMigrationTransportBackend
 {
     private readonly OnnxRuntimeBackend _inner;
@@ -43,6 +44,10 @@ public sealed class OnnxRuntimeMigratableBackend :
     public DeviceId Device => _inner.Device;
     public ModelId ModelId => _inner.ModelId;
     public bool IsInitialized => _inner.IsInitialized;
+
+    public bool TryGetDeviceMemoryPressure(
+        out InferenceDeviceMemoryPressure pressure) =>
+        _inner.TryGetDeviceMemoryPressure(out pressure);
 
     public ValueTask InitializeAsync(CancellationToken cancellationToken = default) =>
         _inner.InitializeAsync(cancellationToken);

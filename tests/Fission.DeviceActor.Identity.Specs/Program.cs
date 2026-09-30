@@ -24,6 +24,16 @@ var kvPool = new KvPagePool(capacity: 8, tokensPerPage: 4);
 using var runtime = new ExecutionPlanExecutor(device, kvPagePool: kvPool);
 var scheduled = new ScheduledBatchExecutor(runtime);
 
+var memoryPressure = runtime.GetDeviceMemoryPressure();
+Require(memoryPressure.Count == 1,
+    "Runtime must surface one memory-pressure snapshot from its reporting device actor.");
+Require(memoryPressure[0].Device == deviceId &&
+        memoryPressure[0].ActiveBytes == 64 &&
+        memoryPressure[0].ReclaimableBytes == 32 &&
+        memoryPressure[0].ReservedBytes == 96 &&
+        memoryPressure[0].PeakReservedBytes == 128,
+    "Runtime memory-pressure feedback must preserve physical device identity and byte accounting.");
+
 var first = SequenceId.New();
 var second = SequenceId.New();
 var batch = new ScheduledBatch(
@@ -81,9 +91,12 @@ Require(backend.DisposeCount == 1, "Backend cleanup must run exactly once after 
 
 Console.WriteLine(
     $"Fission device actor identity specs passed: batch={backend.LastPrefillBatchSize}, " +
-    $"positions={firstSequence.Position},{secondSequence.Position}, kv={kvPool.AllocatedPages}.");
+    $"positions={firstSequence.Position},{secondSequence.Position}, kv={kvPool.AllocatedPages}, " +
+    $"deviceReserved={memoryPressure[0].ReservedBytes}.");
 
-sealed class MisorderedBackend : IInferenceBackend
+sealed class MisorderedBackend :
+    IInferenceBackend,
+    IInferenceDeviceMemoryPressureSource
 {
     private bool _initialized;
 
@@ -97,6 +110,17 @@ sealed class MisorderedBackend : IInferenceBackend
     public int PrefillCalls { get; private set; }
     public int LastPrefillBatchSize { get; private set; }
     public int DisposeCount { get; private set; }
+
+    public bool TryGetDeviceMemoryPressure(
+        out InferenceDeviceMemoryPressure pressure)
+    {
+        pressure = new InferenceDeviceMemoryPressure(
+            ActiveBytes: 64,
+            ReclaimableBytes: 32,
+            ReservedBytes: 96,
+            PeakReservedBytes: 128);
+        return true;
+    }
 
     public ValueTask InitializeAsync(CancellationToken cancellationToken = default)
     {

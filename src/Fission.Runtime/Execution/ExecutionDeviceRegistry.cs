@@ -88,4 +88,27 @@ public sealed class ExecutionDeviceRegistry
 
     internal int GetInferenceCapacity(DeviceId actorDevice) =>
         ResolveRegistered(actorDevice).InferenceCapacity;
+
+    internal IReadOnlyList<RuntimeDeviceMemoryPressure> GetDeviceMemoryPressure()
+    {
+        var pressure = new List<RuntimeDeviceMemoryPressure>(_devices.Count);
+        foreach (var (deviceId, executor) in _devices.OrderBy(
+                     static pair => pair.Key.Value,
+                     StringComparer.Ordinal))
+        {
+            if (!executor.TryGetDeviceMemoryPressure(out var snapshot))
+            {
+                continue;
+            }
+
+            pressure.Add(new RuntimeDeviceMemoryPressure(
+                deviceId,
+                snapshot.ActiveBytes,
+                snapshot.ReclaimableBytes,
+                snapshot.ReservedBytes,
+                snapshot.PeakReservedBytes));
+        }
+
+        return pressure;
+    }
 }

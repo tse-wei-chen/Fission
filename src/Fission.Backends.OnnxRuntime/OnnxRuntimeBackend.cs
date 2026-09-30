@@ -11,7 +11,8 @@ public sealed record OnnxRuntimeBackendOptions(
     int? IntraOpNumThreads = null,
     int? InterOpNumThreads = null,
     GraphOptimizationLevel GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
-    OnnxSessionContract? SessionContract = null);
+    OnnxSessionContract? SessionContract = null,
+    IInferenceDeviceMemoryPressureSource? DeviceMemoryPressureSource = null);
 
 /// <summary>
 /// ONNX Runtime session host. Model-specific tensor names, shapes, KV schemas,
@@ -20,11 +21,14 @@ public sealed record OnnxRuntimeBackendOptions(
 /// A configured session contract, or a contract supplied by the adapter, validates
 /// the live graph signature before the adapter initializes model-owned state.
 /// </summary>
-public sealed class OnnxRuntimeBackend : IInferenceBackend
+public sealed class OnnxRuntimeBackend :
+    IInferenceBackend,
+    IInferenceDeviceMemoryPressureSource
 {
     private readonly OnnxRuntimeBackendOptions _options;
     private readonly IOnnxRuntimeExecutionAdapter _adapter;
     private readonly Func<SessionOptions>? _sessionOptionsFactory;
+    private readonly IInferenceDeviceMemoryPressureSource? _deviceMemoryPressureSource;
     private InferenceSession? _session;
     private int _disposed;
 
@@ -54,12 +58,28 @@ public sealed class OnnxRuntimeBackend : IInferenceBackend
         _options = options;
         _adapter = adapter;
         _sessionOptionsFactory = sessionOptionsFactory;
+        _deviceMemoryPressureSource =
+            options.DeviceMemoryPressureSource ??
+            adapter as IInferenceDeviceMemoryPressureSource;
     }
 
     public string Name => $"onnxruntime/{_adapter.Name}";
     public DeviceId Device => _options.Device;
     public ModelId ModelId => _options.ModelId;
     public bool IsInitialized => _session is not null;
+
+    public bool TryGetDeviceMemoryPressure(
+        out InferenceDeviceMemoryPressure pressure)
+    {
+        if (Volatile.Read(ref _disposed) != 0 ||
+            _deviceMemoryPressureSource is null)
+        {
+            pressure = default;
+            return false;
+        }
+
+        return _deviceMemoryPressureSource.TryGetDeviceMemoryPressure(out pressure);
+    }
 
     public async ValueTask InitializeAsync(
         CancellationToken cancellationToken = default)
