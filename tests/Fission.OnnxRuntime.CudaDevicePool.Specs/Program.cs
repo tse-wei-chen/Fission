@@ -179,18 +179,66 @@ Require(secondPool.Statistics.Returns == 1 && secondPool.Statistics.Drops == 1 &
         secondPool.Statistics.ActiveBuffers == 0 && secondPool.Statistics.ReservedBytes == 0,
     "Post-disposal return must clear active residency and be observable as a dropped buffer.");
 
+using var mallocEntered = new ManualResetEventSlim(initialState: false);
+using var continueMalloc = new ManualResetEventSlim(initialState: false);
+var racingCuda = new FakeCudaDeviceMemoryApi(
+    initialDevice: 9,
+    mallocEntered,
+    continueMalloc);
+using var racingPool = new CudaPooledDeviceMemoryAllocator(
+    racingCuda,
+    new CudaDeviceMemoryPoolOptions
+    {
+        MaxRetainedBytes = 64,
+        MaxRetainedBuffersPerSize = 2
+    },
+    new CudaDeviceMemoryAllocatorOptions { DeviceId = deviceId });
+var raceTask = Task.Run(() =>
+{
+    try
+    {
+        using var unexpected = racingPool.Allocate(24);
+        return false;
+    }
+    catch (ObjectDisposedException)
+    {
+        return true;
+    }
+});
+var enteredMalloc = mallocEntered.Wait(TimeSpan.FromSeconds(5));
+if (!enteredMalloc)
+{
+    continueMalloc.Set();
+}
+Require(enteredMalloc,
+    "Allocate/dispose race spec must observe the native allocation in flight.");
+racingPool.Dispose();
+continueMalloc.Set();
+Require(raceTask.GetAwaiter().GetResult(),
+    "A native allocation completing after pool disposal must not escape as a caller lease.");
+Require(racingCuda.MallocCalls == 1 && racingCuda.FreeCalls == 1 &&
+        racingCuda.ActivePointers.Count == 0,
+    "A post-disposal native allocation must be synchronously released exactly once.");
+var afterRace = racingPool.Statistics;
+Require(afterRace.NativeAllocations == 1 && afterRace.ActiveBuffers == 0 &&
+        afterRace.RetainedBuffers == 0 && afterRace.ReservedBytes == 0,
+    "Rejected post-disposal allocation must not appear as active or retained residency.");
+
 Require(cuda.MallocDevices.All(static current => current == deviceId) &&
         cuda.FreeDevices.All(static current => current == deviceId),
     "Every pooled cudaMalloc/cudaFree must execute under the configured device ordinal.");
 Require(cuda.CurrentDevice == 9,
     "Pooled allocation and release must restore the caller's ambient CUDA device.");
+Require(racingCuda.MallocDevices.All(static current => current == deviceId) &&
+        racingCuda.FreeDevices.All(static current => current == deviceId),
+    "Allocate/dispose race cleanup must preserve explicit CUDA device scoping.");
 
 Console.WriteLine(
     $"Fission CUDA device pool specs passed: native={pool.Statistics.NativeAllocations}, " +
     $"reuse={pool.Statistics.Reuses}, returns={pool.Statistics.Returns}, " +
     $"drops={pool.Statistics.Drops}, trimmed={pool.Statistics.TrimmedBytes}B, " +
     $"peak-reserved={pool.Statistics.PeakReservedBytes}B, " +
-    $"mallocs={cuda.MallocCalls}, frees={cuda.FreeCalls}.");
+    $"mallocs={cuda.MallocCalls}, frees={cuda.FreeCalls}. Race cleanup verified.");
 
 sealed class FakeCudaDeviceMemoryApi : ICudaDeviceMemoryApi
 {
@@ -199,12 +247,19 @@ sealed class FakeCudaDeviceMemoryApi : ICudaDeviceMemoryApi
     private readonly HashSet<nint> _activePointers = new();
     private readonly List<int> _mallocDevices = new();
     private readonly List<int> _freeDevices = new();
+    private readonly ManualResetEventSlim? _mallocEntered;
+    private readonly ManualResetEventSlim? _continueMalloc;
     private int _mallocCalls;
     private int _freeCalls;
 
-    public FakeCudaDeviceMemoryApi(int initialDevice)
+    public FakeCudaDeviceMemoryApi(
+        int initialDevice,
+        ManualResetEventSlim? mallocEntered = null,
+        ManualResetEventSlim? continueMalloc = null)
     {
         _currentDevice = new ThreadLocal<int>(() => initialDevice);
+        _mallocEntered = mallocEntered;
+        _continueMalloc = continueMalloc;
     }
 
     public int CurrentDevice => _currentDevice.Value;
@@ -258,6 +313,9 @@ sealed class FakeCudaDeviceMemoryApi : ICudaDeviceMemoryApi
 
     public int Malloc(out nint pointer, nuint byteLength)
     {
+        _mallocEntered?.Set();
+        _continueMalloc?.Wait();
+
         pointer = Marshal.AllocHGlobal(checked((int)byteLength));
         Interlocked.Increment(ref _mallocCalls);
         lock (_gate)
