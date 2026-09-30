@@ -272,13 +272,15 @@ var pressureCycle = await pressureEngine.RunCycleAsync(
     baseTime.AddSeconds(4.5).AddMilliseconds(1));
 Require(pressureBackend.ReclaimCount == 1,
     "Engine must reclaim idle device residency when physical headroom blocks scheduling.");
-Require(pressureBackend.ReclaimableDeviceBytes == 0,
-    "Blocked device admission should trim reclaimable idle residency before retrying scheduling.");
-Require(pressureCycle.Batch.Items.Count == 1 && pressureCycle.Batch.Items[0].TokenGrant == 3,
-    "After reclaim, 384 bytes of physical headroom at 128 bytes/token must admit three prefill tokens.");
 Require(
-    pressureRuntime.TryGetSequence(pressureLimited, out var pressureSequence) && pressureSequence?.Position == 3,
-    "Device-memory-limited prefill must execute the post-reclaim scheduler grant.");
+    pressureBackend.LastReclaimTargetReclaimableBytes == 256 &&
+    pressureBackend.ReclaimableDeviceBytes == 256,
+    "Engine should release only the 256 bytes required to bring residency under the cap and admit one work quantum.");
+Require(pressureCycle.Batch.Items.Count == 1 && pressureCycle.Batch.Items[0].TokenGrant == 1,
+    "Selective reclaim should create exactly one 128-byte work quantum of headroom instead of draining the idle cache.");
+Require(
+    pressureRuntime.TryGetSequence(pressureLimited, out var pressureSequence) && pressureSequence?.Position == 1,
+    "Device-memory-limited prefill must execute the post-reclaim one-token scheduler grant.");
 var pressureCancelled = await pressureEngine.CancelAsync(pressureLimited);
 Require(pressureCancelled.FinishReason == InferenceFinishReason.Cancelled,
     "Device-memory budget test request must remain cancellable after partial prefill.");
@@ -335,6 +337,7 @@ Console.WriteLine(
     $"manual={snapshotA.GeneratedTokens.Count + snapshotB.GeneratedTokens.Count}, " +
     $"streamed={streamed[0].Length + streamed[1].Length}, backendReleases={trackingBackend.ReleaseCount}, " +
     $"byteGrant={byteFirstCycle.Batch.ConsumedKvBytes}, deviceReclaims={pressureBackend.ReclaimCount}, " +
+    $"deviceReclaimTarget={pressureBackend.LastReclaimTargetReclaimableBytes}, " +
     $"deviceClamp={capacityCycles.Max(static cycle => cycle.Batch.Items.Count)}, " +
     $"kv={kvPool.AllocatedPages}/{kvPool.Capacity}.");
 
@@ -373,6 +376,7 @@ sealed class TrackingStateBackend :
     public int ActiveSequenceCount => _active.Count;
     public int ReleaseCount { get; private set; }
     public int ReclaimCount { get; private set; }
+    public long LastReclaimTargetReclaimableBytes { get; private set; } = -1;
     public long ReclaimableDeviceBytes => _reclaimableDeviceBytes;
     public IReadOnlySet<SequenceId> ReleasedSequences => _released;
 
@@ -401,6 +405,7 @@ sealed class TrackingStateBackend :
         var released = _reclaimableDeviceBytes - retained;
         _reclaimableDeviceBytes = retained;
         ReclaimCount++;
+        LastReclaimTargetReclaimableBytes = targetReclaimableBytes;
         return ValueTask.FromResult(new InferenceDeviceMemoryReclaimResult(
             ReleasedBytes: released,
             ReclaimableBytes: retained,
