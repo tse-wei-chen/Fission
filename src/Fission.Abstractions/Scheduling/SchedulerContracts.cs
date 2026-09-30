@@ -19,18 +19,30 @@ public readonly record struct SchedulingCandidate(
     int Position,
     int TokensPerKvPage,
     int Priority,
-    long KvBytesPerToken = 0);
+    long KvBytesPerToken = 0,
+    DeviceId? ExecutionDevice = null);
 
 /// <summary>
-/// Physical KV byte slack is used by two independent scheduler constraints:
-/// retained incremental growth and temporary immutable successor-frontier peak.
-/// Both are checked against the same currently available device-memory slack.
+/// Physical device-memory headroom available for additional transient allocations
+/// on one execution device. Existing active and idle-resident allocations are
+/// already charged before this value reaches the scheduling kernel.
+/// </summary>
+public readonly record struct SchedulingDeviceMemoryBudget(
+    DeviceId Device,
+    long AvailableBytes);
+
+/// <summary>
+/// Logical retained-KV byte slack remains independent from physical device-memory
+/// headroom. The scheduler checks retained and immutable-successor KV constraints
+/// against AvailableKvBytes, while DeviceMemory applies an additional per-device
+/// transient allocation constraint when supplied.
 /// </summary>
 public readonly record struct SchedulingBudget(
     int MaxBatchTokens,
     int AvailableKvPages,
     int MaxBatchSequences,
-    long AvailableKvBytes = long.MaxValue);
+    long AvailableKvBytes = long.MaxValue,
+    IReadOnlyList<SchedulingDeviceMemoryBudget>? DeviceMemory = null);
 
 public readonly record struct SchedulingPolicyOptions(
     int DecodeTokenReserve,
@@ -44,6 +56,7 @@ public enum SchedulingDeferralReason
     KvBudget,
     KvByteBudget,
     TransientKvByteBudget,
+    DeviceMemoryBudget,
     BatchSequenceBudget
 }
 

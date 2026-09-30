@@ -22,7 +22,8 @@ let mk sequenceId phase priority deadline enqueuedAt tokenDemand position tokens
       Position = position
       TokensPerKvPage = tokensPerKvPage
       Priority = priority
-      KvBytesPerToken = 0L }
+      KvBytesPerToken = 0L
+      ExecutionDevice = None }
 
 let policy =
     { DecodeTokenReserve = 2
@@ -33,7 +34,8 @@ let budget =
     { MaxBatchTokens = 8
       AvailableKvPages = 2
       MaxBatchSequences = 3
-      AvailableKvBytes = Int64.MaxValue }
+      AvailableKvBytes = Int64.MaxValue
+      AvailableDeviceBytes = [] }
 
 let decodeA =
     mk
@@ -174,7 +176,8 @@ let pressureBudget =
     { MaxBatchTokens = 16
       AvailableKvPages = 1
       MaxBatchSequences = 1
-      AvailableKvBytes = Int64.MaxValue }
+      AvailableKvBytes = Int64.MaxValue
+      AvailableDeviceBytes = [] }
 
 let pressurePrefill =
     mk (sid "00000000-0000-0000-0000-000000000016") Prefilling 0 None now 16 0 blockSize
@@ -193,7 +196,8 @@ let bytePressureBudget =
     { MaxBatchTokens = 16
       AvailableKvPages = 16
       MaxBatchSequences = 1
-      AvailableKvBytes = 512L }
+      AvailableKvBytes = 512L
+      AvailableDeviceBytes = [] }
 
 let bytePressureDecision =
     Scheduler.scheduleAt now bytePressureBudget pressurePolicy [ bytePressurePrefill ]
@@ -232,7 +236,8 @@ let transientBudget =
     { MaxBatchTokens = 1
       AvailableKvPages = 16
       MaxBatchSequences = 1
-      AvailableKvBytes = 512L }
+      AvailableKvBytes = 512L
+      AvailableDeviceBytes = [] }
 
 let transientFitsDecision =
     Scheduler.scheduleAt now transientBudget admissionPolicy [ transientFits ]
@@ -251,7 +256,8 @@ let noPageBudget =
     { MaxBatchTokens = 4
       AvailableKvPages = 0
       MaxBatchSequences = 1
-      AvailableKvBytes = Int64.MaxValue }
+      AvailableKvBytes = Int64.MaxValue
+      AvailableDeviceBytes = [] }
 
 let decodeInsidePage =
     mk (sid "00000000-0000-0000-0000-000000000017") Decoding 0 None now 1 3 blockSize
@@ -268,7 +274,8 @@ let oneSlotBudget =
     { MaxBatchTokens = 4
       AvailableKvPages = 1
       MaxBatchSequences = 1
-      AvailableKvBytes = Int64.MaxValue }
+      AvailableKvBytes = Int64.MaxValue
+      AvailableDeviceBytes = [] }
 
 let urgentLowPriority =
     mk
@@ -339,8 +346,40 @@ require
      && deterministicRight.Selected.Head.Sequence.SequenceId = tieA.SequenceId)
     "Stable sequence-id tie breaking must make scheduling independent of input order."
 
+let deviceA = DeviceId("cuda:device-budget-a")
+let deviceB = DeviceId("cuda:device-budget-b")
+let devicePrefillA =
+    { mk (sid "00000000-0000-0000-0000-000000000040") Prefilling 0 None now 1 0 blockSize with
+        KvBytesPerToken = 128L
+        ExecutionDevice = Some deviceA }
+let devicePrefillB =
+    { mk (sid "00000000-0000-0000-0000-000000000041") Prefilling 0 None now 1 0 blockSize with
+        KvBytesPerToken = 128L
+        ExecutionDevice = Some deviceB }
+let splitDeviceBudget =
+    { MaxBatchTokens = 2
+      AvailableKvPages = 16
+      MaxBatchSequences = 2
+      AvailableKvBytes = Int64.MaxValue
+      AvailableDeviceBytes = [ deviceA, 128L; deviceB, 128L ] }
+let splitDeviceDecision =
+    Scheduler.scheduleAt now splitDeviceBudget admissionPolicy [ devicePrefillA; devicePrefillB ]
+require
+    (splitDeviceDecision.Selected.Length = 2)
+    "Independent devices must consume independent physical-memory headroom."
+
+let sameDevicePrefillB =
+    { devicePrefillB with ExecutionDevice = Some deviceA }
+let sameDeviceDecision =
+    Scheduler.scheduleAt now splitDeviceBudget admissionPolicy [ devicePrefillA; sameDevicePrefillB ]
+require
+    (sameDeviceDecision.Selected.Length = 1
+     && sameDeviceDecision.Deferred.Length = 1
+     && sameDeviceDecision.Deferred.Head.Reason = DeviceMemoryBudget)
+    "Two successor frontiers on one device must share that device's physical headroom."
+
 printfn
-    "Fission scheduler specs passed: selected=%d tokens=%d kvPages=%d kvBytes=%d transientKvBytes=%d rejected=%d bytePressureGrant=%d"
+    "Fission scheduler specs passed: selected=%d tokens=%d kvPages=%d kvBytes=%d transientKvBytes=%d rejected=%d bytePressureGrant=%d deviceBudget=%d/%d"
     mixedDecision.Selected.Length
     mixedDecision.ConsumedTokens
     mixedDecision.ConsumedKvPages
@@ -348,3 +387,5 @@ printfn
     transientFitsDecision.ConsumedTransientKvBytes
     admissionDecision.Rejected.Length
     bytePressureDecision.Selected.Head.TokenGrant
+    splitDeviceDecision.Selected.Length
+    sameDeviceDecision.Selected.Length

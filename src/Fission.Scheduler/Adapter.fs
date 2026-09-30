@@ -28,7 +28,12 @@ type SchedulingKernel() =
           Position = candidate.Position
           TokensPerKvPage = candidate.TokensPerKvPage
           Priority = candidate.Priority
-          KvBytesPerToken = candidate.KvBytesPerToken }
+          KvBytesPerToken = candidate.KvBytesPerToken
+          ExecutionDevice =
+            if candidate.ExecutionDevice.HasValue then
+                Some candidate.ExecutionDevice.Value
+            else
+                None }
 
     let toDeferralReason reason =
         match reason with
@@ -37,6 +42,7 @@ type SchedulingKernel() =
         | KvBudget -> SchedulingDeferralReason.KvBudget
         | KvByteBudget -> SchedulingDeferralReason.KvByteBudget
         | TransientKvByteBudget -> SchedulingDeferralReason.TransientKvByteBudget
+        | DeviceMemoryBudget -> SchedulingDeferralReason.DeviceMemoryBudget
         | BatchSequenceBudget -> SchedulingDeferralReason.BatchSequenceBudget
 
     let toRejectionReason reason =
@@ -52,11 +58,20 @@ type SchedulingKernel() =
 
     interface ISchedulingKernel with
         member _.Schedule(scheduleId, now, budget, policy, candidates) =
+            let availableDeviceBytes =
+                match budget.DeviceMemory with
+                | null -> []
+                | deviceMemory ->
+                    deviceMemory
+                    |> Seq.map (fun item -> item.Device, item.AvailableBytes)
+                    |> Seq.toList
+
             let resourceBudget : ResourceBudget =
                 { MaxBatchTokens = budget.MaxBatchTokens
                   AvailableKvPages = budget.AvailableKvPages
                   MaxBatchSequences = budget.MaxBatchSequences
-                  AvailableKvBytes = budget.AvailableKvBytes }
+                  AvailableKvBytes = budget.AvailableKvBytes
+                  AvailableDeviceBytes = availableDeviceBytes }
 
             let schedulingPolicy : SchedulingPolicy =
                 { DecodeTokenReserve = policy.DecodeTokenReserve

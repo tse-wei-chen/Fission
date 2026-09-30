@@ -16,7 +16,8 @@ module Scheduler =
           UsedTokens: int
           UsedKvPages: int
           UsedKvBytes: int64
-          UsedTransientKvBytes: int64 }
+          UsedTransientKvBytes: int64
+          UsedDeviceTransientBytes: (Fission.Abstractions.DeviceId * int64) list }
 
     let private isRunnable (sequence: ReadySequence) =
         sequence.Phase = Prefilling || sequence.Phase = Decoding
@@ -98,9 +99,9 @@ module Scheduler =
             if writable > int64 Int32.MaxValue then Int32.MaxValue else int writable
 
     // Dense immutable decoder execution temporarily owns both the prior frontier
-    // (already included in retained device usage) and the full successor frontier.
-    // The successor therefore has to fit entirely inside the remaining physical
-    // byte slack. This is deliberately conservative for future paged/COW backends.
+    // and the full successor frontier. The same successor-frontier estimate is
+    // used both for logical transient-KV policy and for per-device physical
+    // headroom, while the two budgets remain independently observable.
     let private tokensWritableWithTransientKvBytes (sequence: ReadySequence) (availableBytes: int64) =
         if sequence.KvBytesPerToken = 0L then
             Int32.MaxValue
@@ -116,6 +117,22 @@ module Scheduler =
             0L
         else
             (int64 sequence.Position + int64 tokenGrant) * sequence.KvBytesPerToken
+
+    let private tryFindDeviceBudget (budget: ResourceBudget) device =
+        budget.AvailableDeviceBytes
+        |> List.tryPick (fun (candidate, availableBytes) ->
+            if candidate = device then Some availableBytes else None)
+
+    let private usedDeviceBytes (state: SelectionState) device =
+        state.UsedDeviceTransientBytes
+        |> List.tryPick (fun (candidate, usedBytes) ->
+            if candidate = device then Some usedBytes else None)
+        |> Option.defaultValue 0L
+
+    let private addDeviceBytes device byteGrant used =
+        let withoutDevice = used |> List.filter (fun (candidate, _) -> candidate <> device)
+        (device, usedDeviceBytes { SelectedRev = []; DeferredRev = []; SelectedCount = 0; UsedTokens = 0; UsedKvPages = 0; UsedKvBytes = 0L; UsedTransientKvBytes = 0L; UsedDeviceTransientBytes = used } device + byteGrant)
+        :: withoutDevice
 
     let private classifyAdmission (sequence: ReadySequence) =
         if not (isRunnable sequence) then
@@ -163,18 +180,30 @@ module Scheduler =
                 let availableTransientKvBytes = budget.AvailableKvBytes - state.UsedTransientKvBytes
                 let transientKvByteTokenCapacity =
                     tokensWritableWithTransientKvBytes sequence availableTransientKvBytes
+                let deviceMemoryTokenCapacity =
+                    match sequence.ExecutionDevice with
+                    | Some device ->
+                        match tryFindDeviceBudget budget device with
+                        | Some availableBytes ->
+                            let remainingBytes = availableBytes - usedDeviceBytes state device
+                            tokensWritableWithTransientKvBytes sequence remainingBytes
+                        | None -> Int32.MaxValue
+                    | None -> Int32.MaxValue
                 let tokenGrant =
                     min
                         desiredTokens
                         (min
                             availableTokens
-                            (min kvTokenCapacity (min kvByteTokenCapacity transientKvByteTokenCapacity)))
+                            (min
+                                kvTokenCapacity
+                                (min kvByteTokenCapacity (min transientKvByteTokenCapacity deviceMemoryTokenCapacity))))
 
                 if tokenGrant <= 0 then
                     let reason =
                         if kvTokenCapacity <= 0 then KvBudget
                         elif kvByteTokenCapacity <= 0 then KvByteBudget
                         elif transientKvByteTokenCapacity <= 0 then TransientKvByteBudget
+                        elif deviceMemoryTokenCapacity <= 0 then DeviceMemoryBudget
                         else TokenBudget
                     { state with
                         DeferredRev = { Sequence = sequence; Reason = reason } :: state.DeferredRev },
@@ -183,6 +212,11 @@ module Scheduler =
                     let kvPageGrant = kvPagesForGrant sequence tokenGrant
                     let kvByteGrant = int64 tokenGrant * sequence.KvBytesPerToken
                     let transientKvByteGrant = transientKvBytesForGrant sequence tokenGrant
+                    let nextDeviceUsage =
+                        match sequence.ExecutionDevice with
+                        | Some device when tryFindDeviceBudget budget device |> Option.isSome ->
+                            addDeviceBytes device transientKvByteGrant state.UsedDeviceTransientBytes
+                        | _ -> state.UsedDeviceTransientBytes
                     { state with
                         SelectedRev =
                             { Sequence = sequence
@@ -195,7 +229,8 @@ module Scheduler =
                         UsedTokens = state.UsedTokens + tokenGrant
                         UsedKvPages = state.UsedKvPages + kvPageGrant
                         UsedKvBytes = state.UsedKvBytes + kvByteGrant
-                        UsedTransientKvBytes = state.UsedTransientKvBytes + transientKvByteGrant },
+                        UsedTransientKvBytes = state.UsedTransientKvBytes + transientKvByteGrant
+                        UsedDeviceTransientBytes = nextDeviceUsage },
                     true
 
     let private reserveDecodeTokens
@@ -228,6 +263,10 @@ module Scheduler =
         if budget.AvailableKvPages < 0 then invalidArg "AvailableKvPages" "AvailableKvPages cannot be negative."
         if budget.MaxBatchSequences < 0 then invalidArg "MaxBatchSequences" "MaxBatchSequences cannot be negative."
         if budget.AvailableKvBytes < 0L then invalidArg "AvailableKvBytes" "AvailableKvBytes cannot be negative."
+        if budget.AvailableDeviceBytes |> List.exists (fun (_, availableBytes) -> availableBytes < 0L) then
+            invalidArg "AvailableDeviceBytes" "Available device bytes cannot be negative."
+        if (budget.AvailableDeviceBytes |> List.distinctBy fst |> List.length) <> budget.AvailableDeviceBytes.Length then
+            invalidArg "AvailableDeviceBytes" "Each execution device may appear only once in the device-memory budget."
         if policy.DecodeTokenReserve < 0 then invalidArg "DecodeTokenReserve" "DecodeTokenReserve cannot be negative."
         if policy.MaxPrefillChunkTokens <= 0 then invalidArg "MaxPrefillChunkTokens" "MaxPrefillChunkTokens must be positive."
         if policy.DeadlineUrgencyWindow < TimeSpan.Zero then invalidArg "DeadlineUrgencyWindow" "DeadlineUrgencyWindow cannot be negative."
@@ -259,7 +298,8 @@ module Scheduler =
               UsedTokens = 0
               UsedKvPages = 0
               UsedKvBytes = 0L
-              UsedTransientKvBytes = 0L }
+              UsedTransientKvBytes = 0L
+              UsedDeviceTransientBytes = [] }
 
         let afterReserve, remainingDecodes =
             reserveDecodeTokens budget policy orderedDecodes initialState
