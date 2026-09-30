@@ -37,6 +37,11 @@ Require(firstActive.ActiveBuffers == 2 && firstActive.ActiveBytes == 32 &&
     "Fresh cohort allocations must be visible as active CUDA residency.");
 Require(firstActive.PeakActiveBytes == 32 && firstActive.PeakReservedBytes == 32,
     "First cohort must establish the initial active/reserved high-water marks.");
+Require(pool.TryGetDeviceMemoryPressure(out var firstPressure) &&
+        firstPressure.ActiveBytes == 32 && firstPressure.NonReclaimableBytes == 32 &&
+        firstPressure.ReclaimableBytes == 0 && firstPressure.ReservedBytes == 32 &&
+        firstPressure.PeakReservedBytes == 32,
+    "CUDA pool must expose active residency through the generic device-pressure capability.");
 firstArena.Release();
 
 var afterFirstReturn = pool.Statistics;
@@ -48,6 +53,10 @@ Require(afterFirstReturn.Returns == 2 && afterFirstReturn.Drops == 0 &&
 Require(afterFirstReturn.ActiveBuffers == 0 && afterFirstReturn.ActiveBytes == 0 &&
         afterFirstReturn.ReservedBytes == 32,
     "Returned buffers must move from active to retained without changing reserved CUDA bytes.");
+Require(pool.TryGetDeviceMemoryPressure(out var retainedPressure) &&
+        retainedPressure.ActiveBytes == 0 && retainedPressure.ReclaimableBytes == 32 &&
+        retainedPressure.ReservedBytes == 32,
+    "Returned idle CUDA allocations must become reclaimable pressure rather than disappearing from residency.");
 
 var secondArena = new CudaDecoderOrtCohortArena(
     position: 2,
@@ -116,6 +125,10 @@ var afterPartialTrim = pool.Statistics;
 Require(afterPartialTrim.TrimmedBuffers == 1 && afterPartialTrim.TrimmedBytes == 16 &&
         afterPartialTrim.ReservedBytes == 16,
     "Trim accounting must track cumulative explicitly reclaimed CUDA residency.");
+Require(pool.TryGetDeviceMemoryPressure(out var trimmedPressure) &&
+        trimmedPressure.ActiveBytes == 0 && trimmedPressure.ReclaimableBytes == 16 &&
+        trimmedPressure.ReservedBytes == 16 && trimmedPressure.PeakReservedBytes == 48,
+    "Generic device pressure must immediately observe reclaimed idle CUDA bytes while preserving the peak.");
 
 var noOpTrim = pool.TrimRetained(targetRetainedBytes: 16);
 Require(noOpTrim.ReleasedBuffers == 0 && noOpTrim.ReleasedBytes == 0 &&
@@ -137,6 +150,8 @@ Require(cuda.FreeCalls == 4 && cuda.ActivePointers.Count == 0,
 Require(pool.Statistics.RetainedBuffers == 0 && pool.Statistics.RetainedBytes == 0 &&
         pool.Statistics.ActiveBuffers == 0 && pool.Statistics.ReservedBytes == 0,
     "Disposed pool must report no active or retained device memory.");
+Require(!pool.TryGetDeviceMemoryPressure(out _),
+    "Disposed CUDA pool must stop advertising a live device-pressure snapshot.");
 
 var allocateAfterDisposeFailed = false;
 try
@@ -238,7 +253,7 @@ Console.WriteLine(
     $"reuse={pool.Statistics.Reuses}, returns={pool.Statistics.Returns}, " +
     $"drops={pool.Statistics.Drops}, trimmed={pool.Statistics.TrimmedBytes}B, " +
     $"peak-reserved={pool.Statistics.PeakReservedBytes}B, " +
-    $"mallocs={cuda.MallocCalls}, frees={cuda.FreeCalls}. Race cleanup verified.");
+    $"mallocs={cuda.MallocCalls}, frees={cuda.FreeCalls}. Pressure capability and race cleanup verified.");
 
 sealed class FakeCudaDeviceMemoryApi : ICudaDeviceMemoryApi
 {
