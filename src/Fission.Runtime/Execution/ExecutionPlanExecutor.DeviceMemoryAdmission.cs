@@ -10,11 +10,18 @@ internal readonly record struct RuntimeDeviceMemoryReservationSnapshot(
     DeviceId Device,
     long Bytes);
 
+internal sealed record RuntimeDeviceMemoryReservationState(
+    long ReleaseVersion,
+    IReadOnlyList<RuntimeDeviceMemoryReservationSnapshot> Reservations);
+
 public sealed partial class ExecutionPlanExecutor
 {
     private readonly SemaphoreSlim _deviceMemoryAdmissionGate = new(1, 1);
     private readonly object _deviceMemoryReservationGate = new();
     private readonly Dictionary<DeviceId, long> _deviceMemoryReservations = new();
+    private long _deviceMemoryReservationReleaseVersion;
+    private TaskCompletionSource<long> _deviceMemoryReservationReleased =
+        CreateReservationReleaseSignal();
 
     /// <summary>
     /// Serializes pressure observation, optional reclaim, scheduling, and transient
@@ -39,17 +46,42 @@ public sealed partial class ExecutionPlanExecutor
     }
 
     internal IReadOnlyList<RuntimeDeviceMemoryReservationSnapshot>
-        GetDeviceMemoryReservations()
+        GetDeviceMemoryReservations() =>
+        GetDeviceMemoryReservationState().Reservations;
+
+    internal RuntimeDeviceMemoryReservationState GetDeviceMemoryReservationState()
     {
         lock (_deviceMemoryReservationGate)
         {
-            return _deviceMemoryReservations
-                .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal)
-                .Select(static pair => new RuntimeDeviceMemoryReservationSnapshot(
-                    pair.Key,
-                    pair.Value))
-                .ToArray();
+            return new RuntimeDeviceMemoryReservationState(
+                _deviceMemoryReservationReleaseVersion,
+                _deviceMemoryReservations
+                    .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal)
+                    .Select(static pair => new RuntimeDeviceMemoryReservationSnapshot(
+                        pair.Key,
+                        pair.Value))
+                    .ToArray());
         }
+    }
+
+    internal Task WaitForDeviceMemoryReservationReleaseAsync(
+        long observedReleaseVersion,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+        Task<long> signal;
+        lock (_deviceMemoryReservationGate)
+        {
+            if (_deviceMemoryReservationReleaseVersion != observedReleaseVersion)
+            {
+                return Task.CompletedTask;
+            }
+
+            signal = _deviceMemoryReservationReleased.Task;
+        }
+
+        return signal.WaitAsync(cancellationToken);
     }
 
     internal IDisposable ReserveDeviceMemory(
@@ -92,6 +124,9 @@ public sealed partial class ExecutionPlanExecutor
     private void ReleaseDeviceMemoryReservations(
         IReadOnlyDictionary<DeviceId, long> reservations)
     {
+        TaskCompletionSource<long> releasedSignal;
+        long releaseVersion;
+
         lock (_deviceMemoryReservationGate)
         {
             foreach (var (device, bytes) in reservations)
@@ -114,8 +149,18 @@ public sealed partial class ExecutionPlanExecutor
                     _deviceMemoryReservations[device] = remaining;
                 }
             }
+
+            releaseVersion = checked(_deviceMemoryReservationReleaseVersion + 1);
+            _deviceMemoryReservationReleaseVersion = releaseVersion;
+            releasedSignal = _deviceMemoryReservationReleased;
+            _deviceMemoryReservationReleased = CreateReservationReleaseSignal();
         }
+
+        releasedSignal.TrySetResult(releaseVersion);
     }
+
+    private static TaskCompletionSource<long> CreateReservationReleaseSignal() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private sealed class AdmissionGateLease : IDisposable
     {
