@@ -260,38 +260,17 @@ public sealed class InferenceEngine : IDisposable
                 _options.MaxBatchSequences,
                 executionCapacity.MaxInferenceItems);
             var availableKvBytes = GetAvailableKvBytes(active);
-            var deviceMemory = GetDeviceMemoryBudgets(candidates);
-            var decision = _scheduler.Schedule(
-                scheduleId,
-                now,
-                new SchedulingBudget(
-                    _options.MaxBatchTokens,
-                    kvBefore.AvailablePages,
-                    maxBatchSequences,
-                    availableKvBytes,
-                    deviceMemory),
-                _options.Scheduling,
-                candidates);
-
-            if (await TryReclaimBlockedDeviceMemoryAsync(
-                    decision,
-                    candidates,
-                    cancellationToken)
-                .ConfigureAwait(false))
-            {
-                deviceMemory = GetDeviceMemoryBudgets(candidates);
-                decision = _scheduler.Schedule(
-                    scheduleId,
-                    now,
-                    new SchedulingBudget(
-                        _options.MaxBatchTokens,
-                        kvBefore.AvailablePages,
+            var (decision, deviceMemoryReservation) =
+                await ScheduleWithDeviceMemoryAdmissionAsync(
+                        scheduleId,
+                        now,
+                        kvBefore,
                         maxBatchSequences,
                         availableKvBytes,
-                        deviceMemory),
-                    _options.Scheduling,
-                    candidates);
-            }
+                        candidates,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            using var reservationLease = deviceMemoryReservation;
 
             var prefillBindings = new Dictionary<SequenceId, ScheduledPrefillBinding>();
             foreach (var item in decision.Batch.Items)
@@ -471,6 +450,86 @@ public sealed class InferenceEngine : IDisposable
         };
     }
 
+    private async ValueTask<(SchedulingKernelResult Decision, IDisposable? Reservation)>
+        ScheduleWithDeviceMemoryAdmissionAsync(
+            Guid scheduleId,
+            DateTimeOffset now,
+            RuntimeKvCapacity kvCapacity,
+            int maxBatchSequences,
+            long availableKvBytes,
+            IReadOnlyList<SchedulingCandidate> candidates,
+            CancellationToken cancellationToken)
+    {
+        if (_options.MaxDeviceBytes is null)
+        {
+            return (
+                ScheduleOnce(
+                    scheduleId,
+                    now,
+                    kvCapacity,
+                    maxBatchSequences,
+                    availableKvBytes,
+                    candidates,
+                    deviceMemory: null),
+                null);
+        }
+
+        using var admission = await _runtime.EnterDeviceMemoryAdmissionAsync(
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        var deviceMemory = GetDeviceMemoryBudgets(candidates);
+        var decision = ScheduleOnce(
+            scheduleId,
+            now,
+            kvCapacity,
+            maxBatchSequences,
+            availableKvBytes,
+            candidates,
+            deviceMemory);
+
+        if (await TryReclaimBlockedDeviceMemoryAsync(
+                decision,
+                candidates,
+                cancellationToken)
+            .ConfigureAwait(false))
+        {
+            deviceMemory = GetDeviceMemoryBudgets(candidates);
+            decision = ScheduleOnce(
+                scheduleId,
+                now,
+                kvCapacity,
+                maxBatchSequences,
+                availableKvBytes,
+                candidates,
+                deviceMemory);
+        }
+
+        var reservation = _runtime.ReserveDeviceMemory(
+            BuildDeviceMemoryReservationRequests(decision, candidates));
+        return (decision, reservation);
+    }
+
+    private SchedulingKernelResult ScheduleOnce(
+        Guid scheduleId,
+        DateTimeOffset now,
+        RuntimeKvCapacity kvCapacity,
+        int maxBatchSequences,
+        long availableKvBytes,
+        IReadOnlyList<SchedulingCandidate> candidates,
+        IReadOnlyList<SchedulingDeviceMemoryBudget>? deviceMemory) =>
+        _scheduler.Schedule(
+            scheduleId,
+            now,
+            new SchedulingBudget(
+                _options.MaxBatchTokens,
+                kvCapacity.AvailablePages,
+                maxBatchSequences,
+                availableKvBytes,
+                deviceMemory),
+            _options.Scheduling,
+            candidates);
+
     private IReadOnlyList<SchedulingDeviceMemoryBudget>? GetDeviceMemoryBudgets(
         IReadOnlyList<SchedulingCandidate> candidates)
     {
@@ -481,6 +540,9 @@ public sealed class InferenceEngine : IDisposable
 
         var pressureByDevice = _runtime.GetDeviceMemoryPressure()
             .ToDictionary(static pressure => pressure.Device);
+        var reservedByDevice = _runtime.GetDeviceMemoryReservations()
+            .ToDictionary(static reservation => reservation.Device,
+                static reservation => reservation.Bytes);
         var devices = candidates
             .Select(static candidate => candidate.ExecutionDevice)
             .Where(static device => device.HasValue)
@@ -499,13 +561,48 @@ public sealed class InferenceEngine : IDisposable
                     $"MaxDeviceBytes requires physical memory pressure from execution device {device}.");
             }
 
-            var availableBytes = pressure.ReservedBytes >= maxDeviceBytes
+            var physicalAvailableBytes = pressure.ReservedBytes >= maxDeviceBytes
                 ? 0L
                 : maxDeviceBytes - pressure.ReservedBytes;
+            reservedByDevice.TryGetValue(device, out var outstandingReservationBytes);
+            var availableBytes = outstandingReservationBytes >= physicalAvailableBytes
+                ? 0L
+                : physicalAvailableBytes - outstandingReservationBytes;
             budgets[index] = new SchedulingDeviceMemoryBudget(device, availableBytes);
         }
 
         return budgets;
+    }
+
+    private IReadOnlyList<RuntimeDeviceMemoryReservationRequest>
+        BuildDeviceMemoryReservationRequests(
+            SchedulingKernelResult decision,
+            IReadOnlyList<SchedulingCandidate> candidates)
+    {
+        var candidateBySequence = candidates.ToDictionary(
+            static candidate => candidate.SequenceId);
+        var bytesByDevice = new Dictionary<DeviceId, long>();
+
+        foreach (var item in decision.Batch.Items)
+        {
+            if (item.TransientKvByteGrant == 0 ||
+                !candidateBySequence.TryGetValue(item.SequenceId, out var candidate) ||
+                candidate.ExecutionDevice is not { } device)
+            {
+                continue;
+            }
+
+            bytesByDevice.TryGetValue(device, out var existing);
+            bytesByDevice[device] = checked(
+                existing + item.TransientKvByteGrant);
+        }
+
+        return bytesByDevice
+            .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal)
+            .Select(static pair => new RuntimeDeviceMemoryReservationRequest(
+                pair.Key,
+                pair.Value))
+            .ToArray();
     }
 
     private async ValueTask<bool> TryReclaimBlockedDeviceMemoryAsync(
@@ -554,6 +651,9 @@ public sealed class InferenceEngine : IDisposable
 
         var pressureByDevice = _runtime.GetDeviceMemoryPressure()
             .ToDictionary(static pressure => pressure.Device);
+        var reservedByDevice = _runtime.GetDeviceMemoryReservations()
+            .ToDictionary(static reservation => reservation.Device,
+                static reservation => reservation.Bytes);
         var shouldReschedule = false;
 
         foreach (var (device, blockedCandidate) in firstBlockedByDevice)
@@ -564,26 +664,28 @@ public sealed class InferenceEngine : IDisposable
             }
 
             selectedTransientByDevice.TryGetValue(device, out var selectedTransientBytes);
+            reservedByDevice.TryGetValue(device, out var outstandingReservationBytes);
             var minimumBlockedTransientBytes = checked(
                 ((long)blockedCandidate.Position + 1L) *
                 blockedCandidate.KvBytesPerToken);
             var requiredTransientBytes = checked(
                 selectedTransientBytes + minimumBlockedTransientBytes);
+            var chargedTransientBytes = checked(
+                outstandingReservationBytes + requiredTransientBytes);
 
             var releaseNeeded = pressure.ReservedBytes >= maxDeviceBytes
                 ? checked(
                     pressure.ReservedBytes - maxDeviceBytes +
-                    requiredTransientBytes)
+                    chargedTransientBytes)
                 : Math.Max(
                     0L,
-                    requiredTransientBytes -
+                    chargedTransientBytes -
                     (maxDeviceBytes - pressure.ReservedBytes));
 
             if (releaseNeeded <= 0)
             {
-                // Pressure may have improved since the scheduler snapshot (for
-                // example another owner released VRAM). Re-run admission once even
-                // when this engine does not need to issue a reclaim control.
+                // Pressure or outstanding reservations may have improved since the
+                // scheduler snapshot. Re-run admission once under the shared gate.
                 shouldReschedule = true;
                 continue;
             }
