@@ -730,6 +730,8 @@ public sealed partial class ExecutionPlanExecutor : IDisposable
             return;
         }
 
+        DisposeDeviceMemoryReservationWaiters();
+
         foreach (var snapshot in _snapshots.Values)
         {
             snapshot.Snapshot.Dispose();
