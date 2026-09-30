@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Fission.Abstractions;
 
 namespace Fission.Runtime.Execution;
@@ -16,7 +17,8 @@ internal sealed record RuntimeDeviceMemoryReservationState(
 
 public sealed partial class ExecutionPlanExecutor
 {
-    private readonly SemaphoreSlim _deviceMemoryAdmissionGate = new(1, 1);
+    private readonly ConcurrentDictionary<DeviceId, SemaphoreSlim>
+        _deviceMemoryAdmissionGates = new();
     private readonly object _deviceMemoryReservationGate = new();
     private readonly Dictionary<DeviceId, long> _deviceMemoryReservations = new();
     private long _deviceMemoryReservationReleaseVersion;
@@ -25,24 +27,54 @@ public sealed partial class ExecutionPlanExecutor
 
     /// <summary>
     /// Serializes pressure observation, optional reclaim, scheduling, and transient
-    /// reservation across InferenceEngine instances that share this runtime. The
-    /// gate is released before backend execution; the returned reservation lease
-    /// keeps admitted transient bytes charged until execution completes.
+    /// reservation only across engines whose scheduling candidate sets touch the
+    /// same physical execution device. Multi-device admissions acquire gates in
+    /// stable DeviceId order, preventing lock-order deadlocks while allowing
+    /// disjoint GPUs to perform admission concurrently. Gates are released before
+    /// backend execution; the returned reservation lease keeps admitted transient
+    /// bytes charged until execution completes.
     /// </summary>
     internal async ValueTask<IDisposable> EnterDeviceMemoryAdmissionAsync(
+        IReadOnlyList<DeviceId> devices,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(devices);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        await _deviceMemoryAdmissionGate.WaitAsync(cancellationToken)
-            .ConfigureAwait(false);
 
-        if (Volatile.Read(ref _disposed) != 0)
+        var normalized = devices
+            .Distinct()
+            .OrderBy(static device => device.Value, StringComparer.Ordinal)
+            .ToArray();
+        if (normalized.Length == 0)
         {
-            _deviceMemoryAdmissionGate.Release();
-            throw new ObjectDisposedException(nameof(ExecutionPlanExecutor));
+            return EmptyAdmissionGateLease.Instance;
         }
 
-        return new AdmissionGateLease(_deviceMemoryAdmissionGate);
+        var acquired = new SemaphoreSlim[normalized.Length];
+        var acquiredCount = 0;
+        try
+        {
+            foreach (var device in normalized)
+            {
+                var gate = _deviceMemoryAdmissionGates.GetOrAdd(
+                    device,
+                    static _ => new SemaphoreSlim(1, 1));
+                await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                acquired[acquiredCount++] = gate;
+            }
+
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                throw new ObjectDisposedException(nameof(ExecutionPlanExecutor));
+            }
+
+            return new AdmissionGateLease(acquired);
+        }
+        catch
+        {
+            ReleaseAdmissionGates(acquired, acquiredCount);
+            throw;
+        }
     }
 
     internal IReadOnlyList<RuntimeDeviceMemoryReservationSnapshot>
@@ -162,17 +194,41 @@ public sealed partial class ExecutionPlanExecutor
     private static TaskCompletionSource<long> CreateReservationReleaseSignal() =>
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    private static void ReleaseAdmissionGates(
+        IReadOnlyList<SemaphoreSlim> gates,
+        int count)
+    {
+        for (var index = count - 1; index >= 0; index--)
+        {
+            gates[index].Release();
+        }
+    }
+
     private sealed class AdmissionGateLease : IDisposable
     {
-        private SemaphoreSlim? _gate;
+        private SemaphoreSlim[]? _gates;
 
-        public AdmissionGateLease(SemaphoreSlim gate)
+        public AdmissionGateLease(SemaphoreSlim[] gates)
         {
-            _gate = gate;
+            _gates = gates;
         }
 
-        public void Dispose() =>
-            Interlocked.Exchange(ref _gate, null)?.Release();
+        public void Dispose()
+        {
+            var gates = Interlocked.Exchange(ref _gates, null);
+            if (gates is not null)
+            {
+                ReleaseAdmissionGates(gates, gates.Length);
+            }
+        }
+    }
+
+    private sealed class EmptyAdmissionGateLease : IDisposable
+    {
+        public static EmptyAdmissionGateLease Instance { get; } = new();
+        public void Dispose()
+        {
+        }
     }
 
     private sealed class DeviceMemoryReservationLease : IDisposable
