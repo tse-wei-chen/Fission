@@ -3,4 +3,7 @@
     <ProjectReference Include="../Fission.Abstractions/Fission.Abstractions.csproj" />
     <ProjectReference Include="../Fission.Plan/Fission.Plan.fsproj" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Fission.Engine" />
+  </ItemGroup>
 </Project>
