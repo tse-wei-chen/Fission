@@ -13,6 +13,7 @@ namespace Fission.Backends.OnnxRuntime;
 public sealed class OnnxRuntimeMigratableBackend :
     IInferenceBackend,
     IInferenceDeviceMemoryPressureSource,
+    IInferenceDeviceMemoryReclaimer,
     ISequenceMigrationTransportBackend
 {
     private readonly OnnxRuntimeBackend _inner;
@@ -48,6 +49,11 @@ public sealed class OnnxRuntimeMigratableBackend :
     public bool TryGetDeviceMemoryPressure(
         out InferenceDeviceMemoryPressure pressure) =>
         _inner.TryGetDeviceMemoryPressure(out pressure);
+
+    public ValueTask<InferenceDeviceMemoryReclaimResult> ReclaimDeviceMemoryAsync(
+        long targetReclaimableBytes,
+        CancellationToken cancellationToken = default) =>
+        _inner.ReclaimDeviceMemoryAsync(targetReclaimableBytes, cancellationToken);
 
     public ValueTask InitializeAsync(CancellationToken cancellationToken = default) =>
         _inner.InitializeAsync(cancellationToken);
