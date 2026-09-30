@@ -237,6 +237,52 @@ var byteCancelled = await byteEngine.CancelAsync(byteLimited);
 Require(byteCancelled.FinishReason == InferenceFinishReason.Cancelled, "Byte-budget test request must be cancellable after partial prefill.");
 Require(byteRuntime.SequenceCount == 0 && byteKvPool.AllocatedPages == 0, "Byte-budget cancellation must release runtime KV ownership.");
 
+var pressureBackend = new TrackingStateBackend(
+    new DeviceId("cpu:device-memory-budget"),
+    kvBytesPerToken: 128,
+    activeDeviceBytes: 128,
+    reclaimableDeviceBytes: 512);
+var pressureKvPool = new KvPagePool(capacity: 16, tokensPerPage: 16);
+await using var pressureDevice = await ContinuousBatchExecutor.CreateAsync(
+    pressureBackend,
+    capacity: 16,
+    maxBatchSize: 4);
+using var pressureRuntime = new ExecutionPlanExecutor(
+    pressureDevice,
+    kvPagePool: pressureKvPool);
+using var pressureEngine = new InferenceEngine(
+    pressureRuntime,
+    new SchedulingKernel(),
+    new InferenceEngineOptions(
+        MaxBatchTokens: 16,
+        MaxBatchSequences: 1,
+        Scheduling: new SchedulingPolicyOptions(
+            DecodeTokenReserve: 0,
+            MaxPrefillChunkTokens: 16,
+            DeadlineUrgencyWindow: TimeSpan.FromMilliseconds(50)),
+        MaxDeviceBytes: 512),
+    kvMemoryProfile: pressureBackend);
+
+var pressureLimited = pressureEngine.Submit(
+    new ModelId("device-memory-model"),
+    new[] { 31, 32, 33, 34, 35, 36, 37, 38 },
+    maxNewTokens: 1,
+    enqueuedAt: baseTime.AddSeconds(4.5));
+var pressureCycle = await pressureEngine.RunCycleAsync(
+    baseTime.AddSeconds(4.5).AddMilliseconds(1));
+Require(pressureBackend.ReclaimCount == 1,
+    "Engine must reclaim idle device residency when physical headroom blocks scheduling.");
+Require(pressureBackend.ReclaimableDeviceBytes == 0,
+    "Blocked device admission should trim reclaimable idle residency before retrying scheduling.");
+Require(pressureCycle.Batch.Items.Count == 1 && pressureCycle.Batch.Items[0].TokenGrant == 3,
+    "After reclaim, 384 bytes of physical headroom at 128 bytes/token must admit three prefill tokens.");
+Require(
+    pressureRuntime.TryGetSequence(pressureLimited, out var pressureSequence) && pressureSequence?.Position == 3,
+    "Device-memory-limited prefill must execute the post-reclaim scheduler grant.");
+var pressureCancelled = await pressureEngine.CancelAsync(pressureLimited);
+Require(pressureCancelled.FinishReason == InferenceFinishReason.Cancelled,
+    "Device-memory budget test request must remain cancellable after partial prefill.");
+
 var capacityKvPool = new KvPagePool(capacity: 16, tokensPerPage: 4);
 await using var capacityDevice = await ContinuousBatchExecutor.CreateAsync(
     new DeterministicBackend(new DeviceId("cpu:engine-capacity")),
@@ -288,30 +334,78 @@ Console.WriteLine(
     $"Fission engine specs passed: cycles={cycles.Count}, prefill=[{string.Join(',', prefillGrants)}], " +
     $"manual={snapshotA.GeneratedTokens.Count + snapshotB.GeneratedTokens.Count}, " +
     $"streamed={streamed[0].Length + streamed[1].Length}, backendReleases={trackingBackend.ReleaseCount}, " +
-    $"byteGrant={byteFirstCycle.Batch.ConsumedKvBytes}, deviceClamp={capacityCycles.Max(static cycle => cycle.Batch.Items.Count)}, " +
+    $"byteGrant={byteFirstCycle.Batch.ConsumedKvBytes}, deviceReclaims={pressureBackend.ReclaimCount}, " +
+    $"deviceClamp={capacityCycles.Max(static cycle => cycle.Batch.Items.Count)}, " +
     $"kv={kvPool.AllocatedPages}/{kvPool.Capacity}.");
 
-sealed class TrackingStateBackend : IInferenceBackend, IInferenceKvMemoryProfile
+sealed class TrackingStateBackend :
+    IInferenceBackend,
+    IInferenceKvMemoryProfile,
+    IInferenceDeviceMemoryPressureSource,
+    IInferenceDeviceMemoryReclaimer
 {
     private readonly HashSet<SequenceId> _active = new();
     private readonly HashSet<SequenceId> _released = new();
     private readonly long _kvBytesPerToken;
+    private readonly long _activeDeviceBytes;
+    private readonly long _peakReservedDeviceBytes;
+    private long _reclaimableDeviceBytes;
     private bool _initialized;
 
-    public TrackingStateBackend(DeviceId device, long kvBytesPerToken = 0)
+    public TrackingStateBackend(
+        DeviceId device,
+        long kvBytesPerToken = 0,
+        long activeDeviceBytes = 0,
+        long reclaimableDeviceBytes = 0)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(kvBytesPerToken);
+        ArgumentOutOfRangeException.ThrowIfNegative(activeDeviceBytes);
+        ArgumentOutOfRangeException.ThrowIfNegative(reclaimableDeviceBytes);
         Device = device;
         _kvBytesPerToken = kvBytesPerToken;
+        _activeDeviceBytes = activeDeviceBytes;
+        _reclaimableDeviceBytes = reclaimableDeviceBytes;
+        _peakReservedDeviceBytes = checked(activeDeviceBytes + reclaimableDeviceBytes);
     }
 
     public string Name => "tracking-state";
     public DeviceId Device { get; }
     public int ActiveSequenceCount => _active.Count;
     public int ReleaseCount { get; private set; }
+    public int ReclaimCount { get; private set; }
+    public long ReclaimableDeviceBytes => _reclaimableDeviceBytes;
     public IReadOnlySet<SequenceId> ReleasedSequences => _released;
 
     public long GetKvBytesPerToken(ModelId modelId) => _kvBytesPerToken;
+
+    public bool TryGetDeviceMemoryPressure(
+        out InferenceDeviceMemoryPressure pressure)
+    {
+        pressure = new InferenceDeviceMemoryPressure(
+            ActiveBytes: _activeDeviceBytes,
+            ReclaimableBytes: _reclaimableDeviceBytes,
+            ReservedBytes: checked(_activeDeviceBytes + _reclaimableDeviceBytes),
+            PeakReservedBytes: _peakReservedDeviceBytes);
+        return true;
+    }
+
+    public ValueTask<InferenceDeviceMemoryReclaimResult> ReclaimDeviceMemoryAsync(
+        long targetReclaimableBytes,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+        ArgumentOutOfRangeException.ThrowIfNegative(targetReclaimableBytes);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var retained = Math.Min(_reclaimableDeviceBytes, targetReclaimableBytes);
+        var released = _reclaimableDeviceBytes - retained;
+        _reclaimableDeviceBytes = retained;
+        ReclaimCount++;
+        return ValueTask.FromResult(new InferenceDeviceMemoryReclaimResult(
+            ReleasedBytes: released,
+            ReclaimableBytes: retained,
+            ReservedBytes: checked(_activeDeviceBytes + retained)));
+    }
 
     public ValueTask InitializeAsync(CancellationToken cancellationToken = default)
     {
