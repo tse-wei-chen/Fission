@@ -9,10 +9,14 @@ internal readonly record struct RuntimeDeviceMemoryReservationRequest(
 
 internal readonly record struct RuntimeDeviceMemoryReservationSnapshot(
     DeviceId Device,
-    long Bytes);
+    long Bytes,
+    long ReleaseVersion);
+
+internal readonly record struct RuntimeDeviceMemoryReservationVersion(
+    DeviceId Device,
+    long ReleaseVersion);
 
 internal sealed record RuntimeDeviceMemoryReservationState(
-    long ReleaseVersion,
     IReadOnlyList<RuntimeDeviceMemoryReservationSnapshot> Reservations);
 
 public sealed partial class ExecutionPlanExecutor
@@ -21,9 +25,10 @@ public sealed partial class ExecutionPlanExecutor
         _deviceMemoryAdmissionGates = new();
     private readonly object _deviceMemoryReservationGate = new();
     private readonly Dictionary<DeviceId, long> _deviceMemoryReservations = new();
-    private long _deviceMemoryReservationReleaseVersion;
-    private TaskCompletionSource<long> _deviceMemoryReservationReleased =
-        CreateReservationReleaseSignal();
+    private readonly Dictionary<DeviceId, long>
+        _deviceMemoryReservationReleaseVersions = new();
+    private readonly Dictionary<DeviceId, TaskCompletionSource<long>>
+        _deviceMemoryReservationReleased = new();
 
     /// <summary>
     /// Serializes pressure observation, optional reclaim, scheduling, and transient
@@ -85,35 +90,70 @@ public sealed partial class ExecutionPlanExecutor
     {
         lock (_deviceMemoryReservationGate)
         {
-            return new RuntimeDeviceMemoryReservationState(
-                _deviceMemoryReservationReleaseVersion,
-                _deviceMemoryReservations
-                    .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal)
-                    .Select(static pair => new RuntimeDeviceMemoryReservationSnapshot(
-                        pair.Key,
-                        pair.Value))
-                    .ToArray());
+            var reservations = _deviceMemoryReservations
+                .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal)
+                .Select(pair => new RuntimeDeviceMemoryReservationSnapshot(
+                    pair.Key,
+                    pair.Value,
+                    GetDeviceMemoryReservationReleaseVersionLocked(pair.Key)))
+                .ToArray();
+            return new RuntimeDeviceMemoryReservationState(reservations);
         }
     }
 
+    /// <summary>
+    /// Waits until any observed physical device releases reservation bytes. Each
+    /// observed version is device-scoped, so releases on unrelated GPUs do not
+    /// wake this waiter. Version comparison and signal capture share the ledger
+    /// lock, preserving the missed-wakeup protection used by admission retries.
+    /// </summary>
     internal Task WaitForDeviceMemoryReservationReleaseAsync(
-        long observedReleaseVersion,
+        IReadOnlyList<RuntimeDeviceMemoryReservationVersion> observedVersions,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(observedVersions);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        Task<long> signal;
-        lock (_deviceMemoryReservationGate)
+        if (observedVersions.Count == 0)
         {
-            if (_deviceMemoryReservationReleaseVersion != observedReleaseVersion)
-            {
-                return Task.CompletedTask;
-            }
-
-            signal = _deviceMemoryReservationReleased.Task;
+            return Task.CompletedTask;
         }
 
-        return signal.WaitAsync(cancellationToken);
+        Task<long>[] signals;
+        lock (_deviceMemoryReservationGate)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+            var normalized = new Dictionary<DeviceId, long>();
+            foreach (var observed in observedVersions)
+            {
+                if (normalized.TryGetValue(observed.Device, out var existing) &&
+                    existing != observed.ReleaseVersion)
+                {
+                    throw new InvalidOperationException(
+                        $"Conflicting reservation release versions were supplied for {observed.Device}: " +
+                        $"{existing} and {observed.ReleaseVersion}.");
+                }
+
+                normalized[observed.Device] = observed.ReleaseVersion;
+            }
+
+            foreach (var (device, observedVersion) in normalized)
+            {
+                if (GetDeviceMemoryReservationReleaseVersionLocked(device) !=
+                    observedVersion)
+                {
+                    return Task.CompletedTask;
+                }
+            }
+
+            signals = normalized
+                .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal)
+                .Select(pair => GetOrCreateReservationReleaseSignalLocked(pair.Key).Task)
+                .ToArray();
+        }
+
+        return WaitForAnyReservationReleaseAsync(signals, cancellationToken);
     }
 
     internal IDisposable ReserveDeviceMemory(
@@ -156,8 +196,7 @@ public sealed partial class ExecutionPlanExecutor
     private void ReleaseDeviceMemoryReservations(
         IReadOnlyDictionary<DeviceId, long> reservations)
     {
-        TaskCompletionSource<long> releasedSignal;
-        long releaseVersion;
+        var releasedSignals = new List<(TaskCompletionSource<long> Signal, long Version)>();
 
         lock (_deviceMemoryReservationGate)
         {
@@ -180,15 +219,66 @@ public sealed partial class ExecutionPlanExecutor
                 {
                     _deviceMemoryReservations[device] = remaining;
                 }
-            }
 
-            releaseVersion = checked(_deviceMemoryReservationReleaseVersion + 1);
-            _deviceMemoryReservationReleaseVersion = releaseVersion;
-            releasedSignal = _deviceMemoryReservationReleased;
-            _deviceMemoryReservationReleased = CreateReservationReleaseSignal();
+                var releaseVersion = checked(
+                    GetDeviceMemoryReservationReleaseVersionLocked(device) + 1);
+                _deviceMemoryReservationReleaseVersions[device] = releaseVersion;
+
+                if (_deviceMemoryReservationReleased.Remove(device, out var signal))
+                {
+                    releasedSignals.Add((signal, releaseVersion));
+                }
+            }
         }
 
-        releasedSignal.TrySetResult(releaseVersion);
+        foreach (var (signal, version) in releasedSignals)
+        {
+            signal.TrySetResult(version);
+        }
+    }
+
+    private long GetDeviceMemoryReservationReleaseVersionLocked(DeviceId device) =>
+        _deviceMemoryReservationReleaseVersions.TryGetValue(device, out var version)
+            ? version
+            : 0L;
+
+    private TaskCompletionSource<long> GetOrCreateReservationReleaseSignalLocked(
+        DeviceId device)
+    {
+        if (_deviceMemoryReservationReleased.TryGetValue(device, out var signal))
+        {
+            return signal;
+        }
+
+        signal = CreateReservationReleaseSignal();
+        _deviceMemoryReservationReleased.Add(device, signal);
+        return signal;
+    }
+
+    private static async Task WaitForAnyReservationReleaseAsync(
+        IReadOnlyList<Task<long>> signals,
+        CancellationToken cancellationToken)
+    {
+        var completed = await Task.WhenAny(signals)
+            .WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+        await completed.ConfigureAwait(false);
+    }
+
+    private void DisposeDeviceMemoryReservationWaiters()
+    {
+        TaskCompletionSource<long>[] signals;
+        lock (_deviceMemoryReservationGate)
+        {
+            signals = _deviceMemoryReservationReleased.Values.ToArray();
+            _deviceMemoryReservationReleased.Clear();
+        }
+
+        foreach (var signal in signals)
+        {
+            signal.TrySetException(
+                new ObjectDisposedException(nameof(ExecutionPlanExecutor)));
+        }
     }
 
     private static TaskCompletionSource<long> CreateReservationReleaseSignal() =>
