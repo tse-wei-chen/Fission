@@ -29,13 +29,16 @@ public sealed record CudaDeviceMemoryAllocatorOptions
 public sealed class CudaDeviceMemoryAllocation : IDisposable
 {
     private CudaDeviceAllocationHandle? _handle;
+    private readonly Action<CudaDeviceAllocationHandle, long>? _release;
 
     internal CudaDeviceMemoryAllocation(
         CudaDeviceAllocationHandle handle,
         long byteLength,
-        int deviceId)
+        int deviceId,
+        Action<CudaDeviceAllocationHandle, long>? release = null)
     {
         _handle = handle;
+        _release = release;
         ByteLength = byteLength;
         DeviceId = deviceId;
     }
@@ -50,7 +53,19 @@ public sealed class CudaDeviceMemoryAllocation : IDisposable
 
     public void Dispose()
     {
-        Interlocked.Exchange(ref _handle, null)?.Dispose();
+        var handle = Interlocked.Exchange(ref _handle, null);
+        if (handle is null)
+        {
+            return;
+        }
+
+        if (_release is null)
+        {
+            handle.Dispose();
+            return;
+        }
+
+        _release(handle, ByteLength);
     }
 }
 
@@ -58,7 +73,7 @@ public sealed class CudaDeviceMemoryAllocation : IDisposable
 /// Device-ordinal-bound cudaMalloc/cudaFree allocator. Allocation and release both
 /// enter the configured CUDA device and restore the calling thread's prior device.
 /// </summary>
-public sealed class CudaDeviceMemoryAllocator
+public class CudaDeviceMemoryAllocator
 {
     private readonly ICudaDeviceMemoryApi _cuda;
 
@@ -70,7 +85,7 @@ public sealed class CudaDeviceMemoryAllocator
     {
     }
 
-    internal CudaDeviceMemoryAllocator(
+    protected internal CudaDeviceMemoryAllocator(
         ICudaDeviceMemoryApi cuda,
         CudaDeviceMemoryAllocatorOptions? options = null)
     {
@@ -102,7 +117,16 @@ public sealed class CudaDeviceMemoryAllocator
         }
     }
 
-    public CudaDeviceMemoryAllocation Allocate(long byteLength)
+    public virtual CudaDeviceMemoryAllocation Allocate(long byteLength)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(byteLength);
+        return new CudaDeviceMemoryAllocation(
+            AllocateHandle(byteLength),
+            byteLength,
+            DeviceId);
+    }
+
+    private protected CudaDeviceAllocationHandle AllocateHandle(long byteLength)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(byteLength);
         var nativeBytes = checked((nuint)byteLength);
@@ -116,12 +140,9 @@ public sealed class CudaDeviceMemoryAllocator
                 "cudaMalloc reported success but returned a null device pointer.");
         }
 
-        return new CudaDeviceMemoryAllocation(
-            new CudaDeviceAllocationHandle(
-                _cuda,
-                pointer,
-                DeviceId),
-            byteLength,
+        return new CudaDeviceAllocationHandle(
+            _cuda,
+            pointer,
             DeviceId);
     }
 
