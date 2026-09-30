@@ -29,8 +29,14 @@ var firstArena = new CudaDecoderOrtCohortArena(
     pool);
 Require(cuda.MallocCalls == 2,
     "First one-layer CUDA cohort must perform exactly two native allocations.");
-Require(pool.Statistics.NativeAllocations == 2 && pool.Statistics.Reuses == 0,
+var firstActive = pool.Statistics;
+Require(firstActive.NativeAllocations == 2 && firstActive.Reuses == 0,
     "First cohort allocations must be recorded as fresh native allocations.");
+Require(firstActive.ActiveBuffers == 2 && firstActive.ActiveBytes == 32 &&
+        firstActive.RetainedBuffers == 0 && firstActive.ReservedBytes == 32,
+    "Fresh cohort allocations must be visible as active CUDA residency.");
+Require(firstActive.PeakActiveBytes == 32 && firstActive.PeakReservedBytes == 32,
+    "First cohort must establish the initial active/reserved high-water marks.");
 firstArena.Release();
 
 var afterFirstReturn = pool.Statistics;
@@ -39,6 +45,9 @@ Require(cuda.FreeCalls == 0,
 Require(afterFirstReturn.Returns == 2 && afterFirstReturn.Drops == 0 &&
         afterFirstReturn.RetainedBuffers == 2 && afterFirstReturn.RetainedBytes == 32,
     "First cohort must retain its exact two 16-byte layer allocations.");
+Require(afterFirstReturn.ActiveBuffers == 0 && afterFirstReturn.ActiveBytes == 0 &&
+        afterFirstReturn.ReservedBytes == 32,
+    "Returned buffers must move from active to retained without changing reserved CUDA bytes.");
 
 var secondArena = new CudaDecoderOrtCohortArena(
     position: 2,
@@ -48,8 +57,12 @@ var secondArena = new CudaDecoderOrtCohortArena(
     pool);
 Require(cuda.MallocCalls == 2,
     "Second same-shape cohort must reuse both retained CUDA allocations without cudaMalloc.");
-Require(pool.Statistics.Reuses == 2 && pool.Statistics.RetainedBuffers == 0,
+var duringReuse = pool.Statistics;
+Require(duringReuse.Reuses == 2 && duringReuse.RetainedBuffers == 0,
     "Second cohort must rent both retained exact-size buffers.");
+Require(duringReuse.ActiveBuffers == 2 && duringReuse.ActiveBytes == 32 &&
+        duringReuse.ReservedBytes == 32,
+    "Reused allocations must become active without changing total reserved bytes.");
 secondArena.Release();
 Require(pool.Statistics.RetainedBuffers == 2 && pool.Statistics.RetainedBytes == 32,
     "Second cohort release must return both buffers to the pool again.");
@@ -60,6 +73,10 @@ using (var differentSize = pool.Allocate(8))
         "A different byte length must never reuse a retained 16-byte allocation.");
     Require(differentSize.ByteLength == 8 && differentSize.DeviceId == deviceId,
         "Different-size allocation must preserve exact geometry and device identity.");
+    var mixedResidency = pool.Statistics;
+    Require(mixedResidency.ActiveBytes == 8 && mixedResidency.RetainedBytes == 32 &&
+            mixedResidency.ReservedBytes == 40 && mixedResidency.PeakReservedBytes == 40,
+        "Pool statistics must include simultaneously active and retained CUDA residency.");
 }
 Require(cuda.FreeCalls == 1,
     "Different-size return must be dropped when the retained-byte budget is already full.");
@@ -69,8 +86,13 @@ Require(pool.Statistics.Drops == 1 && pool.Statistics.RetainedBytes == 32,
 var firstReuse = pool.Allocate(16);
 var secondReuse = pool.Allocate(16);
 var overflow = pool.Allocate(16);
-Require(cuda.MallocCalls == 4 && pool.Statistics.Reuses == 4,
+var peakConcurrency = pool.Statistics;
+Require(cuda.MallocCalls == 4 && peakConcurrency.Reuses == 4,
     "Two exact buffers must be reused and a third simultaneous request must allocate natively.");
+Require(peakConcurrency.ActiveBuffers == 3 && peakConcurrency.ActiveBytes == 48 &&
+        peakConcurrency.ReservedBytes == 48 &&
+        peakConcurrency.PeakActiveBytes == 48 && peakConcurrency.PeakReservedBytes == 48,
+    "Pool high-water statistics must capture simultaneous active CUDA allocations.");
 firstReuse.Dispose();
 secondReuse.Dispose();
 overflow.Dispose();
@@ -78,14 +100,43 @@ var afterOverflow = pool.Statistics;
 Require(afterOverflow.Returns == 8 && afterOverflow.Drops == 2 &&
         afterOverflow.RetainedBuffers == 2 && afterOverflow.RetainedBytes == 32,
     "Per-size/budget bounds must retain exactly two 16-byte allocations and drop the overflow.");
+Require(afterOverflow.ActiveBuffers == 0 && afterOverflow.ActiveBytes == 0 &&
+        afterOverflow.ReservedBytes == 32,
+    "All returned leases must leave only idle-retained residency.");
 Require(cuda.FreeCalls == 2,
     "Only the different-size and third-overflow allocations should have been freed so far.");
 
+var partialTrim = pool.TrimRetained(targetRetainedBytes: 16);
+Require(partialTrim.ReleasedBuffers == 1 && partialTrim.ReleasedBytes == 16 &&
+        partialTrim.RetainedBuffers == 1 && partialTrim.RetainedBytes == 16,
+    "Targeted trim must synchronously release enough largest idle buffers to meet the target.");
+Require(cuda.FreeCalls == 3,
+    "Targeted trim must cudaFree the released idle allocation.");
+var afterPartialTrim = pool.Statistics;
+Require(afterPartialTrim.TrimmedBuffers == 1 && afterPartialTrim.TrimmedBytes == 16 &&
+        afterPartialTrim.ReservedBytes == 16,
+    "Trim accounting must track cumulative explicitly reclaimed CUDA residency.");
+
+var noOpTrim = pool.TrimRetained(targetRetainedBytes: 16);
+Require(noOpTrim.ReleasedBuffers == 0 && noOpTrim.ReleasedBytes == 0 &&
+        noOpTrim.RetainedBytes == 16 && cuda.FreeCalls == 3,
+    "Trimming to the current retained size must be a no-op.");
+
+var fullTrim = pool.TrimRetained();
+Require(fullTrim.ReleasedBuffers == 1 && fullTrim.ReleasedBytes == 16 &&
+        fullTrim.RetainedBuffers == 0 && fullTrim.RetainedBytes == 0,
+    "Default trim must release all currently idle retained allocations.");
+Require(cuda.FreeCalls == 4 && pool.Statistics.ReservedBytes == 0,
+    "Full trim must return idle CUDA residency to the device immediately.");
+Require(pool.Statistics.TrimmedBuffers == 2 && pool.Statistics.TrimmedBytes == 32,
+    "Cumulative trim counters must include partial and full trims.");
+
 pool.Dispose();
 Require(cuda.FreeCalls == 4 && cuda.ActivePointers.Count == 0,
-    "Pool disposal must synchronously cudaFree every retained handle exactly once.");
-Require(pool.Statistics.RetainedBuffers == 0 && pool.Statistics.RetainedBytes == 0,
-    "Disposed pool must report no retained device memory.");
+    "Pool disposal after a full trim must not double-free released handles.");
+Require(pool.Statistics.RetainedBuffers == 0 && pool.Statistics.RetainedBytes == 0 &&
+        pool.Statistics.ActiveBuffers == 0 && pool.Statistics.ReservedBytes == 0,
+    "Disposed pool must report no active or retained device memory.");
 
 var allocateAfterDisposeFailed = false;
 try
@@ -110,14 +161,23 @@ using var secondPool = new CudaPooledDeviceMemoryAllocator(
 var outstanding = secondPool.Allocate(16);
 Require(cuda.MallocCalls == 5,
     "A separate pool must own an independent native allocation.");
+var activeSecondPool = secondPool.Statistics;
+Require(activeSecondPool.ActiveBuffers == 1 && activeSecondPool.ActiveBytes == 16 &&
+        activeSecondPool.RetainedBytes == 0 && activeSecondPool.ReservedBytes == 16,
+    "Outstanding caller leases must be visible as active reserved CUDA memory.");
+var activeTrim = secondPool.TrimRetained();
+Require(activeTrim.ReleasedBuffers == 0 && activeTrim.ReleasedBytes == 0 &&
+        cuda.FreeCalls == 4,
+    "Trim must never revoke or free an active caller lease.");
 secondPool.Dispose();
-Require(cuda.FreeCalls == 4,
-    "Disposing a pool must not free an allocation still leased to a caller.");
+Require(cuda.FreeCalls == 4 && secondPool.Statistics.ReservedBytes == 16,
+    "Disposing a pool must not free or hide an allocation still leased to a caller.");
 outstanding.Dispose();
 Require(cuda.FreeCalls == 5 && cuda.ActivePointers.Count == 0,
     "An outstanding lease returned after pool disposal must cudaFree instead of being retained.");
-Require(secondPool.Statistics.Returns == 1 && secondPool.Statistics.Drops == 1,
-    "Post-disposal return must be observable as a dropped buffer.");
+Require(secondPool.Statistics.Returns == 1 && secondPool.Statistics.Drops == 1 &&
+        secondPool.Statistics.ActiveBuffers == 0 && secondPool.Statistics.ReservedBytes == 0,
+    "Post-disposal return must clear active residency and be observable as a dropped buffer.");
 
 Require(cuda.MallocDevices.All(static current => current == deviceId) &&
         cuda.FreeDevices.All(static current => current == deviceId),
@@ -128,7 +188,9 @@ Require(cuda.CurrentDevice == 9,
 Console.WriteLine(
     $"Fission CUDA device pool specs passed: native={pool.Statistics.NativeAllocations}, " +
     $"reuse={pool.Statistics.Reuses}, returns={pool.Statistics.Returns}, " +
-    $"drops={pool.Statistics.Drops}, mallocs={cuda.MallocCalls}, frees={cuda.FreeCalls}.");
+    $"drops={pool.Statistics.Drops}, trimmed={pool.Statistics.TrimmedBytes}B, " +
+    $"peak-reserved={pool.Statistics.PeakReservedBytes}B, " +
+    $"mallocs={cuda.MallocCalls}, frees={cuda.FreeCalls}.");
 
 sealed class FakeCudaDeviceMemoryApi : ICudaDeviceMemoryApi
 {
