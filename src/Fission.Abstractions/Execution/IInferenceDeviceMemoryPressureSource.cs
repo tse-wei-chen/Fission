@@ -2,13 +2,13 @@ namespace Fission.Abstractions.Execution;
 
 /// <summary>
 /// Physical device-memory residency reported by an inference backend.
-/// This is deliberately separate from scheduler KV-byte accounting: active bytes
-/// describe currently leased native memory, reclaimable bytes describe idle cache
-/// that may be released without revoking live inference state, and reserved bytes
-/// are the physical sum still resident on the device.
+/// This is deliberately separate from scheduler KV-byte accounting:
+/// non-reclaimable bytes cannot currently be returned without disturbing live
+/// backend state, reclaimable bytes are idle cache that may be released safely,
+/// and reserved bytes are their physical sum still resident on the device.
 /// </summary>
 public readonly record struct InferenceDeviceMemoryPressure(
-    long ActiveBytes,
+    long NonReclaimableBytes,
     long ReclaimableBytes,
     long ReservedBytes,
     long PeakReservedBytes);
