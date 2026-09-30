@@ -140,6 +140,93 @@ internal static class DeviceMemoryAdmissionGateSpecs
 
         using var canonicalOrderLease = await canonicalOrderWait
             .WaitAsync(TimeSpan.FromSeconds(5));
+
+        await VerifyReservationReleaseSignalsAsync(runtime, gpu0, gpu1);
+    }
+
+    private static async Task VerifyReservationReleaseSignalsAsync(
+        ExecutionPlanExecutor runtime,
+        DeviceId gpu0,
+        DeviceId gpu1)
+    {
+        IDisposable? gpu0Reservation = runtime.ReserveDeviceMemory(
+            [new RuntimeDeviceMemoryReservationRequest(gpu0, 64)]);
+        IDisposable? gpu1Reservation = runtime.ReserveDeviceMemory(
+            [new RuntimeDeviceMemoryReservationRequest(gpu1, 64)]);
+
+        try
+        {
+            var state = runtime.GetDeviceMemoryReservationState();
+            var gpu0Snapshot = state.Reservations.Single(
+                reservation => reservation.Device == gpu0);
+            var gpu1Snapshot = state.Reservations.Single(
+                reservation => reservation.Device == gpu1);
+
+            var gpu0Wait = runtime.WaitForDeviceMemoryReservationReleaseAsync(
+                [new RuntimeDeviceMemoryReservationVersion(
+                    gpu0,
+                    gpu0Snapshot.ReleaseVersion)]);
+
+            gpu1Reservation.Dispose();
+            gpu1Reservation = null;
+            await RequirePendingAsync(
+                gpu0Wait,
+                "Releasing GPU1 reservation must not wake a waiter scoped only to GPU0.");
+
+            gpu0Reservation.Dispose();
+            gpu0Reservation = null;
+            await gpu0Wait.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Require(
+                gpu1Snapshot.ReleaseVersion == 0,
+                "Independent reservation versions should begin at zero for each device.");
+        }
+        finally
+        {
+            gpu1Reservation?.Dispose();
+            gpu0Reservation?.Dispose();
+        }
+
+        // If release wins the race before the waiter attaches, the version mismatch
+        // must complete the wait immediately rather than miss the wakeup.
+        var preReleased = runtime.ReserveDeviceMemory(
+            [new RuntimeDeviceMemoryReservationRequest(gpu0, 32)]);
+        var preReleaseState = runtime.GetDeviceMemoryReservationState();
+        var preReleaseSnapshot = preReleaseState.Reservations.Single(
+            reservation => reservation.Device == gpu0);
+        preReleased.Dispose();
+        await runtime.WaitForDeviceMemoryReservationReleaseAsync(
+                [new RuntimeDeviceMemoryReservationVersion(
+                    gpu0,
+                    preReleaseSnapshot.ReleaseVersion)])
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        // A cycle blocked by multiple physical devices should retry when any one of
+        // those relevant reservations changes, while still ignoring other devices.
+        IDisposable? multiGpu0 = runtime.ReserveDeviceMemory(
+            [new RuntimeDeviceMemoryReservationRequest(gpu0, 16)]);
+        IDisposable? multiGpu1 = runtime.ReserveDeviceMemory(
+            [new RuntimeDeviceMemoryReservationRequest(gpu1, 16)]);
+        try
+        {
+            var state = runtime.GetDeviceMemoryReservationState();
+            var observed = state.Reservations
+                .Where(reservation => reservation.Device == gpu0 || reservation.Device == gpu1)
+                .Select(static reservation => new RuntimeDeviceMemoryReservationVersion(
+                    reservation.Device,
+                    reservation.ReleaseVersion))
+                .ToArray();
+            var anyRelevantWait = runtime.WaitForDeviceMemoryReservationReleaseAsync(observed);
+
+            multiGpu1.Dispose();
+            multiGpu1 = null;
+            await anyRelevantWait.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            multiGpu1?.Dispose();
+            multiGpu0?.Dispose();
+        }
     }
 
     private static async Task RequirePendingAsync(
