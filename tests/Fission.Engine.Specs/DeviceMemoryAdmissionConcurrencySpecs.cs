@@ -275,7 +275,7 @@ internal static class DeviceMemoryAdmissionConcurrencySpecs
             var completed = await stream.Completion.WaitAsync(TimeSpan.FromSeconds(5));
             Require(
                 completed.IsCompleted &&
-                completed.FinishReason == InferenceFinishReason.Length,
+                completed.FinishReason == InferenceFinishReason.Stop,
                 "InferenceWorker must resume scheduling and finish the waiting request after reservation release.");
             Require(
                 backend.PrefillCalls == 2,
@@ -395,9 +395,10 @@ internal static class DeviceMemoryAdmissionConcurrencySpecs
             }
 
             return batch.Items
-                .Select(static item => new BackendStepResult(
+                .Select(item => new BackendStepResult(
                     item.SequenceId,
-                    TokenId: 7))
+                    TokenId: 7,
+                    IsFinished: call > 1))
                 .ToArray();
         }
 
