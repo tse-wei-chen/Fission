@@ -17,7 +17,8 @@ public sealed record InferenceEngineOptions(
     int MaxBatchTokens,
     int MaxBatchSequences,
     SchedulingPolicyOptions Scheduling,
-    long? MaxKvBytes = null);
+    long? MaxKvBytes = null,
+    long? MaxDeviceBytes = null);
 
 public sealed record InferenceRequestSnapshot(
     SequenceId SequenceId,
@@ -74,6 +75,13 @@ public sealed class InferenceEngine : IDisposable
             throw new ArgumentOutOfRangeException(
                 nameof(options),
                 "MaxKvBytes must be positive when specified.");
+        }
+
+        if (options.MaxDeviceBytes is <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                "MaxDeviceBytes must be positive when specified.");
         }
 
         if (options.Scheduling.DeadlineUrgencyWindow < TimeSpan.Zero)
@@ -248,16 +256,42 @@ public sealed class InferenceEngine : IDisposable
             }
 
             var executionCapacity = _runtime.GetExecutionCapacity();
+            var maxBatchSequences = Math.Min(
+                _options.MaxBatchSequences,
+                executionCapacity.MaxInferenceItems);
+            var availableKvBytes = GetAvailableKvBytes(active);
+            var deviceMemory = GetDeviceMemoryBudgets(candidates);
             var decision = _scheduler.Schedule(
                 scheduleId,
                 now,
                 new SchedulingBudget(
                     _options.MaxBatchTokens,
                     kvBefore.AvailablePages,
-                    Math.Min(_options.MaxBatchSequences, executionCapacity.MaxInferenceItems),
-                    GetAvailableKvBytes(active)),
+                    maxBatchSequences,
+                    availableKvBytes,
+                    deviceMemory),
                 _options.Scheduling,
                 candidates);
+
+            if (await TryReclaimBlockedDeviceMemoryAsync(
+                    decision,
+                    candidates,
+                    cancellationToken)
+                .ConfigureAwait(false))
+            {
+                deviceMemory = GetDeviceMemoryBudgets(candidates);
+                decision = _scheduler.Schedule(
+                    scheduleId,
+                    now,
+                    new SchedulingBudget(
+                        _options.MaxBatchTokens,
+                        kvBefore.AvailablePages,
+                        maxBatchSequences,
+                        availableKvBytes,
+                        deviceMemory),
+                    _options.Scheduling,
+                    candidates);
+            }
 
             var prefillBindings = new Dictionary<SequenceId, ScheduledPrefillBinding>();
             foreach (var item in decision.Batch.Items)
@@ -383,6 +417,7 @@ public sealed class InferenceEngine : IDisposable
     private SchedulingCandidate BuildCandidate(RequestView request, int tokensPerKvPage)
     {
         var kvBytesPerToken = GetKvBytesPerToken(request.ModelId);
+        var executionDevice = _runtime.GetExecutionDevice(request.SequenceId);
 
         if (!_runtime.TryGetSequence(request.SequenceId, out var sequence) || sequence is null)
         {
@@ -395,7 +430,8 @@ public sealed class InferenceEngine : IDisposable
                 0,
                 tokensPerKvPage,
                 request.Priority,
-                kvBytesPerToken);
+                kvBytesPerToken,
+                executionDevice);
         }
 
         return sequence.Status switch
@@ -409,7 +445,8 @@ public sealed class InferenceEngine : IDisposable
                 sequence.Position,
                 tokensPerKvPage,
                 request.Priority,
-                kvBytesPerToken),
+                kvBytesPerToken,
+                executionDevice),
 
             SequenceStatus.Decoding => new SchedulingCandidate(
                 request.SequenceId,
@@ -420,7 +457,8 @@ public sealed class InferenceEngine : IDisposable
                 sequence.Position,
                 tokensPerKvPage,
                 request.Priority,
-                kvBytesPerToken),
+                kvBytesPerToken,
+                executionDevice),
 
             SequenceStatus.Suspended => throw new InvalidOperationException(
                 $"Engine-owned request {request.SequenceId} is suspended without a resume phase."),
@@ -431,6 +469,101 @@ public sealed class InferenceEngine : IDisposable
             _ => throw new InvalidOperationException(
                 $"Unexpected runtime sequence state {sequence.Status} for request {request.SequenceId}.")
         };
+    }
+
+    private IReadOnlyList<SchedulingDeviceMemoryBudget>? GetDeviceMemoryBudgets(
+        IReadOnlyList<SchedulingCandidate> candidates)
+    {
+        if (_options.MaxDeviceBytes is not { } maxDeviceBytes)
+        {
+            return null;
+        }
+
+        var pressureByDevice = _runtime.GetDeviceMemoryPressure()
+            .ToDictionary(static pressure => pressure.Device);
+        var devices = candidates
+            .Select(static candidate => candidate.ExecutionDevice)
+            .Where(static device => device.HasValue)
+            .Select(static device => device!.Value)
+            .Distinct()
+            .OrderBy(static device => device.Value, StringComparer.Ordinal)
+            .ToArray();
+        var budgets = new SchedulingDeviceMemoryBudget[devices.Length];
+
+        for (var index = 0; index < devices.Length; index++)
+        {
+            var device = devices[index];
+            if (!pressureByDevice.TryGetValue(device, out var pressure))
+            {
+                throw new InvalidOperationException(
+                    $"MaxDeviceBytes requires physical memory pressure from execution device {device}.");
+            }
+
+            var availableBytes = pressure.ReservedBytes >= maxDeviceBytes
+                ? 0L
+                : maxDeviceBytes - pressure.ReservedBytes;
+            budgets[index] = new SchedulingDeviceMemoryBudget(device, availableBytes);
+        }
+
+        return budgets;
+    }
+
+    private async ValueTask<bool> TryReclaimBlockedDeviceMemoryAsync(
+        SchedulingKernelResult decision,
+        IReadOnlyList<SchedulingCandidate> candidates,
+        CancellationToken cancellationToken)
+    {
+        if (_options.MaxDeviceBytes is null)
+        {
+            return false;
+        }
+
+        var deviceBySequence = candidates
+            .Where(static candidate => candidate.ExecutionDevice.HasValue)
+            .ToDictionary(
+                static candidate => candidate.SequenceId,
+                static candidate => candidate.ExecutionDevice!.Value);
+        var blockedDevices = decision.Deferred
+            .Where(static deferred =>
+                deferred.Reason == SchedulingDeferralReason.DeviceMemoryBudget)
+            .Select(deferred => deviceBySequence[deferred.SequenceId])
+            .Distinct()
+            .ToArray();
+
+        if (blockedDevices.Length == 0)
+        {
+            return false;
+        }
+
+        var pressureByDevice = _runtime.GetDeviceMemoryPressure()
+            .ToDictionary(static pressure => pressure.Device);
+        var reclaimed = false;
+
+        foreach (var device in blockedDevices)
+        {
+            if (!pressureByDevice.TryGetValue(device, out var pressure) ||
+                pressure.ReclaimableBytes == 0)
+            {
+                continue;
+            }
+
+            try
+            {
+                await _runtime.ReclaimDeviceMemoryAsync(
+                        device,
+                        targetReclaimableBytes: 0,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                reclaimed = true;
+            }
+            catch (NotSupportedException)
+            {
+                // Reclaim is optional. Keep idle-resident bytes charged to physical
+                // headroom and preserve the scheduler's conservative deferral.
+            }
+        }
+
+        return reclaimed;
     }
 
     private long GetAvailableKvBytes(RequestView[] active)
