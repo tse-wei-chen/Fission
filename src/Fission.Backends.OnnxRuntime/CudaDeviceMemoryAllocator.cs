@@ -85,7 +85,7 @@ public class CudaDeviceMemoryAllocator
     {
     }
 
-    protected internal CudaDeviceMemoryAllocator(
+    internal CudaDeviceMemoryAllocator(
         ICudaDeviceMemoryApi cuda,
         CudaDeviceMemoryAllocatorOptions? options = null)
     {
