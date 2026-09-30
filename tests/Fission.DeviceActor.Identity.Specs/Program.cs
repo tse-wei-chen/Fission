@@ -34,6 +34,38 @@ Require(memoryPressure[0].Device == deviceId &&
         memoryPressure[0].PeakReservedBytes == 128,
     "Runtime memory-pressure feedback must preserve physical device identity and byte accounting.");
 
+var reclaimDeviceId = new DeviceId("cpu:reclaim-barrier");
+var reclaimBackend = new ReclaimBarrierBackend(reclaimDeviceId);
+await using (var reclaimDevice = await ContinuousBatchExecutor.CreateAsync(
+    reclaimBackend,
+    capacity: 4,
+    maxBatchSize: 4))
+{
+    using var reclaimRuntime = new ExecutionPlanExecutor(
+        reclaimDevice,
+        kvPagePool: new KvPagePool(capacity: 4, tokensPerPage: 4));
+
+    var reclaimSequence = SequenceId.New();
+    var queuedPrefill = reclaimDevice.SubmitPrefillAsync(
+        new PrefillItem(
+            reclaimSequence,
+            modelId,
+            new ReadOnlyMemory<int>(new[] { 1, 2 }),
+            Position: 0)).AsTask();
+    var reclaim = reclaimRuntime.ReclaimDeviceMemoryAsync(
+        reclaimDeviceId,
+        targetReclaimableBytes: 16).AsTask();
+
+    await Task.WhenAll(queuedPrefill, reclaim).WaitAsync(TimeSpan.FromSeconds(5));
+    Require(reclaimBackend.Events.SequenceEqual(new[] { "prefill", "reclaim:16" }),
+        "Device-memory reclaim must execute as a queue-order barrier after previously accepted inference.");
+    Require(reclaim.Result.Device == reclaimDeviceId &&
+            reclaim.Result.ReleasedBytes == 48 &&
+            reclaim.Result.ReclaimableBytes == 16 &&
+            reclaim.Result.ReservedBytes == 80,
+        "Runtime reclaim result must preserve device identity and backend post-reclaim accounting.");
+}
+
 var first = SequenceId.New();
 var second = SequenceId.New();
 var batch = new ScheduledBatch(
@@ -92,7 +124,74 @@ Require(backend.DisposeCount == 1, "Backend cleanup must run exactly once after 
 Console.WriteLine(
     $"Fission device actor identity specs passed: batch={backend.LastPrefillBatchSize}, " +
     $"positions={firstSequence.Position},{secondSequence.Position}, kv={kvPool.AllocatedPages}, " +
-    $"deviceReserved={memoryPressure[0].ReservedBytes}.");
+    $"deviceReserved={memoryPressure[0].ReservedBytes}, reclaimBarrier=ok.");
+
+sealed class ReclaimBarrierBackend :
+    IInferenceBackend,
+    IInferenceDeviceMemoryReclaimer
+{
+    private bool _initialized;
+
+    public ReclaimBarrierBackend(DeviceId device)
+    {
+        Device = device;
+    }
+
+    public string Name => "reclaim-barrier-backend";
+    public DeviceId Device { get; }
+    public List<string> Events { get; } = new();
+
+    public ValueTask InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _initialized = true;
+        return ValueTask.CompletedTask;
+    }
+
+    public ValueTask<IReadOnlyList<BackendStepResult>> PrefillAsync(
+        PrefillBatch batch,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+        cancellationToken.ThrowIfCancellationRequested();
+        Events.Add("prefill");
+        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(
+            batch.Items.Select(static item =>
+                new BackendStepResult(item.SequenceId, TokenId: 7)).ToArray());
+    }
+
+    public ValueTask<IReadOnlyList<BackendStepResult>> DecodeAsync(
+        DecodeBatch batch,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Decode is not used by the reclaim barrier spec.");
+
+    public ValueTask<InferenceDeviceMemoryReclaimResult> ReclaimDeviceMemoryAsync(
+        long targetReclaimableBytes,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+        cancellationToken.ThrowIfCancellationRequested();
+        Events.Add($"reclaim:{targetReclaimableBytes}");
+        return ValueTask.FromResult(new InferenceDeviceMemoryReclaimResult(
+            ReleasedBytes: 48,
+            ReclaimableBytes: targetReclaimableBytes,
+            ReservedBytes: 64 + targetReclaimableBytes));
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _initialized = false;
+        return ValueTask.CompletedTask;
+    }
+
+    private void EnsureInitialized()
+    {
+        if (!_initialized)
+        {
+            throw new InvalidOperationException("Backend is not initialized.");
+        }
+    }
+}
 
 sealed class MisorderedBackend :
     IInferenceBackend,
