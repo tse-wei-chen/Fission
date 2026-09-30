@@ -40,12 +40,13 @@ public sealed record InferenceCycleResult(
     RuntimeKvCapacity KvCapacity)
 {
     /// <summary>
-    /// Internal version token captured from the runtime reservation ledger when an
-    /// otherwise-runnable empty batch was blocked by another engine's transient
-    /// device-memory reservation. A null value means the empty batch is not known
-    /// to be temporary reservation backpressure.
+    /// Internal device-scoped reservation versions captured when an otherwise-
+    /// runnable empty batch was blocked by another engine's transient physical
+    /// device-memory reservation. Null means the empty batch is not known to be
+    /// temporary reservation backpressure.
     /// </summary>
-    internal long? DeviceMemoryBackpressureReleaseVersion { get; init; }
+    internal IReadOnlyList<RuntimeDeviceMemoryReservationVersion>?
+        DeviceMemoryBackpressureReservations { get; init; }
 }
 
 /// <summary>
@@ -269,7 +270,7 @@ public sealed class InferenceEngine : IDisposable
                 _options.MaxBatchSequences,
                 executionCapacity.MaxInferenceItems);
             var availableKvBytes = GetAvailableKvBytes(active);
-            var (decision, deviceMemoryReservation, backpressureReleaseVersion) =
+            var (decision, deviceMemoryReservation, backpressureReservations) =
                 await ScheduleWithDeviceMemoryAdmissionAsync(
                         scheduleId,
                         now,
@@ -356,7 +357,7 @@ public sealed class InferenceEngine : IDisposable
                 completed,
                 _runtime.KvCapacity)
             {
-                DeviceMemoryBackpressureReleaseVersion = backpressureReleaseVersion
+                DeviceMemoryBackpressureReservations = backpressureReservations
             };
         }
         finally
@@ -385,10 +386,10 @@ public sealed class InferenceEngine : IDisposable
 
             if (cycle.Batch.Items.Count == 0 && ActiveRequestCount != 0)
             {
-                if (cycle.DeviceMemoryBackpressureReleaseVersion is { } releaseVersion)
+                if (cycle.DeviceMemoryBackpressureReservations is { Count: > 0 } observed)
                 {
                     await _runtime.WaitForDeviceMemoryReservationReleaseAsync(
-                            releaseVersion,
+                            observed,
                             cancellationToken)
                         .ConfigureAwait(false);
                     continue;
@@ -406,9 +407,9 @@ public sealed class InferenceEngine : IDisposable
     internal Task? GetDeviceMemoryBackpressureWait(
         InferenceCycleResult cycle,
         CancellationToken cancellationToken = default) =>
-        cycle.DeviceMemoryBackpressureReleaseVersion is { } releaseVersion
+        cycle.DeviceMemoryBackpressureReservations is { Count: > 0 } observed
             ? _runtime.WaitForDeviceMemoryReservationReleaseAsync(
-                releaseVersion,
+                observed,
                 cancellationToken)
             : null;
 
@@ -483,7 +484,7 @@ public sealed class InferenceEngine : IDisposable
     private async ValueTask<(
         SchedulingKernelResult Decision,
         IDisposable? Reservation,
-        long? BackpressureReleaseVersion)>
+        IReadOnlyList<RuntimeDeviceMemoryReservationVersion>? BackpressureReservations)>
         ScheduleWithDeviceMemoryAdmissionAsync(
             Guid scheduleId,
             DateTimeOffset now,
@@ -547,13 +548,13 @@ public sealed class InferenceEngine : IDisposable
                 deviceMemory.Budgets);
         }
 
-        var backpressureReleaseVersion = GetDeviceMemoryBackpressureReleaseVersion(
+        var backpressureReservations = GetDeviceMemoryBackpressureReservations(
             decision,
             candidates,
             deviceMemory.ReservationState);
         var reservation = _runtime.ReserveDeviceMemory(
             BuildDeviceMemoryReservationRequests(decision, candidates));
-        return (decision, reservation, backpressureReleaseVersion);
+        return (decision, reservation, backpressureReservations);
     }
 
     private SchedulingKernelResult ScheduleOnce(
@@ -622,10 +623,11 @@ public sealed class InferenceEngine : IDisposable
         return new DeviceMemoryBudgetSnapshot(budgets, reservationState);
     }
 
-    private static long? GetDeviceMemoryBackpressureReleaseVersion(
-        SchedulingKernelResult decision,
-        IReadOnlyList<SchedulingCandidate> candidates,
-        RuntimeDeviceMemoryReservationState reservationState)
+    private static IReadOnlyList<RuntimeDeviceMemoryReservationVersion>?
+        GetDeviceMemoryBackpressureReservations(
+            SchedulingKernelResult decision,
+            IReadOnlyList<SchedulingCandidate> candidates,
+            RuntimeDeviceMemoryReservationState reservationState)
     {
         if (decision.Batch.Items.Count != 0 ||
             reservationState.Reservations.Count == 0)
@@ -635,23 +637,32 @@ public sealed class InferenceEngine : IDisposable
 
         var candidateBySequence = candidates.ToDictionary(
             static candidate => candidate.SequenceId);
-        var reservedDevices = reservationState.Reservations
+        var reservationByDevice = reservationState.Reservations
             .Where(static reservation => reservation.Bytes > 0)
-            .Select(static reservation => reservation.Device)
-            .ToHashSet();
+            .ToDictionary(static reservation => reservation.Device);
+        var blocked = new Dictionary<DeviceId, long>();
 
         foreach (var deferred in decision.Deferred)
         {
-            if (deferred.Reason == SchedulingDeferralReason.DeviceMemoryBudget &&
-                candidateBySequence.TryGetValue(deferred.SequenceId, out var candidate) &&
-                candidate.ExecutionDevice is { } device &&
-                reservedDevices.Contains(device))
+            if (deferred.Reason != SchedulingDeferralReason.DeviceMemoryBudget ||
+                !candidateBySequence.TryGetValue(deferred.SequenceId, out var candidate) ||
+                candidate.ExecutionDevice is not { } device ||
+                !reservationByDevice.TryGetValue(device, out var reservation))
             {
-                return reservationState.ReleaseVersion;
+                continue;
             }
+
+            blocked[device] = reservation.ReleaseVersion;
         }
 
-        return null;
+        return blocked.Count == 0
+            ? null
+            : blocked
+                .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal)
+                .Select(static pair => new RuntimeDeviceMemoryReservationVersion(
+                    pair.Key,
+                    pair.Value))
+                .ToArray();
     }
 
     private IReadOnlyList<RuntimeDeviceMemoryReservationRequest>
