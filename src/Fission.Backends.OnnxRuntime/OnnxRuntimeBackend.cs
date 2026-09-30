@@ -12,7 +12,8 @@ public sealed record OnnxRuntimeBackendOptions(
     int? InterOpNumThreads = null,
     GraphOptimizationLevel GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
     OnnxSessionContract? SessionContract = null,
-    IInferenceDeviceMemoryPressureSource? DeviceMemoryPressureSource = null);
+    IInferenceDeviceMemoryPressureSource? DeviceMemoryPressureSource = null,
+    IInferenceDeviceMemoryReclaimer? DeviceMemoryReclaimer = null);
 
 /// <summary>
 /// ONNX Runtime session host. Model-specific tensor names, shapes, KV schemas,
@@ -23,12 +24,14 @@ public sealed record OnnxRuntimeBackendOptions(
 /// </summary>
 public sealed class OnnxRuntimeBackend :
     IInferenceBackend,
-    IInferenceDeviceMemoryPressureSource
+    IInferenceDeviceMemoryPressureSource,
+    IInferenceDeviceMemoryReclaimer
 {
     private readonly OnnxRuntimeBackendOptions _options;
     private readonly IOnnxRuntimeExecutionAdapter _adapter;
     private readonly Func<SessionOptions>? _sessionOptionsFactory;
     private readonly IInferenceDeviceMemoryPressureSource? _deviceMemoryPressureSource;
+    private readonly IInferenceDeviceMemoryReclaimer? _deviceMemoryReclaimer;
     private InferenceSession? _session;
     private int _disposed;
 
@@ -61,6 +64,10 @@ public sealed class OnnxRuntimeBackend :
         _deviceMemoryPressureSource =
             options.DeviceMemoryPressureSource ??
             adapter as IInferenceDeviceMemoryPressureSource;
+        _deviceMemoryReclaimer =
+            options.DeviceMemoryReclaimer ??
+            options.DeviceMemoryPressureSource as IInferenceDeviceMemoryReclaimer ??
+            adapter as IInferenceDeviceMemoryReclaimer;
     }
 
     public string Name => $"onnxruntime/{_adapter.Name}";
@@ -79,6 +86,20 @@ public sealed class OnnxRuntimeBackend :
         }
 
         return _deviceMemoryPressureSource.TryGetDeviceMemoryPressure(out pressure);
+    }
+
+    public ValueTask<InferenceDeviceMemoryReclaimResult> ReclaimDeviceMemoryAsync(
+        long targetReclaimableBytes,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(targetReclaimableBytes);
+        _ = GetSession();
+        return _deviceMemoryReclaimer?.ReclaimDeviceMemoryAsync(
+                targetReclaimableBytes,
+                cancellationToken)
+            ?? ValueTask.FromException<InferenceDeviceMemoryReclaimResult>(
+                new NotSupportedException(
+                    $"ONNX Runtime backend '{Name}' does not expose device-memory reclaim."));
     }
 
     public async ValueTask InitializeAsync(
