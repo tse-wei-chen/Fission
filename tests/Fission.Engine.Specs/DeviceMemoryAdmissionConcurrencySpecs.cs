@@ -9,9 +9,37 @@ using Fission.Scheduler;
 
 internal static class DeviceMemoryAdmissionConcurrencySpecs
 {
+    private static Task? _runTask;
+
     [ModuleInitializer]
-    internal static void Run() =>
-        RunAsync().GetAwaiter().GetResult();
+    internal static void Start()
+    {
+        // A genuinely async concurrency scenario must not synchronously block the
+        // module initializer. Let the executable start normally, then verify the
+        // task before process exit.
+        _runTask = Task.Run(RunAsync);
+        AppDomain.CurrentDomain.ProcessExit += static (_, _) => CompleteBeforeExit();
+    }
+
+    private static void CompleteBeforeExit()
+    {
+        var runTask = _runTask;
+        if (runTask is null)
+        {
+            return;
+        }
+
+        try
+        {
+            runTask.GetAwaiter().GetResult();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(
+                $"Device-memory admission concurrency spec failed: {exception}");
+            Environment.ExitCode = 1;
+        }
+    }
 
     private static async Task RunAsync()
     {
@@ -57,51 +85,88 @@ internal static class DeviceMemoryAdmissionConcurrencySpecs
             maxNewTokens: 4,
             enqueuedAt: now.AddMilliseconds(1));
 
-        var firstCycleTask = firstEngine.RunCycleAsync(now.AddMilliseconds(2)).AsTask();
-        await backend.FirstPrefillStarted.Task
-            .WaitAsync(TimeSpan.FromSeconds(5));
+        Task<InferenceCycleResult>? firstCycleTask = null;
+        Task<InferenceCycleResult>? secondCycleTask = null;
+        try
+        {
+            firstCycleTask = firstEngine.RunCycleAsync(now.AddMilliseconds(2)).AsTask();
+            await backend.FirstPrefillStarted.Task
+                .WaitAsync(TimeSpan.FromSeconds(5));
 
-        var blockedSecondCycle = await secondEngine
-            .RunCycleAsync(now.AddMilliseconds(3))
-            .AsTask()
-            .WaitAsync(TimeSpan.FromSeconds(5));
+            secondCycleTask = secondEngine
+                .RunCycleAsync(now.AddMilliseconds(3))
+                .AsTask();
+            var blockedSecondCycle = await secondCycleTask
+                .WaitAsync(TimeSpan.FromSeconds(5));
 
-        Require(
-            blockedSecondCycle.Batch.Items.Count == 0,
-            "A second engine sharing the runtime must not admit the same physical headroom while the first batch holds a transient reservation.");
-        Require(
-            blockedSecondCycle.Deferred.Count == 1 &&
-            blockedSecondCycle.Deferred[0].SequenceId == secondSequence &&
-            blockedSecondCycle.Deferred[0].Reason == SchedulingDeferralReason.DeviceMemoryBudget,
-            "Shared-runtime reservation pressure must surface as DeviceMemoryBudget deferral for the competing engine.");
-        Require(
-            backend.PrefillCalls == 1,
-            "The competing engine must be deferred before a second backend prefill reaches the device actor.");
+            Require(
+                blockedSecondCycle.Batch.Items.Count == 0,
+                "A second engine sharing the runtime must not admit the same physical headroom while the first batch holds a transient reservation.");
+            Require(
+                blockedSecondCycle.Deferred.Count == 1 &&
+                blockedSecondCycle.Deferred[0].SequenceId == secondSequence &&
+                blockedSecondCycle.Deferred[0].Reason == SchedulingDeferralReason.DeviceMemoryBudget,
+                "Shared-runtime reservation pressure must surface as DeviceMemoryBudget deferral for the competing engine.");
+            Require(
+                backend.PrefillCalls == 1,
+                "The competing engine must be deferred before a second backend prefill reaches the device actor.");
 
-        backend.ReleaseFirstPrefill();
-        var firstCycle = await firstCycleTask.WaitAsync(TimeSpan.FromSeconds(5));
-        Require(
-            firstCycle.Batch.Items.Count == 1 &&
-            firstCycle.Batch.Items[0].SequenceId == firstSequence,
-            "The first engine must retain and execute the batch that owns the reservation.");
+            backend.ReleaseFirstPrefill();
+            var firstCycle = await firstCycleTask.WaitAsync(TimeSpan.FromSeconds(5));
+            Require(
+                firstCycle.Batch.Items.Count == 1 &&
+                firstCycle.Batch.Items[0].SequenceId == firstSequence,
+                "The first engine must retain and execute the batch that owns the reservation.");
 
-        var admittedSecondCycle = await secondEngine
-            .RunCycleAsync(now.AddMilliseconds(4))
-            .AsTask()
-            .WaitAsync(TimeSpan.FromSeconds(5));
-        Require(
-            admittedSecondCycle.Batch.Items.Count == 1 &&
-            admittedSecondCycle.Batch.Items[0].SequenceId == secondSequence,
-            "Releasing the first batch reservation must make the physical headroom reusable by the second engine.");
-        Require(
-            backend.PrefillCalls == 2,
-            "The second backend prefill should execute only after the first reservation is released.");
+            var admittedSecondCycle = await secondEngine
+                .RunCycleAsync(now.AddMilliseconds(4))
+                .AsTask()
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            Require(
+                admittedSecondCycle.Batch.Items.Count == 1 &&
+                admittedSecondCycle.Batch.Items[0].SequenceId == secondSequence,
+                "Releasing the first batch reservation must make the physical headroom reusable by the second engine.");
+            Require(
+                backend.PrefillCalls == 2,
+                "The second backend prefill should execute only after the first reservation is released.");
 
-        await firstEngine.CancelAsync(firstSequence);
-        await secondEngine.CancelAsync(secondSequence);
-        Require(
-            runtime.SequenceCount == 0,
-            "Shared-runtime admission spec must release both runtime sequences after cancellation.");
+            await firstEngine.CancelAsync(firstSequence);
+            await secondEngine.CancelAsync(secondSequence);
+            Require(
+                runtime.SequenceCount == 0,
+                "Shared-runtime admission spec must release both runtime sequences after cancellation.");
+        }
+        finally
+        {
+            // A failed assertion or timeout must not leave the fake backend blocked,
+            // otherwise actor disposal would hide the real regression by hanging CI.
+            backend.ReleaseFirstPrefill();
+
+            if (firstCycleTask is not null)
+            {
+                try
+                {
+                    await firstCycleTask.WaitAsync(TimeSpan.FromSeconds(5));
+                }
+                catch
+                {
+                    // Preserve the original failure while making cleanup progress.
+                }
+            }
+
+            if (secondCycleTask is not null)
+            {
+                try
+                {
+                    await secondCycleTask.WaitAsync(TimeSpan.FromSeconds(5));
+                }
+                catch
+                {
+                    // Same cleanup-only behavior for a competing cycle that may
+                    // have incorrectly reached the actor.
+                }
+            }
+        }
     }
 
     private static void Require(bool condition, string message)
