@@ -142,6 +142,7 @@ internal static class DeviceMemoryAdmissionGateSpecs
             .WaitAsync(TimeSpan.FromSeconds(5));
 
         await VerifyReservationReleaseSignalsAsync(runtime, gpu0, gpu1);
+        await VerifyReservationLedgerConcurrencyAsync(runtime, gpu0, gpu1);
         await VerifyReservationWaiterDisposalAsync(device, gpu0);
     }
 
@@ -228,6 +229,68 @@ internal static class DeviceMemoryAdmissionGateSpecs
             multiGpu1?.Dispose();
             multiGpu0?.Dispose();
         }
+    }
+
+    private static async Task VerifyReservationLedgerConcurrencyAsync(
+        ExecutionPlanExecutor runtime,
+        DeviceId gpu0,
+        DeviceId gpu1)
+    {
+        var gpu2 = new DeviceId("cuda:gate-2");
+        var gpu3 = new DeviceId("cuda:gate-3");
+        var devices = new[] { gpu0, gpu1, gpu2, gpu3 };
+
+        // Scoped snapshots should touch only the requested physical ledger state.
+        using (var gpu0Reservation = runtime.ReserveDeviceMemory(
+                   [new RuntimeDeviceMemoryReservationRequest(gpu0, 64)]))
+        using (var gpu1Reservation = runtime.ReserveDeviceMemory(
+                   [new RuntimeDeviceMemoryReservationRequest(gpu1, 32)]))
+        {
+            var scoped = runtime.GetDeviceMemoryReservationState([gpu0]);
+            Require(
+                scoped.Reservations.Count == 1 &&
+                scoped.Reservations[0].Device == gpu0 &&
+                scoped.Reservations[0].Bytes == 64,
+                "A device-scoped reservation snapshot must not include unrelated ledgers.");
+        }
+
+        const int workerCount = 24;
+        const int iterations = 100;
+        var workers = Enumerable.Range(0, workerCount)
+            .Select(workerIndex => Task.Run(() =>
+            {
+                for (var iteration = 0; iteration < iterations; iteration++)
+                {
+                    var first = devices[(workerIndex + iteration) % devices.Length];
+                    var second = devices[(workerIndex + iteration + 1) % devices.Length];
+                    var requests = (workerIndex + iteration) % 2 == 0
+                        ? new[]
+                        {
+                            new RuntimeDeviceMemoryReservationRequest(first, 1),
+                            new RuntimeDeviceMemoryReservationRequest(second, 1)
+                        }
+                        : new[]
+                        {
+                            new RuntimeDeviceMemoryReservationRequest(second, 1),
+                            new RuntimeDeviceMemoryReservationRequest(first, 1)
+                        };
+
+                    using var reservation = runtime.ReserveDeviceMemory(requests);
+                    var scoped = runtime.GetDeviceMemoryReservationState([first]);
+                    Require(
+                        scoped.Reservations.Any(snapshot =>
+                            snapshot.Device == first && snapshot.Bytes > 0),
+                        "An active per-device reservation must be visible in its scoped ledger snapshot.");
+                }
+            }))
+            .ToArray();
+
+        await Task.WhenAll(workers).WaitAsync(TimeSpan.FromSeconds(10));
+
+        var finalState = runtime.GetDeviceMemoryReservationState(devices);
+        Require(
+            finalState.Reservations.Count == 0,
+            "Concurrent overlapping multi-device reservation leases must release every ledger back to zero.");
     }
 
     private static async Task VerifyReservationWaiterDisposalAsync(
