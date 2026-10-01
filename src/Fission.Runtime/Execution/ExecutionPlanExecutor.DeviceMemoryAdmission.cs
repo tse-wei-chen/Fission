@@ -26,6 +26,9 @@ internal interface IRuntimeDeviceMemoryReservationLease : IDisposable
 
 public sealed partial class ExecutionPlanExecutor
 {
+    private static readonly RuntimeDeviceMemoryReservationState EmptyDeviceMemoryReservationState =
+        new(Array.Empty<RuntimeDeviceMemoryReservationSnapshot>());
+
     private readonly ConcurrentDictionary<DeviceId, SemaphoreSlim>
         _deviceMemoryAdmissionGates = new();
     private readonly ConcurrentDictionary<DeviceId, DeviceMemoryReservationLedger>
@@ -98,20 +101,40 @@ public sealed partial class ExecutionPlanExecutor
         IReadOnlyList<DeviceId> devices)
     {
         ArgumentNullException.ThrowIfNull(devices);
-        var ledgers = NormalizeDevices(devices)
-            .Select(device => _deviceMemoryReservationLedgers.TryGetValue(device, out var ledger)
-                ? ledger
-                : null)
-            .Where(static ledger => ledger is not null)
-            .Cast<DeviceMemoryReservationLedger>()
-            .ToArray();
-        return SnapshotDeviceMemoryReservationState(ledgers);
+        var normalized = NormalizeDevices(devices);
+        List<RuntimeDeviceMemoryReservationSnapshot>? reservations = null;
+
+        foreach (var device in normalized)
+        {
+            if (!_deviceMemoryReservationLedgers.TryGetValue(device, out var ledger))
+            {
+                continue;
+            }
+
+            lock (ledger.Gate)
+            {
+                if (ledger.ReservedBytes == 0)
+                {
+                    continue;
+                }
+
+                (reservations ??= new List<RuntimeDeviceMemoryReservationSnapshot>(normalized.Length))
+                    .Add(new RuntimeDeviceMemoryReservationSnapshot(
+                        ledger.Device,
+                        ledger.ReservedBytes,
+                        ledger.ReleaseVersion));
+            }
+        }
+
+        return reservations is null
+            ? EmptyDeviceMemoryReservationState
+            : new RuntimeDeviceMemoryReservationState(reservations);
     }
 
     private static RuntimeDeviceMemoryReservationState SnapshotDeviceMemoryReservationState(
         IReadOnlyList<DeviceMemoryReservationLedger> ledgers)
     {
-        var reservations = new List<RuntimeDeviceMemoryReservationSnapshot>(ledgers.Count);
+        List<RuntimeDeviceMemoryReservationSnapshot>? reservations = null;
         foreach (var ledger in ledgers)
         {
             lock (ledger.Gate)
@@ -121,14 +144,17 @@ public sealed partial class ExecutionPlanExecutor
                     continue;
                 }
 
-                reservations.Add(new RuntimeDeviceMemoryReservationSnapshot(
-                    ledger.Device,
-                    ledger.ReservedBytes,
-                    ledger.ReleaseVersion));
+                (reservations ??= new List<RuntimeDeviceMemoryReservationSnapshot>(ledgers.Count))
+                    .Add(new RuntimeDeviceMemoryReservationSnapshot(
+                        ledger.Device,
+                        ledger.ReservedBytes,
+                        ledger.ReleaseVersion));
             }
         }
 
-        return new RuntimeDeviceMemoryReservationState(reservations);
+        return reservations is null
+            ? EmptyDeviceMemoryReservationState
+            : new RuntimeDeviceMemoryReservationState(reservations);
     }
 
     /// <summary>
@@ -404,11 +430,41 @@ public sealed partial class ExecutionPlanExecutor
     private static TaskCompletionSource<long> CreateReservationReleaseSignal() =>
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    private static DeviceId[] NormalizeDevices(IReadOnlyList<DeviceId> devices) =>
-        devices
-            .Distinct()
-            .OrderBy(static device => device.Value, StringComparer.Ordinal)
-            .ToArray();
+    private static DeviceId[] NormalizeDevices(IReadOnlyList<DeviceId> devices)
+    {
+        if (devices.Count == 0)
+        {
+            return Array.Empty<DeviceId>();
+        }
+
+        var normalized = new DeviceId[devices.Count];
+        for (var index = 0; index < devices.Count; index++)
+        {
+            normalized[index] = devices[index];
+        }
+
+        Array.Sort(
+            normalized,
+            static (left, right) => StringComparer.Ordinal.Compare(left.Value, right.Value));
+
+        var uniqueCount = 1;
+        for (var index = 1; index < normalized.Length; index++)
+        {
+            if (normalized[index].Equals(normalized[uniqueCount - 1]))
+            {
+                continue;
+            }
+
+            normalized[uniqueCount++] = normalized[index];
+        }
+
+        if (uniqueCount != normalized.Length)
+        {
+            Array.Resize(ref normalized, uniqueCount);
+        }
+
+        return normalized;
+    }
 
     private static void ReleaseAdmissionGates(
         IReadOnlyList<SemaphoreSlim> gates,
