@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.ExceptionServices;
 using Fission.Abstractions;
@@ -258,31 +259,32 @@ public sealed class ScheduledBatchExecutor
         ArgumentNullException.ThrowIfNull(bindings);
 
         var groupsByDevice = new ScheduledDeviceGroupTable();
+        var itemCount = batch.Items.Count;
         var prepared = Prepare(batch, bindings, groupsByDevice);
-        if (prepared.Length == 0)
+        if (itemCount == 0)
         {
             return Array.Empty<BackendStepResult>();
-        }
-
-        foreach (var group in groupsByDevice.Values)
-        {
-            var capacity = _runtime.GetDeviceInferenceCapacity(group.Device);
-            if (group.Count > capacity)
-            {
-                throw new InvalidOperationException(
-                    $"Scheduled batch {batch.ScheduleId} contains {group.Count} inference item(s) " +
-                    $"for device {group.Device}, but that device actor capacity is {capacity}.");
-            }
         }
 
         try
         {
             foreach (var group in groupsByDevice.Values)
             {
+                var capacity = _runtime.GetDeviceInferenceCapacity(group.Device);
+                if (group.Count > capacity)
+                {
+                    throw new InvalidOperationException(
+                        $"Scheduled batch {batch.ScheduleId} contains {group.Count} inference item(s) " +
+                        $"for device {group.Device}, but that device actor capacity is {capacity}.");
+                }
+            }
+
+            foreach (var group in groupsByDevice.Values)
+            {
                 group.InitializeSubmission(onDeviceCompleted);
             }
 
-            for (var index = 0; index < prepared.Length; index++)
+            for (var index = 0; index < itemCount; index++)
             {
                 ref var item = ref prepared[index];
                 item.Pending = _runtime.ExecuteScheduledInferenceAsync(
@@ -295,7 +297,7 @@ public sealed class ScheduledBatchExecutor
                     cancellationToken);
             }
 
-            var results = await AwaitAllAsync(prepared).ConfigureAwait(false);
+            var results = await AwaitAllAsync(prepared, itemCount).ConfigureAwait(false);
             if (onDeviceCompleted is not null)
             {
                 foreach (var group in groupsByDevice.Values)
@@ -312,17 +314,20 @@ public sealed class ScheduledBatchExecutor
             {
                 group.DisposeSubmission();
             }
+
+            ReturnPreparedItems(prepared, itemCount);
         }
     }
 
     private static async ValueTask<BackendStepResult[]> AwaitAllAsync(
-        PreparedItem[] prepared)
+        PreparedItem[] prepared,
+        int itemCount)
     {
-        var results = new BackendStepResult[prepared.Length];
+        var results = new BackendStepResult[itemCount];
         ExceptionDispatchInfo? firstFailure = null;
         ExceptionDispatchInfo? firstCancellation = null;
 
-        for (var index = 0; index < prepared.Length; index++)
+        for (var index = 0; index < itemCount; index++)
         {
             try
             {
@@ -348,138 +353,158 @@ public sealed class ScheduledBatchExecutor
         ScheduledExecutionBindings bindings,
         ScheduledDeviceGroupTable groupsByDevice)
     {
-        var prepared = new PreparedItem[batch.Items.Count];
-        var sequences = new HashSet<SequenceId>();
-        var consumedTokens = 0;
-        var consumedKvPages = 0;
-        var consumedKvBytes = 0L;
-        var consumedTransientKvBytes = 0L;
-
-        for (var index = 0; index < batch.Items.Count; index++)
+        var itemCount = batch.Items.Count;
+        if (itemCount == 0)
         {
-            var item = batch.Items[index];
-            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(item.TokenGrant);
-            ArgumentOutOfRangeException.ThrowIfNegative(item.KvPageGrant);
-            ArgumentOutOfRangeException.ThrowIfNegative(item.KvByteGrant);
-            ArgumentOutOfRangeException.ThrowIfNegative(item.TransientKvByteGrant);
+            return Array.Empty<PreparedItem>();
+        }
 
-            if (!sequences.Add(item.SequenceId))
+        var prepared = ArrayPool<PreparedItem>.Shared.Rent(itemCount);
+        try
+        {
+            var sequences = new HashSet<SequenceId>();
+            var consumedTokens = 0;
+            var consumedKvPages = 0;
+            var consumedKvBytes = 0L;
+            var consumedTransientKvBytes = 0L;
+
+            for (var index = 0; index < itemCount; index++)
             {
-                throw new InvalidOperationException(
-                    $"Scheduled batch {batch.ScheduleId} contains sequence {item.SequenceId} more than once.");
-            }
+                var item = batch.Items[index];
+                ArgumentOutOfRangeException.ThrowIfNegativeOrZero(item.TokenGrant);
+                ArgumentOutOfRangeException.ThrowIfNegative(item.KvPageGrant);
+                ArgumentOutOfRangeException.ThrowIfNegative(item.KvByteGrant);
+                ArgumentOutOfRangeException.ThrowIfNegative(item.TransientKvByteGrant);
 
-            var hasExistingSequence = _runtime.TryGetSequence(item.SequenceId, out var existingSequence);
-            var position = existingSequence?.Position ?? 0;
-            var expectedKvPages = _runtime.KvPages.IncrementalPagesFor(position, item.TokenGrant);
-            if (expectedKvPages != item.KvPageGrant)
-            {
-                throw new InvalidOperationException(
-                    $"Schedule grants {item.KvPageGrant} KV page(s) for {item.SequenceId}, " +
-                    $"but runtime position {position} requires {expectedKvPages} page(s) " +
-                    $"at {_runtime.KvPages.TokensPerPage} tokens/page.");
-            }
-
-            consumedTokens = checked(consumedTokens + item.TokenGrant);
-            consumedKvPages = checked(consumedKvPages + item.KvPageGrant);
-            consumedKvBytes = checked(consumedKvBytes + item.KvByteGrant);
-            consumedTransientKvBytes = checked(
-                consumedTransientKvBytes + item.TransientKvByteGrant);
-
-            ScheduledInferenceStep step;
-            ReadOnlyMemory<int> prefillTokens = default;
-
-            switch (item.Kind)
-            {
-                case ScheduledWorkKind.Prefill:
+                if (!sequences.Add(item.SequenceId))
                 {
-                    var binding = bindings.ResolvePrefill(
-                        item.SequenceId,
-                        position,
-                        item.TokenGrant,
-                        item.CompletesPrefill);
-                    step = ScheduledInferenceStep.Prefill(
-                        item.SequenceId,
-                        binding.ModelId,
-                        item.TokenGrant,
-                        item.CompletesPrefill);
-                    prefillTokens = binding.Tokens;
-                    break;
+                    throw new InvalidOperationException(
+                        $"Scheduled batch {batch.ScheduleId} contains sequence {item.SequenceId} more than once.");
                 }
 
-                case ScheduledWorkKind.Decode:
-                    if (!hasExistingSequence)
+                var hasExistingSequence = _runtime.TryGetSequence(item.SequenceId, out var existingSequence);
+                var position = existingSequence?.Position ?? 0;
+                var expectedKvPages = _runtime.KvPages.IncrementalPagesFor(position, item.TokenGrant);
+                if (expectedKvPages != item.KvPageGrant)
+                {
+                    throw new InvalidOperationException(
+                        $"Schedule grants {item.KvPageGrant} KV page(s) for {item.SequenceId}, " +
+                        $"but runtime position {position} requires {expectedKvPages} page(s) " +
+                        $"at {_runtime.KvPages.TokensPerPage} tokens/page.");
+                }
+
+                consumedTokens = checked(consumedTokens + item.TokenGrant);
+                consumedKvPages = checked(consumedKvPages + item.KvPageGrant);
+                consumedKvBytes = checked(consumedKvBytes + item.KvByteGrant);
+                consumedTransientKvBytes = checked(
+                    consumedTransientKvBytes + item.TransientKvByteGrant);
+
+                ScheduledInferenceStep step;
+                ReadOnlyMemory<int> prefillTokens = default;
+
+                switch (item.Kind)
+                {
+                    case ScheduledWorkKind.Prefill:
                     {
-                        throw new KeyNotFoundException(
-                            $"Scheduled decode sequence {item.SequenceId} does not exist in the runtime.");
+                        var binding = bindings.ResolvePrefill(
+                            item.SequenceId,
+                            position,
+                            item.TokenGrant,
+                            item.CompletesPrefill);
+                        step = ScheduledInferenceStep.Prefill(
+                            item.SequenceId,
+                            binding.ModelId,
+                            item.TokenGrant,
+                            item.CompletesPrefill);
+                        prefillTokens = binding.Tokens;
+                        break;
                     }
 
-                    if (item.TokenGrant != 1)
-                    {
-                        throw new InvalidOperationException(
-                            $"Decode schedule for {item.SequenceId} must grant exactly one token.");
-                    }
+                    case ScheduledWorkKind.Decode:
+                        if (!hasExistingSequence)
+                        {
+                            throw new KeyNotFoundException(
+                                $"Scheduled decode sequence {item.SequenceId} does not exist in the runtime.");
+                        }
 
-                    step = ScheduledInferenceStep.Decode(item.SequenceId);
-                    break;
+                        if (item.TokenGrant != 1)
+                        {
+                            throw new InvalidOperationException(
+                                $"Decode schedule for {item.SequenceId} must grant exactly one token.");
+                        }
 
-                default:
-                    throw new NotSupportedException(
-                        $"Unsupported scheduled work kind {item.Kind}.");
+                        step = ScheduledInferenceStep.Decode(item.SequenceId);
+                        break;
+
+                    default:
+                        throw new NotSupportedException(
+                            $"Unsupported scheduled work kind {item.Kind}.");
+                }
+
+                var device = _runtime.ResolveExecutionDevice(item.SequenceId);
+                if (!groupsByDevice.TryGetValue(device, out var group))
+                {
+                    group = new ScheduledDeviceGroup(device);
+                    groupsByDevice.Add(device, group);
+                }
+
+                var slot = group.RegisterItem();
+                prepared[index] = new PreparedItem(
+                    DerivePlanId(batch.ScheduleId, index),
+                    step,
+                    prefillTokens,
+                    group,
+                    slot);
             }
 
-            var device = _runtime.ResolveExecutionDevice(item.SequenceId);
-            if (!groupsByDevice.TryGetValue(device, out var group))
+            if (consumedTokens != batch.ConsumedTokens)
             {
-                group = new ScheduledDeviceGroup(device);
-                groupsByDevice.Add(device, group);
+                throw new InvalidOperationException(
+                    $"Scheduled batch {batch.ScheduleId} reports {batch.ConsumedTokens} consumed tokens, " +
+                    $"but its work items sum to {consumedTokens}.");
             }
 
-            var slot = group.RegisterItem();
-            prepared[index] = new PreparedItem(
-                DerivePlanId(batch.ScheduleId, index),
-                step,
-                prefillTokens,
-                group,
-                slot);
-        }
+            if (consumedKvPages != batch.ConsumedKvPages)
+            {
+                throw new InvalidOperationException(
+                    $"Scheduled batch {batch.ScheduleId} reports {batch.ConsumedKvPages} consumed KV pages, " +
+                    $"but its work items sum to {consumedKvPages}.");
+            }
 
-        if (consumedTokens != batch.ConsumedTokens)
+            if (consumedKvBytes != batch.ConsumedKvBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Scheduled batch {batch.ScheduleId} reports {batch.ConsumedKvBytes} retained KV bytes, " +
+                    $"but its work items sum to {consumedKvBytes}.");
+            }
+
+            if (consumedTransientKvBytes != batch.ConsumedTransientKvBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Scheduled batch {batch.ScheduleId} reports {batch.ConsumedTransientKvBytes} transient KV bytes, " +
+                    $"but its work items sum to {consumedTransientKvBytes}.");
+            }
+
+            if (consumedKvPages > _runtime.KvPages.AvailablePages)
+            {
+                throw new InvalidOperationException(
+                    $"Scheduled batch {batch.ScheduleId} needs {consumedKvPages} KV page(s), " +
+                    $"but runtime has only {_runtime.KvPages.AvailablePages} available.");
+            }
+
+            return prepared;
+        }
+        catch
         {
-            throw new InvalidOperationException(
-                $"Scheduled batch {batch.ScheduleId} reports {batch.ConsumedTokens} consumed tokens, " +
-                $"but its work items sum to {consumedTokens}.");
+            ReturnPreparedItems(prepared, itemCount);
+            throw;
         }
+    }
 
-        if (consumedKvPages != batch.ConsumedKvPages)
-        {
-            throw new InvalidOperationException(
-                $"Scheduled batch {batch.ScheduleId} reports {batch.ConsumedKvPages} consumed KV pages, " +
-                $"but its work items sum to {consumedKvPages}.");
-        }
-
-        if (consumedKvBytes != batch.ConsumedKvBytes)
-        {
-            throw new InvalidOperationException(
-                $"Scheduled batch {batch.ScheduleId} reports {batch.ConsumedKvBytes} retained KV bytes, " +
-                $"but its work items sum to {consumedKvBytes}.");
-        }
-
-        if (consumedTransientKvBytes != batch.ConsumedTransientKvBytes)
-        {
-            throw new InvalidOperationException(
-                $"Scheduled batch {batch.ScheduleId} reports {batch.ConsumedTransientKvBytes} transient KV bytes, " +
-                $"but its work items sum to {consumedTransientKvBytes}.");
-        }
-
-        if (consumedKvPages > _runtime.KvPages.AvailablePages)
-        {
-            throw new InvalidOperationException(
-                $"Scheduled batch {batch.ScheduleId} needs {consumedKvPages} KV page(s), " +
-                $"but runtime has only {_runtime.KvPages.AvailablePages} available.");
-        }
-
-        return prepared;
+    private static void ReturnPreparedItems(PreparedItem[] prepared, int itemCount)
+    {
+        Array.Clear(prepared, 0, itemCount);
+        ArrayPool<PreparedItem>.Shared.Return(prepared);
     }
 
     private static Guid DerivePlanId(Guid scheduleId, int index)
