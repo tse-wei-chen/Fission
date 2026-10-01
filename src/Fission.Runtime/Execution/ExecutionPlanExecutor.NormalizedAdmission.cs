@@ -24,7 +24,36 @@ public sealed partial class ExecutionPlanExecutor
             return EmptyAdmissionGateLease.Instance;
         }
 
-        var acquired = new SemaphoreSlim[devices.Length];
+        if (devices.Length == 1)
+        {
+            var gate = _deviceMemoryAdmissionGates.GetOrAdd(
+                devices[0],
+                static _ => new SemaphoreSlim(1, 1));
+            var acquired = false;
+            try
+            {
+                await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                acquired = true;
+
+                if (Volatile.Read(ref _disposed) != 0)
+                {
+                    throw new ObjectDisposedException(nameof(ExecutionPlanExecutor));
+                }
+
+                return new SingleAdmissionGateLease(gate);
+            }
+            catch
+            {
+                if (acquired)
+                {
+                    gate.Release();
+                }
+
+                throw;
+            }
+        }
+
+        var acquiredGates = new SemaphoreSlim[devices.Length];
         var acquiredCount = 0;
         try
         {
@@ -34,7 +63,7 @@ public sealed partial class ExecutionPlanExecutor
                     device,
                     static _ => new SemaphoreSlim(1, 1));
                 await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-                acquired[acquiredCount++] = gate;
+                acquiredGates[acquiredCount++] = gate;
             }
 
             if (Volatile.Read(ref _disposed) != 0)
@@ -42,11 +71,11 @@ public sealed partial class ExecutionPlanExecutor
                 throw new ObjectDisposedException(nameof(ExecutionPlanExecutor));
             }
 
-            return new AdmissionGateLease(acquired);
+            return new AdmissionGateLease(acquiredGates);
         }
         catch
         {
-            ReleaseAdmissionGates(acquired, acquiredCount);
+            ReleaseAdmissionGates(acquiredGates, acquiredCount);
             throw;
         }
     }
@@ -157,5 +186,20 @@ public sealed partial class ExecutionPlanExecutor
         }
 
         return true;
+    }
+
+    private sealed class SingleAdmissionGateLease : IDisposable
+    {
+        private SemaphoreSlim? _gate;
+
+        public SingleAdmissionGateLease(SemaphoreSlim gate)
+        {
+            _gate = gate;
+        }
+
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _gate, null)?.Release();
+        }
     }
 }
