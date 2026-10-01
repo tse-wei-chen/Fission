@@ -11,3 +11,16 @@ The project explores a typed, stateful inference architecture where:
 The long-term direction is an inference operating system with first-class support for forkable KV state, snapshots, migration, scheduling contracts, and replayable execution plans.
 
 > Status: early bootstrap.
+
+## Container quick start
+
+Build and start the current `Fission.Server` composition with Docker Compose:
+
+```bash
+docker compose up --build -d
+curl --fail http://localhost:8000/healthz
+```
+
+The current server executable uses the deterministic backend/token codec, so this image is intended for deployment and serving integration validation rather than production GPU model serving.
+
+See [`docs/container.md`](docs/container.md) for configuration, smoke tests, and the planned GPU-container boundary.

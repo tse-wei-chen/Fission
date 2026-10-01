@@ -1,0 +1,23 @@
+name: fission
+
+services:
+  server:
+    image: ${FISSION_IMAGE:-fission:dev}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        DOTNET_VERSION: ${DOTNET_VERSION:-10.0}
+    init: true
+    ports:
+      - "${FISSION_PORT:-8000}:8000"
+    environment:
+      ASPNETCORE_URLS: http://+:8000
+      Fission__Device: ${FISSION_DEVICE:-cpu:0}
+      Fission__KvPages: ${FISSION_KV_PAGES:-16384}
+      Fission__TokensPerKvPage: ${FISSION_TOKENS_PER_KV_PAGE:-16}
+      Fission__MaxBatchTokens: ${FISSION_MAX_BATCH_TOKENS:-2048}
+      Fission__MaxBatchSequences: ${FISSION_MAX_BATCH_SEQUENCES:-128}
+      Fission__MaxPrefillChunkTokens: ${FISSION_MAX_PREFILL_CHUNK_TOKENS:-512}
+      Fission__AdmissionCapacity: ${FISSION_ADMISSION_CAPACITY:-1024}
+    stop_grace_period: 15s
