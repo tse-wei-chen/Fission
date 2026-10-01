@@ -317,7 +317,7 @@ public sealed partial class InferenceEngine : IDisposable
                     "Scheduled execution result count does not match selected work count.");
             }
 
-            var completed = new List<SequenceId>();
+            List<SequenceId>? completed = null;
             for (var index = 0; index < admission.Decision.Batch.Items.Count; index++)
             {
                 var item = admission.Decision.Batch.Items[index];
@@ -341,7 +341,7 @@ public sealed partial class InferenceEngine : IDisposable
                             finishReason.Value,
                             cancellationToken)
                         .ConfigureAwait(false);
-                    completed.Add(item.SequenceId);
+                    (completed ??= new List<SequenceId>()).Add(item.SequenceId);
                 }
             }
 
@@ -350,7 +350,7 @@ public sealed partial class InferenceEngine : IDisposable
                 admission.Decision.Batch,
                 admission.Decision.Deferred,
                 admission.Decision.Rejected,
-                completed,
+                completed is null ? Array.Empty<SequenceId>() : completed,
                 _runtime.KvCapacity)
             {
                 DeviceMemoryBackpressureReservations =
