@@ -61,71 +61,87 @@ public sealed partial class ExecutionPlanExecutor
         ReadOnlyMemory<int> prefillTokens,
         ContinuousBatchExecutor.AtomicSubmissionBatch submission,
         int slot,
+        ScheduledBatchFailureCoordinator failureCoordinator,
+        ScheduledDeviceCompletionTracker? completionTracker,
         CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        ArgumentNullException.ThrowIfNull(submission);
+        ArgumentNullException.ThrowIfNull(failureCoordinator);
 
-        var operation = step.Operation;
-        ReserveSequence(step.SequenceId, $"plan {planId}");
         try
         {
-            Record(new ExecutionTraceEvent(
-                planId,
-                ExecutionTraceKind.PlanStarted,
-                -1,
-                "Plan"));
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            ArgumentNullException.ThrowIfNull(submission);
 
-            cancellationToken.ThrowIfCancellationRequested();
-
-            RecordSequenceState(
-                planId,
-                ExecutionTraceKind.StepStarted,
-                0,
-                operation,
-                step.SequenceId);
-
-            BackendStepResult result = step.Kind switch
+            var operation = step.Operation;
+            ReserveSequence(step.SequenceId, $"plan {planId}");
+            try
             {
-                ScheduledInferenceKind.Prefill => await ExecuteScheduledPrefillAsync(
-                        step,
-                        prefillTokens,
-                        submission,
-                        slot,
-                        cancellationToken)
-                    .ConfigureAwait(false),
-                ScheduledInferenceKind.Decode => await ExecuteScheduledDecodeAsync(
-                        step,
-                        submission,
-                        slot,
-                        cancellationToken)
-                    .ConfigureAwait(false),
-                _ => throw new NotSupportedException(
-                    $"Unsupported scheduled inference kind {step.Kind}.")
-            };
+                Record(new ExecutionTraceEvent(
+                    planId,
+                    ExecutionTraceKind.PlanStarted,
+                    -1,
+                    "Plan"));
 
-            RecordSequenceState(
-                planId,
-                ExecutionTraceKind.StepCompleted,
-                0,
-                operation,
-                step.SequenceId);
+                cancellationToken.ThrowIfCancellationRequested();
 
-            Record(new ExecutionTraceEvent(
-                planId,
-                ExecutionTraceKind.PlanCompleted,
-                1,
-                "Plan"));
+                RecordSequenceState(
+                    planId,
+                    ExecutionTraceKind.StepStarted,
+                    0,
+                    operation,
+                    step.SequenceId);
 
-            return new ExecutionPlanResult(
-                planId,
-                new[] { result },
-                Array.Empty<KvSnapshotId>(),
-                Array.Empty<ForkExecutionResult>());
+                BackendStepResult result = step.Kind switch
+                {
+                    ScheduledInferenceKind.Prefill => await ExecuteScheduledPrefillAsync(
+                            step,
+                            prefillTokens,
+                            submission,
+                            slot,
+                            cancellationToken)
+                        .ConfigureAwait(false),
+                    ScheduledInferenceKind.Decode => await ExecuteScheduledDecodeAsync(
+                            step,
+                            submission,
+                            slot,
+                            cancellationToken)
+                        .ConfigureAwait(false),
+                    _ => throw new NotSupportedException(
+                        $"Unsupported scheduled inference kind {step.Kind}.")
+                };
+
+                RecordSequenceState(
+                    planId,
+                    ExecutionTraceKind.StepCompleted,
+                    0,
+                    operation,
+                    step.SequenceId);
+
+                Record(new ExecutionTraceEvent(
+                    planId,
+                    ExecutionTraceKind.PlanCompleted,
+                    1,
+                    "Plan"));
+
+                return new ExecutionPlanResult(
+                    planId,
+                    new[] { result },
+                    Array.Empty<KvSnapshotId>(),
+                    Array.Empty<ForkExecutionResult>());
+            }
+            finally
+            {
+                _sequenceReservations.TryRemove(step.SequenceId, out _);
+            }
+        }
+        catch (Exception exception)
+        {
+            failureCoordinator.Abort(exception);
+            throw;
         }
         finally
         {
-            _sequenceReservations.TryRemove(step.SequenceId, out _);
+            completionTracker?.Complete();
         }
     }
 
