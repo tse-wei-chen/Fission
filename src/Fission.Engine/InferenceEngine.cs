@@ -65,6 +65,9 @@ public sealed record InferenceCycleResult(
 /// </summary>
 public sealed partial class InferenceEngine : IDisposable
 {
+    private static readonly ScheduledExecutionBindings EmptyExecutionBindings =
+        new(new Dictionary<SequenceId, ScheduledPrefillBinding>());
+
     private readonly object _gate = new();
     private readonly SemaphoreSlim _cycleGate = new(1, 1);
     private readonly ExecutionPlanExecutor _runtime;
@@ -284,29 +287,7 @@ public sealed partial class InferenceEngine : IDisposable
             using var memoryReservationLease = admission.DeviceMemoryReservation;
             using var inferenceReservationLease = admission.DeviceInferenceReservation;
 
-            var prefillBindings = new Dictionary<SequenceId, ScheduledPrefillBinding>();
-            lock (_gate)
-            {
-                foreach (var item in admission.Decision.Batch.Items)
-                {
-                    if (item.Kind != ScheduledWorkKind.Prefill)
-                    {
-                        continue;
-                    }
-
-                    if (!_requests.TryGetValue(item.SequenceId, out var request) || request.IsCompleted)
-                    {
-                        throw new InvalidOperationException(
-                            $"Scheduler selected unknown or inactive request {item.SequenceId}.");
-                    }
-
-                    prefillBindings.Add(
-                        item.SequenceId,
-                        new ScheduledPrefillBinding(request.ModelId, request.PromptTokens));
-                }
-            }
-
-            var executionBindings = new ScheduledExecutionBindings(prefillBindings);
+            var executionBindings = BuildExecutionBindings(admission.Decision.Batch);
             BackendStepResult[] backendResults;
             if (admission.DeviceMemoryReservation is null &&
                 admission.DeviceInferenceReservation is null)
@@ -470,6 +451,47 @@ public sealed partial class InferenceEngine : IDisposable
         {
             inferenceReservation?.Release(device);
         }
+    }
+
+    private ScheduledExecutionBindings BuildExecutionBindings(ScheduledBatch batch)
+    {
+        var prefillCount = 0;
+        foreach (var item in batch.Items)
+        {
+            if (item.Kind == ScheduledWorkKind.Prefill)
+            {
+                prefillCount++;
+            }
+        }
+
+        if (prefillCount == 0)
+        {
+            return EmptyExecutionBindings;
+        }
+
+        var prefillBindings = new Dictionary<SequenceId, ScheduledPrefillBinding>(prefillCount);
+        lock (_gate)
+        {
+            foreach (var item in batch.Items)
+            {
+                if (item.Kind != ScheduledWorkKind.Prefill)
+                {
+                    continue;
+                }
+
+                if (!_requests.TryGetValue(item.SequenceId, out var request) || request.IsCompleted)
+                {
+                    throw new InvalidOperationException(
+                        $"Scheduler selected unknown or inactive request {item.SequenceId}.");
+                }
+
+                prefillBindings.Add(
+                    item.SequenceId,
+                    new ScheduledPrefillBinding(request.ModelId, request.PromptTokens));
+            }
+        }
+
+        return new ScheduledExecutionBindings(prefillBindings);
     }
 
     private void AddRequest(RequestState request)
