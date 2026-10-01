@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Runtime.ExceptionServices;
 using Fission.Abstractions;
+using Fission.Abstractions.Execution;
 using Fission.Abstractions.Scheduling;
 
 namespace Fission.Runtime.Execution;
@@ -124,16 +125,17 @@ public sealed class ScheduledBatchExecutor
         ScheduledBatch batch,
         ScheduledExecutionBindings bindings,
         CancellationToken cancellationToken = default) =>
-        ExecuteCoreAsync(
+        ExecutePublicAsync(
             batch,
             bindings,
             onDeviceCompleted: null,
             cancellationToken);
 
     /// <summary>
-    /// Runtime-internal execution path that reports each physical device exactly
-    /// once after every scheduled plan targeting that actor reaches a terminal
-    /// state. Other device groups may still be executing when the callback runs.
+    /// Runtime-internal compatibility path that reports each physical device
+    /// exactly once after every scheduled plan targeting that actor reaches a
+    /// terminal state. Engine hot paths use ExecuteBackendAsync to avoid
+    /// materializing per-item ExecutionPlanResult wrappers.
     /// </summary>
     internal ValueTask<ScheduledBatchResult> ExecuteAsync(
         ScheduledBatch batch,
@@ -142,14 +144,71 @@ public sealed class ScheduledBatchExecutor
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(onDeviceCompleted);
-        return ExecuteCoreAsync(
+        return ExecutePublicAsync(
             batch,
             bindings,
             onDeviceCompleted,
             cancellationToken);
     }
 
-    private async ValueTask<ScheduledBatchResult> ExecuteCoreAsync(
+    internal ValueTask<BackendStepResult[]> ExecuteBackendAsync(
+        ScheduledBatch batch,
+        ScheduledExecutionBindings bindings,
+        CancellationToken cancellationToken = default) =>
+        ExecuteBackendCoreAsync(
+            batch,
+            bindings,
+            onDeviceCompleted: null,
+            cancellationToken);
+
+    internal ValueTask<BackendStepResult[]> ExecuteBackendAsync(
+        ScheduledBatch batch,
+        ScheduledExecutionBindings bindings,
+        Action<DeviceId> onDeviceCompleted,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(onDeviceCompleted);
+        return ExecuteBackendCoreAsync(
+            batch,
+            bindings,
+            onDeviceCompleted,
+            cancellationToken);
+    }
+
+    private async ValueTask<ScheduledBatchResult> ExecutePublicAsync(
+        ScheduledBatch batch,
+        ScheduledExecutionBindings bindings,
+        Action<DeviceId>? onDeviceCompleted,
+        CancellationToken cancellationToken)
+    {
+        var backendResults = await ExecuteBackendCoreAsync(
+                batch,
+                bindings,
+                onDeviceCompleted,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        if (backendResults.Length == 0)
+        {
+            return new ScheduledBatchResult(
+                batch.ScheduleId,
+                Array.Empty<ExecutionPlanResult>());
+        }
+
+        var itemResults = new ExecutionPlanResult[backendResults.Length];
+        for (var index = 0; index < backendResults.Length; index++)
+        {
+            itemResults[index] = new ExecutionPlanResult(
+                DerivePlanId(batch.ScheduleId, index),
+                new[] { backendResults[index] },
+                Array.Empty<KvSnapshotId>(),
+                Array.Empty<ForkExecutionResult>());
+        }
+
+        return new ScheduledBatchResult(batch.ScheduleId, itemResults);
+    }
+
+    private async ValueTask<BackendStepResult[]> ExecuteBackendCoreAsync(
         ScheduledBatch batch,
         ScheduledExecutionBindings bindings,
         Action<DeviceId>? onDeviceCompleted,
@@ -162,7 +221,7 @@ public sealed class ScheduledBatchExecutor
         var prepared = Prepare(batch, bindings, countsByDevice);
         if (prepared.Length == 0)
         {
-            return new ScheduledBatchResult(batch.ScheduleId, Array.Empty<ExecutionPlanResult>());
+            return Array.Empty<BackendStepResult>();
         }
 
         foreach (var (device, count) in countsByDevice)
@@ -201,7 +260,7 @@ public sealed class ScheduledBatchExecutor
                 }
             }
 
-            var pending = new ValueTask<ExecutionPlanResult>[prepared.Length];
+            var pending = new ValueTask<BackendStepResult>[prepared.Length];
             for (var index = 0; index < prepared.Length; index++)
             {
                 var item = prepared[index];
@@ -229,7 +288,7 @@ public sealed class ScheduledBatchExecutor
                 }
             }
 
-            return new ScheduledBatchResult(batch.ScheduleId, results);
+            return results;
         }
         finally
         {
@@ -240,10 +299,10 @@ public sealed class ScheduledBatchExecutor
         }
     }
 
-    private static async ValueTask<ExecutionPlanResult[]> AwaitAllAsync(
-        ValueTask<ExecutionPlanResult>[] pending)
+    private static async ValueTask<BackendStepResult[]> AwaitAllAsync(
+        ValueTask<BackendStepResult>[] pending)
     {
-        var results = new ExecutionPlanResult[pending.Length];
+        var results = new BackendStepResult[pending.Length];
         ExceptionDispatchInfo? firstFailure = null;
         ExceptionDispatchInfo? firstCancellation = null;
 
