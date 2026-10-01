@@ -44,6 +44,7 @@ type SchedulingKernel() =
         | TransientKvByteBudget -> SchedulingDeferralReason.TransientKvByteBudget
         | DeviceMemoryBudget -> SchedulingDeferralReason.DeviceMemoryBudget
         | BatchSequenceBudget -> SchedulingDeferralReason.BatchSequenceBudget
+        | DeviceSequenceBudget -> SchedulingDeferralReason.DeviceSequenceBudget
 
     let toRejectionReason reason =
         match reason with
@@ -66,12 +67,21 @@ type SchedulingKernel() =
                     |> Seq.map (fun item -> item.Device, item.AvailableBytes)
                     |> Seq.toList
 
+            let maxDeviceSequences =
+                match budget.DeviceSequences with
+                | null -> []
+                | deviceSequences ->
+                    deviceSequences
+                    |> Seq.map (fun item -> item.Device, item.MaxSequences)
+                    |> Seq.toList
+
             let resourceBudget : ResourceBudget =
                 { MaxBatchTokens = budget.MaxBatchTokens
                   AvailableKvPages = budget.AvailableKvPages
                   MaxBatchSequences = budget.MaxBatchSequences
                   AvailableKvBytes = budget.AvailableKvBytes
-                  AvailableDeviceBytes = availableDeviceBytes }
+                  AvailableDeviceBytes = availableDeviceBytes
+                  MaxDeviceSequences = maxDeviceSequences }
 
             let schedulingPolicy : SchedulingPolicy =
                 { DecodeTokenReserve = policy.DecodeTokenReserve

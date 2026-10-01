@@ -28,7 +28,8 @@ type ResourceBudget =
       AvailableKvPages: int
       MaxBatchSequences: int
       AvailableKvBytes: int64
-      AvailableDeviceBytes: (DeviceId * int64) list }
+      AvailableDeviceBytes: (DeviceId * int64) list
+      MaxDeviceSequences: (DeviceId * int) list }
 
 type SchedulingPolicy =
     { DecodeTokenReserve: int
@@ -53,6 +54,7 @@ type DeferredReason =
     | TransientKvByteBudget
     | DeviceMemoryBudget
     | BatchSequenceBudget
+    | DeviceSequenceBudget
 
 type ScheduledSequence =
     { Sequence: ReadySequence

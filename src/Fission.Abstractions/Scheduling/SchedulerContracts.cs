@@ -32,17 +32,29 @@ public readonly record struct SchedulingDeviceMemoryBudget(
     long AvailableBytes);
 
 /// <summary>
+/// Maximum number of work items that may be selected for one physical execution
+/// actor in the current atomic scheduler submission. This is independent from the
+/// global MaxBatchSequences limit so heterogeneous device actors do not clamp one
+/// another while each actor still receives a batch within its own capacity.
+/// </summary>
+public readonly record struct SchedulingDeviceSequenceBudget(
+    DeviceId Device,
+    int MaxSequences);
+
+/// <summary>
 /// Logical retained-KV byte slack remains independent from physical device-memory
 /// headroom. The scheduler checks retained and immutable-successor KV constraints
 /// against AvailableKvBytes, while DeviceMemory applies an additional per-device
-/// transient allocation constraint when supplied.
+/// transient allocation constraint when supplied. DeviceSequences independently
+/// constrains the number of selected items sent to each physical execution actor.
 /// </summary>
 public readonly record struct SchedulingBudget(
     int MaxBatchTokens,
     int AvailableKvPages,
     int MaxBatchSequences,
     long AvailableKvBytes = long.MaxValue,
-    IReadOnlyList<SchedulingDeviceMemoryBudget>? DeviceMemory = null);
+    IReadOnlyList<SchedulingDeviceMemoryBudget>? DeviceMemory = null,
+    IReadOnlyList<SchedulingDeviceSequenceBudget>? DeviceSequences = null);
 
 public readonly record struct SchedulingPolicyOptions(
     int DecodeTokenReserve,
@@ -57,7 +69,8 @@ public enum SchedulingDeferralReason
     KvByteBudget,
     TransientKvByteBudget,
     DeviceMemoryBudget,
-    BatchSequenceBudget
+    BatchSequenceBudget,
+    DeviceSequenceBudget
 }
 
 public enum SchedulingRejectionReason

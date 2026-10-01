@@ -265,10 +265,7 @@ public sealed class InferenceEngine : IDisposable
                 candidates[index] = BuildCandidate(active[index], kvBefore.TokensPerPage);
             }
 
-            var executionCapacity = _runtime.GetExecutionCapacity();
-            var maxBatchSequences = Math.Min(
-                _options.MaxBatchSequences,
-                executionCapacity.MaxInferenceItems);
+            var maxBatchSequences = _options.MaxBatchSequences;
             var availableKvBytes = GetAvailableKvBytes(active);
             var (decision, deviceMemoryReservation, backpressureReservations) =
                 await ScheduleWithDeviceMemoryAdmissionAsync(
@@ -564,8 +561,20 @@ public sealed class InferenceEngine : IDisposable
         int maxBatchSequences,
         long availableKvBytes,
         IReadOnlyList<SchedulingCandidate> candidates,
-        IReadOnlyList<SchedulingDeviceMemoryBudget>? deviceMemory) =>
-        _scheduler.Schedule(
+        IReadOnlyList<SchedulingDeviceMemoryBudget>? deviceMemory)
+    {
+        var deviceSequences = candidates
+            .Select(static candidate => candidate.ExecutionDevice)
+            .Where(static device => device.HasValue)
+            .Select(static device => device!.Value)
+            .Distinct()
+            .OrderBy(static device => device.Value, StringComparer.Ordinal)
+            .Select(device => new SchedulingDeviceSequenceBudget(
+                device,
+                _runtime.GetDeviceInferenceCapacity(device)))
+            .ToArray();
+
+        return _scheduler.Schedule(
             scheduleId,
             now,
             new SchedulingBudget(
@@ -573,9 +582,11 @@ public sealed class InferenceEngine : IDisposable
                 kvCapacity.AvailablePages,
                 maxBatchSequences,
                 availableKvBytes,
-                deviceMemory),
+                deviceMemory,
+                deviceSequences),
             _options.Scheduling,
             candidates);
+    }
 
     private DeviceMemoryBudgetSnapshot GetDeviceMemoryBudgets(
         IReadOnlyList<DeviceId> devices)
