@@ -308,18 +308,15 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                     }
 
                     var count = end - index;
-                    var work = new PendingPrefill[count];
                     var items = new PrefillItem[count];
                     for (var offset = 0; offset < count; offset++)
                     {
-                        var pending = (PendingPrefill)segment[index + offset];
-                        work[offset] = pending;
-                        items[offset] = pending.Item;
+                        items[offset] = ((PendingPrefill)segment[index + offset]).Item;
                     }
 
                     var results = await _backend.PrefillAsync(
                         new PrefillBatch(items)).ConfigureAwait(false);
-                    Complete(work, results);
+                    Complete(segment, index, count, results);
                     index = end;
                     break;
                 }
@@ -335,18 +332,15 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                     }
 
                     var count = end - index;
-                    var work = new PendingDecode[count];
                     var items = new DecodeItem[count];
                     for (var offset = 0; offset < count; offset++)
                     {
-                        var pending = (PendingDecode)segment[index + offset];
-                        work[offset] = pending;
-                        items[offset] = pending.Item;
+                        items[offset] = ((PendingDecode)segment[index + offset]).Item;
                     }
 
                     var results = await _backend.DecodeAsync(
                         new DecodeBatch(items)).ConfigureAwait(false);
-                    Complete(work, results);
+                    Complete(segment, index, count, results);
                     index = end;
                     break;
                 }
@@ -358,25 +352,27 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         }
     }
 
-    private static void Complete<TWork>(
-        IReadOnlyList<TWork> work,
+    private static void Complete(
+        IReadOnlyList<PendingInference> segment,
+        int start,
+        int count,
         IReadOnlyList<BackendStepResult> results)
-        where TWork : PendingInference
     {
-        if (work.Count != results.Count)
+        if (count != results.Count)
         {
             throw new InvalidOperationException(
-                $"Backend returned {results.Count} results for {work.Count} work items.");
+                $"Backend returned {results.Count} results for {count} work items.");
         }
 
-        for (var i = 0; i < work.Count; i++)
+        for (var i = 0; i < count; i++)
         {
-            var expectedSequenceId = work[i] switch
+            var work = segment[start + i];
+            var expectedSequenceId = work switch
             {
                 PendingPrefill prefill => prefill.Item.SequenceId,
                 PendingDecode decode => decode.Item.SequenceId,
                 _ => throw new InvalidOperationException(
-                    $"Unsupported inference work type {work[i].GetType().Name}.")
+                    $"Unsupported inference work type {work.GetType().Name}.")
             };
 
             if (results[i].SequenceId != expectedSequenceId)
@@ -387,9 +383,9 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
             }
         }
 
-        for (var i = 0; i < work.Count; i++)
+        for (var i = 0; i < count; i++)
         {
-            work[i].Complete(results[i]);
+            segment[start + i].Complete(results[i]);
         }
     }
 
