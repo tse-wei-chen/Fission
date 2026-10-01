@@ -5,8 +5,33 @@ using Fission.Runtime.Execution;
 
 internal static class BorrowedBatchLifetimeSpecs
 {
+    private static Task? _runTask;
+
     [ModuleInitializer]
-    internal static void Run() => RunAsync().GetAwaiter().GetResult();
+    internal static void Start()
+    {
+        _runTask = Task.Run(RunAsync);
+        AppDomain.CurrentDomain.ProcessExit += static (_, _) => CompleteBeforeExit();
+    }
+
+    private static void CompleteBeforeExit()
+    {
+        var runTask = _runTask;
+        if (runTask is null)
+        {
+            return;
+        }
+
+        try
+        {
+            runTask.GetAwaiter().GetResult();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"Borrowed backend batch lifetime spec failed: {exception}");
+            Environment.ExitCode = 1;
+        }
+    }
 
     private static async Task RunAsync()
     {
