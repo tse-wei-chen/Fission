@@ -19,6 +19,11 @@ internal readonly record struct RuntimeDeviceMemoryReservationVersion(
 internal sealed record RuntimeDeviceMemoryReservationState(
     IReadOnlyList<RuntimeDeviceMemoryReservationSnapshot> Reservations);
 
+internal interface IRuntimeDeviceMemoryReservationLease : IDisposable
+{
+    void Release(DeviceId device);
+}
+
 public sealed partial class ExecutionPlanExecutor
 {
     private readonly ConcurrentDictionary<DeviceId, SemaphoreSlim>
@@ -184,13 +189,35 @@ public sealed partial class ExecutionPlanExecutor
     internal IDisposable ReserveDeviceMemory(
         IReadOnlyList<RuntimeDeviceMemoryReservationRequest> requests)
     {
+        var normalized = ReserveDeviceMemoryCore(requests);
+        return normalized.Count == 0
+            ? EmptyReservationLease.Instance
+            : new DeviceMemoryReservationLease(this, normalized);
+    }
+
+    /// <summary>
+    /// Atomically charges all requested physical devices, then returns one logical
+    /// lease whose individual device reservations may be released independently as
+    /// their execution groups reach a terminal state. Disposing the lease releases
+    /// any devices that have not already completed.
+    /// </summary>
+    internal IRuntimeDeviceMemoryReservationLease ReserveDeviceMemoryByDevice(
+        IReadOnlyList<RuntimeDeviceMemoryReservationRequest> requests)
+    {
+        var normalized = ReserveDeviceMemoryCore(requests);
+        return new DeviceMemoryReservationLeaseSet(this, normalized);
+    }
+
+    private Dictionary<DeviceId, long> ReserveDeviceMemoryCore(
+        IReadOnlyList<RuntimeDeviceMemoryReservationRequest> requests)
+    {
         ArgumentNullException.ThrowIfNull(requests);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         var normalized = NormalizeReservationRequests(requests);
         if (normalized.Count == 0)
         {
-            return EmptyReservationLease.Instance;
+            return normalized;
         }
 
         var entries = normalized
@@ -217,7 +244,7 @@ public sealed partial class ExecutionPlanExecutor
             }
         }
 
-        return new DeviceMemoryReservationLease(this, normalized);
+        return normalized;
     }
 
     private void ReleaseDeviceMemoryReservations(
@@ -472,6 +499,69 @@ public sealed partial class ExecutionPlanExecutor
         {
             Interlocked.Exchange(ref _owner, null)?
                 .ReleaseDeviceMemoryReservations(_reservations);
+        }
+    }
+
+    private sealed class DeviceMemoryReservationLeaseSet :
+        IRuntimeDeviceMemoryReservationLease
+    {
+        private readonly object _gate = new();
+        private ExecutionPlanExecutor? _owner;
+        private Dictionary<DeviceId, long>? _remaining;
+
+        public DeviceMemoryReservationLeaseSet(
+            ExecutionPlanExecutor owner,
+            IReadOnlyDictionary<DeviceId, long> reservations)
+        {
+            if (reservations.Count == 0)
+            {
+                return;
+            }
+
+            _owner = owner;
+            _remaining = reservations.ToDictionary(
+                static pair => pair.Key,
+                static pair => pair.Value);
+        }
+
+        public void Release(DeviceId device)
+        {
+            lock (_gate)
+            {
+                if (_owner is null ||
+                    _remaining is null ||
+                    !_remaining.TryGetValue(device, out var bytes))
+                {
+                    return;
+                }
+
+                _owner.ReleaseDeviceMemoryReservations(
+                    new Dictionary<DeviceId, long>
+                    {
+                        [device] = bytes
+                    });
+                _remaining.Remove(device);
+                if (_remaining.Count == 0)
+                {
+                    _remaining = null;
+                    _owner = null;
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (_gate)
+            {
+                if (_owner is null || _remaining is null)
+                {
+                    return;
+                }
+
+                _owner.ReleaseDeviceMemoryReservations(_remaining);
+                _remaining = null;
+                _owner = null;
+            }
         }
     }
 
