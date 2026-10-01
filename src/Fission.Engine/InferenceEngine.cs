@@ -73,6 +73,7 @@ public sealed partial class InferenceEngine : IDisposable
     private readonly InferenceEngineOptions _options;
     private readonly IInferenceKvMemoryProfile? _kvMemoryProfile;
     private readonly Dictionary<SequenceId, RequestState> _requests = new();
+    private int _activeRequestCount;
     private int _disposed;
 
     public InferenceEngine(
@@ -134,7 +135,7 @@ public sealed partial class InferenceEngine : IDisposable
         {
             lock (_gate)
             {
-                return _requests.Values.Count(static request => !request.IsCompleted);
+                return _activeRequestCount;
             }
         }
     }
@@ -165,11 +166,7 @@ public sealed partial class InferenceEngine : IDisposable
             deadline,
             enqueuedAt ?? DateTimeOffset.UtcNow);
 
-        lock (_gate)
-        {
-            _requests.Add(sequenceId, state);
-        }
-
+        AddRequest(state);
         return sequenceId;
     }
 
@@ -233,8 +230,7 @@ public sealed partial class InferenceEngine : IDisposable
 
             lock (_gate)
             {
-                request.IsCompleted = true;
-                request.FinishReason = InferenceFinishReason.Cancelled;
+                MarkRequestCompleted(request, InferenceFinishReason.Cancelled);
                 return request.Snapshot();
             }
         }
@@ -476,14 +472,63 @@ public sealed partial class InferenceEngine : IDisposable
         }
     }
 
+    private void AddRequest(RequestState request)
+    {
+        lock (_gate)
+        {
+            _requests.Add(request.SequenceId, request);
+            _activeRequestCount = checked(_activeRequestCount + 1);
+        }
+    }
+
+    private void MarkRequestCompleted(
+        RequestState request,
+        InferenceFinishReason finishReason)
+    {
+        if (request.IsCompleted)
+        {
+            return;
+        }
+
+        request.IsCompleted = true;
+        request.FinishReason = finishReason;
+        _activeRequestCount = checked(_activeRequestCount - 1);
+    }
+
     private RequestView[] SnapshotActiveRequests()
     {
         lock (_gate)
         {
-            return _requests.Values
-                .Where(static request => !request.IsCompleted)
-                .Select(static request => request.View())
-                .ToArray();
+            if (_activeRequestCount == 0)
+            {
+                return Array.Empty<RequestView>();
+            }
+
+            var active = new RequestView[_activeRequestCount];
+            var index = 0;
+            foreach (var request in _requests.Values)
+            {
+                if (request.IsCompleted)
+                {
+                    continue;
+                }
+
+                if ((uint)index >= (uint)active.Length)
+                {
+                    throw new InvalidOperationException(
+                        "Active request count exceeded the tracked active-request index.");
+                }
+
+                active[index++] = request.View();
+            }
+
+            if (index != active.Length)
+            {
+                throw new InvalidOperationException(
+                    $"Tracked active request count {_activeRequestCount} does not match snapshot count {index}.");
+            }
+
+            return active;
         }
     }
 
@@ -1116,8 +1161,7 @@ public sealed partial class InferenceEngine : IDisposable
         {
             if (_requests.TryGetValue(sequenceId, out var request))
             {
-                request.IsCompleted = true;
-                request.FinishReason = finishReason;
+                MarkRequestCompleted(request, finishReason);
             }
         }
     }
