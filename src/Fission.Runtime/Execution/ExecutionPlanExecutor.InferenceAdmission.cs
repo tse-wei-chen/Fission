@@ -19,6 +19,11 @@ internal readonly record struct RuntimeDeviceInferenceReservationVersion(
 internal sealed record RuntimeDeviceInferenceReservationState(
     IReadOnlyList<RuntimeDeviceInferenceReservationSnapshot> Reservations);
 
+internal interface IRuntimeDeviceInferenceReservationLease : IDisposable
+{
+    void Release(DeviceId device);
+}
+
 /// <summary>
 /// Runtime-scoped reservation ledger for inference item credits that have been
 /// admitted by a scheduler but are not represented in the device actor's credit
@@ -57,9 +62,63 @@ public sealed partial class ExecutionPlanExecutor
         return SnapshotDeviceInferenceReservationState(ledgers);
     }
 
+    /// <summary>
+    /// Waits until any observed physical device releases inference-item
+    /// reservations. Version comparison and signal capture happen under that
+    /// device's ledger lock, so a release immediately before waiter attachment is
+    /// observed as a version mismatch instead of being lost.
+    /// </summary>
+    internal Task WaitForDeviceInferenceReservationReleaseAsync(
+        IReadOnlyList<RuntimeDeviceInferenceReservationVersion> observedVersions,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(observedVersions);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+        if (observedVersions.Count == 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        var normalized = new Dictionary<DeviceId, long>();
+        foreach (var observed in observedVersions)
+        {
+            if (normalized.TryGetValue(observed.Device, out var existing) &&
+                existing != observed.ReleaseVersion)
+            {
+                throw new InvalidOperationException(
+                    $"Conflicting inference reservation release versions were supplied for {observed.Device}: " +
+                    $"{existing} and {observed.ReleaseVersion}.");
+            }
+
+            normalized[observed.Device] = observed.ReleaseVersion;
+        }
+
+        var signals = new Task<long>[normalized.Count];
+        var index = 0;
+        foreach (var (device, observedVersion) in normalized
+                     .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal))
+        {
+            var ledger = GetOrCreateDeviceInferenceReservationLedger(device);
+            lock (ledger.Gate)
+            {
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+                if (ledger.ReleaseVersion != observedVersion)
+                {
+                    return Task.CompletedTask;
+                }
+
+                ledger.ReleaseSignal ??= CreateInferenceReservationReleaseSignal();
+                signals[index++] = ledger.ReleaseSignal.Task;
+            }
+        }
+
+        return WaitForAnyInferenceReservationReleaseAsync(signals, cancellationToken);
+    }
+
     internal bool TryReserveDeviceInference(
         IReadOnlyList<RuntimeDeviceInferenceReservationRequest> requests,
-        out IDisposable reservation)
+        out IRuntimeDeviceInferenceReservationLease reservation)
     {
         ArgumentNullException.ThrowIfNull(requests);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
@@ -108,7 +167,7 @@ public sealed partial class ExecutionPlanExecutor
             }
         }
 
-        reservation = new DeviceInferenceReservationLease(this, normalized);
+        reservation = new DeviceInferenceReservationLeaseSet(this, normalized);
         return true;
     }
 
@@ -204,6 +263,16 @@ public sealed partial class ExecutionPlanExecutor
         }
     }
 
+    private static async Task WaitForAnyInferenceReservationReleaseAsync(
+        IReadOnlyList<Task<long>> signals,
+        CancellationToken cancellationToken)
+    {
+        var completed = await Task.WhenAny(signals)
+            .WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+        await completed.ConfigureAwait(false);
+    }
+
     private void ReleaseDeviceInferenceReservations(
         IReadOnlyDictionary<DeviceId, int> reservations)
     {
@@ -214,6 +283,8 @@ public sealed partial class ExecutionPlanExecutor
                 pair.Value,
                 int.MaxValue))
             .ToArray();
+        var releasedSignals = new List<(TaskCompletionSource<long> Signal, long Version)>(
+            entries.Length);
 
         using (EnterInferenceReservationLedgerLocks(entries))
         {
@@ -235,11 +306,49 @@ public sealed partial class ExecutionPlanExecutor
 
             for (var index = 0; index < entries.Length; index++)
             {
-                entries[index].Ledger.ReservedItems = remainingItems[index];
-                entries[index].Ledger.ReleaseVersion = releaseVersions[index];
+                var ledger = entries[index].Ledger;
+                ledger.ReservedItems = remainingItems[index];
+                ledger.ReleaseVersion = releaseVersions[index];
+                if (ledger.ReleaseSignal is { } signal)
+                {
+                    ledger.ReleaseSignal = null;
+                    releasedSignals.Add((signal, releaseVersions[index]));
+                }
             }
         }
+
+        foreach (var (signal, version) in releasedSignals)
+        {
+            signal.TrySetResult(version);
+        }
     }
+
+    private void DisposeDeviceInferenceReservationWaiters()
+    {
+        var signals = new List<TaskCompletionSource<long>>();
+        foreach (var ledger in _deviceInferenceReservationLedgers.Values)
+        {
+            lock (ledger.Gate)
+            {
+                if (ledger.ReleaseSignal is not { } signal)
+                {
+                    continue;
+                }
+
+                ledger.ReleaseSignal = null;
+                signals.Add(signal);
+            }
+        }
+
+        foreach (var signal in signals)
+        {
+            signal.TrySetException(
+                new ObjectDisposedException(nameof(ExecutionPlanExecutor)));
+        }
+    }
+
+    private static TaskCompletionSource<long> CreateInferenceReservationReleaseSignal() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private sealed class DeviceInferenceReservationLedger(DeviceId device)
     {
@@ -247,6 +356,7 @@ public sealed partial class ExecutionPlanExecutor
         public object Gate { get; } = new();
         public int ReservedItems { get; set; }
         public long ReleaseVersion { get; set; }
+        public TaskCompletionSource<long>? ReleaseSignal { get; set; }
     }
 
     private readonly record struct InferenceReservationLedgerMutation(
@@ -274,29 +384,77 @@ public sealed partial class ExecutionPlanExecutor
         }
     }
 
-    private sealed class DeviceInferenceReservationLease : IDisposable
+    private sealed class DeviceInferenceReservationLeaseSet :
+        IRuntimeDeviceInferenceReservationLease
     {
+        private readonly object _gate = new();
         private ExecutionPlanExecutor? _owner;
-        private readonly IReadOnlyDictionary<DeviceId, int> _reservations;
+        private Dictionary<DeviceId, int>? _remaining;
 
-        public DeviceInferenceReservationLease(
+        public DeviceInferenceReservationLeaseSet(
             ExecutionPlanExecutor owner,
             IReadOnlyDictionary<DeviceId, int> reservations)
         {
+            if (reservations.Count == 0)
+            {
+                return;
+            }
+
             _owner = owner;
-            _reservations = reservations;
+            _remaining = reservations.ToDictionary(
+                static pair => pair.Key,
+                static pair => pair.Value);
+        }
+
+        public void Release(DeviceId device)
+        {
+            lock (_gate)
+            {
+                if (_owner is null ||
+                    _remaining is null ||
+                    !_remaining.TryGetValue(device, out var items))
+                {
+                    return;
+                }
+
+                _owner.ReleaseDeviceInferenceReservations(
+                    new Dictionary<DeviceId, int>
+                    {
+                        [device] = items
+                    });
+                _remaining.Remove(device);
+                if (_remaining.Count == 0)
+                {
+                    _remaining = null;
+                    _owner = null;
+                }
+            }
         }
 
         public void Dispose()
         {
-            Interlocked.Exchange(ref _owner, null)?
-                .ReleaseDeviceInferenceReservations(_reservations);
+            lock (_gate)
+            {
+                if (_owner is null || _remaining is null)
+                {
+                    return;
+                }
+
+                _owner.ReleaseDeviceInferenceReservations(_remaining);
+                _remaining = null;
+                _owner = null;
+            }
         }
     }
 
-    private sealed class EmptyInferenceReservationLease : IDisposable
+    private sealed class EmptyInferenceReservationLease :
+        IRuntimeDeviceInferenceReservationLease
     {
         public static EmptyInferenceReservationLease Instance { get; } = new();
+        public void Release(DeviceId device)
+        {
+        }
+
         public void Dispose()
         {
         }
