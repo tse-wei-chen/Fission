@@ -769,16 +769,14 @@ public sealed partial class InferenceEngine : IDisposable
         IReadOnlyList<DeviceId> devices,
         RuntimeDeviceInferenceReservationState reservationState)
     {
-        var reservedByDevice = reservationState.Reservations
-            .ToDictionary(
-                static reservation => reservation.Device,
-                static reservation => reservation.Items);
         var budgets = new SchedulingDeviceSequenceBudget[devices.Count];
         for (var index = 0; index < devices.Count; index++)
         {
             var device = devices[index];
             var capacity = _runtime.GetDeviceInferenceCapacity(device);
-            reservedByDevice.TryGetValue(device, out var reservedItems);
+            var reservedItems = GetReservedInferenceItems(
+                reservationState.Reservations,
+                device);
             var available = reservedItems >= capacity
                 ? 0
                 : capacity - reservedItems;
@@ -797,18 +795,14 @@ public sealed partial class InferenceEngine : IDisposable
                 "Device-memory budgets require MaxDeviceBytes to be configured.");
         }
 
-        var pressureByDevice = _runtime.GetDeviceMemoryPressureCore(devices)
-            .ToDictionary(static pressure => pressure.Device);
+        var pressures = _runtime.GetDeviceMemoryPressureCore(devices);
         var reservationState = _runtime.GetDeviceMemoryReservationState(devices);
-        var reservedByDevice = reservationState.Reservations
-            .ToDictionary(static reservation => reservation.Device,
-                static reservation => reservation.Bytes);
         var budgets = new SchedulingDeviceMemoryBudget[devices.Count];
 
         for (var index = 0; index < devices.Count; index++)
         {
             var device = devices[index];
-            if (!pressureByDevice.TryGetValue(device, out var pressure))
+            if (!TryGetDeviceMemoryPressure(pressures, device, out var pressure))
             {
                 throw new InvalidOperationException(
                     $"MaxDeviceBytes requires physical memory pressure from execution device {device}.");
@@ -817,7 +811,9 @@ public sealed partial class InferenceEngine : IDisposable
             var physicalAvailableBytes = pressure.ReservedBytes >= maxDeviceBytes
                 ? 0L
                 : maxDeviceBytes - pressure.ReservedBytes;
-            reservedByDevice.TryGetValue(device, out var outstandingReservationBytes);
+            var outstandingReservationBytes = GetReservedDeviceMemoryBytes(
+                reservationState.Reservations,
+                device);
             var availableBytes = outstandingReservationBytes >= physicalAvailableBytes
                 ? 0L
                 : physicalAvailableBytes - outstandingReservationBytes;
@@ -825,6 +821,79 @@ public sealed partial class InferenceEngine : IDisposable
         }
 
         return new DeviceMemoryBudgetSnapshot(budgets, reservationState);
+    }
+
+    // Admission snapshots are device-scoped and intentionally small. Linear scans
+    // avoid rebuilding transient hash tables on every scheduling cycle.
+    private static int GetReservedInferenceItems(
+        IReadOnlyList<RuntimeDeviceInferenceReservationSnapshot> reservations,
+        DeviceId device) =>
+        TryGetDeviceInferenceReservation(reservations, device, out var reservation)
+            ? reservation.Items
+            : 0;
+
+    private static long GetReservedDeviceMemoryBytes(
+        IReadOnlyList<RuntimeDeviceMemoryReservationSnapshot> reservations,
+        DeviceId device) =>
+        TryGetDeviceMemoryReservation(reservations, device, out var reservation)
+            ? reservation.Bytes
+            : 0L;
+
+    private static bool TryGetDeviceInferenceReservation(
+        IReadOnlyList<RuntimeDeviceInferenceReservationSnapshot> reservations,
+        DeviceId device,
+        out RuntimeDeviceInferenceReservationSnapshot reservation)
+    {
+        for (var index = 0; index < reservations.Count; index++)
+        {
+            var candidate = reservations[index];
+            if (candidate.Device.Equals(device))
+            {
+                reservation = candidate;
+                return true;
+            }
+        }
+
+        reservation = default;
+        return false;
+    }
+
+    private static bool TryGetDeviceMemoryReservation(
+        IReadOnlyList<RuntimeDeviceMemoryReservationSnapshot> reservations,
+        DeviceId device,
+        out RuntimeDeviceMemoryReservationSnapshot reservation)
+    {
+        for (var index = 0; index < reservations.Count; index++)
+        {
+            var candidate = reservations[index];
+            if (candidate.Device.Equals(device))
+            {
+                reservation = candidate;
+                return true;
+            }
+        }
+
+        reservation = default;
+        return false;
+    }
+
+    private static bool TryGetDeviceMemoryPressure(
+        IReadOnlyList<RuntimeDeviceMemoryPressure> pressures,
+        DeviceId device,
+        out RuntimeDeviceMemoryPressure pressure)
+    {
+        for (var index = 0; index < pressures.Count; index++)
+        {
+            var candidate = pressures[index];
+            if (candidate.Device.Equals(device))
+            {
+                pressure = candidate;
+                return true;
+            }
+        }
+
+        pressure = default;
+        return false;
     }
 
     private static IReadOnlyList<RuntimeDeviceMemoryReservationVersion>?
@@ -839,9 +908,6 @@ public sealed partial class InferenceEngine : IDisposable
             return null;
         }
 
-        var reservationByDevice = reservationState.Reservations
-            .Where(static reservation => reservation.Bytes > 0)
-            .ToDictionary(static reservation => reservation.Device);
         var blocked = new Dictionary<DeviceId, long>();
 
         foreach (var deferred in decision.Deferred)
@@ -849,7 +915,11 @@ public sealed partial class InferenceEngine : IDisposable
             if (deferred.Reason != SchedulingDeferralReason.DeviceMemoryBudget ||
                 !candidateBySequence.TryGetValue(deferred.SequenceId, out var candidate) ||
                 candidate.ExecutionDevice is not { } device ||
-                !reservationByDevice.TryGetValue(device, out var reservation))
+                !TryGetDeviceMemoryReservation(
+                    reservationState.Reservations,
+                    device,
+                    out var reservation) ||
+                reservation.Bytes <= 0)
             {
                 continue;
             }
@@ -879,9 +949,6 @@ public sealed partial class InferenceEngine : IDisposable
             return null;
         }
 
-        var reservationByDevice = reservationState.Reservations
-            .Where(static reservation => reservation.Items > 0)
-            .ToDictionary(static reservation => reservation.Device);
         var blocked = new Dictionary<DeviceId, long>();
 
         foreach (var deferred in decision.Deferred)
@@ -889,7 +956,11 @@ public sealed partial class InferenceEngine : IDisposable
             if (deferred.Reason != SchedulingDeferralReason.DeviceSequenceBudget ||
                 !candidateBySequence.TryGetValue(deferred.SequenceId, out var candidate) ||
                 candidate.ExecutionDevice is not { } device ||
-                !reservationByDevice.TryGetValue(device, out var reservation))
+                !TryGetDeviceInferenceReservation(
+                    reservationState.Reservations,
+                    device,
+                    out var reservation) ||
+                reservation.Items <= 0)
             {
                 continue;
             }
@@ -1008,22 +1079,21 @@ public sealed partial class InferenceEngine : IDisposable
         var blockedDevices = firstBlockedByDevice.Keys
             .OrderBy(static device => device.Value, StringComparer.Ordinal)
             .ToArray();
-        var pressureByDevice = _runtime.GetDeviceMemoryPressureCore(blockedDevices)
-            .ToDictionary(static pressure => pressure.Device);
-        var reservedByDevice = _runtime.GetDeviceMemoryReservations(blockedDevices)
-            .ToDictionary(static reservation => reservation.Device,
-                static reservation => reservation.Bytes);
+        var pressures = _runtime.GetDeviceMemoryPressureCore(blockedDevices);
+        var reservations = _runtime.GetDeviceMemoryReservations(blockedDevices);
         var shouldReschedule = false;
 
         foreach (var (device, blockedCandidate) in firstBlockedByDevice)
         {
-            if (!pressureByDevice.TryGetValue(device, out var pressure))
+            if (!TryGetDeviceMemoryPressure(pressures, device, out var pressure))
             {
                 continue;
             }
 
             selectedTransientByDevice.TryGetValue(device, out var selectedTransientBytes);
-            reservedByDevice.TryGetValue(device, out var outstandingReservationBytes);
+            var outstandingReservationBytes = GetReservedDeviceMemoryBytes(
+                reservations,
+                device);
             var minimumBlockedTransientBytes = checked(
                 ((long)blockedCandidate.Position + 1L) *
                 blockedCandidate.KvBytesPerToken);
