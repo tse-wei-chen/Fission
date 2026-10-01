@@ -1,6 +1,7 @@
 using System.Collections;
 using System.Runtime.ExceptionServices;
 using System.Threading.Channels;
+using System.Threading.Tasks.Sources;
 using Fission.Abstractions;
 using Fission.Abstractions.Execution;
 
@@ -183,7 +184,7 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
             }
         }
 
-        return await work.Completion.Task.ConfigureAwait(false);
+        return await work.WaitAsync().ConfigureAwait(false);
     }
 
     private async ValueTask SubmitControlAsync(
@@ -640,27 +641,52 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         public abstract void Fail(Exception exception);
     }
 
-    internal abstract class PendingInference : PendingWork
+    internal abstract class PendingInference : PendingWork, IValueTaskSource<BackendStepResult>
     {
+        private ManualResetValueTaskSourceCore<BackendStepResult> _completion;
+        private int _terminal;
+
         protected PendingInference()
         {
-            Completion = new TaskCompletionSource<BackendStepResult>(
-                TaskCreationOptions.RunContinuationsAsynchronously);
+            _completion.RunContinuationsAsynchronously = true;
         }
 
-        public TaskCompletionSource<BackendStepResult> Completion { get; }
+        internal ValueTask<BackendStepResult> WaitAsync() =>
+            new(this, _completion.Version);
 
         internal void Complete(BackendStepResult result)
         {
-            Completion.TrySetResult(result);
+            if (Interlocked.CompareExchange(ref _terminal, 1, 0) == 0)
+            {
+                _completion.SetResult(result);
+            }
+
             ReleaseCredits();
         }
 
         public override void Fail(Exception exception)
         {
-            Completion.TrySetException(exception);
+            ArgumentNullException.ThrowIfNull(exception);
+            if (Interlocked.CompareExchange(ref _terminal, 1, 0) == 0)
+            {
+                _completion.SetException(exception);
+            }
+
             ReleaseCredits();
         }
+
+        BackendStepResult IValueTaskSource<BackendStepResult>.GetResult(short token) =>
+            _completion.GetResult(token);
+
+        ValueTaskSourceStatus IValueTaskSource<BackendStepResult>.GetStatus(short token) =>
+            _completion.GetStatus(token);
+
+        void IValueTaskSource<BackendStepResult>.OnCompleted(
+            Action<object?> continuation,
+            object? state,
+            short token,
+            ValueTaskSourceOnCompletedFlags flags) =>
+            _completion.OnCompleted(continuation, state, token, flags);
     }
 
     private sealed class PendingPrefill(PrefillItem item) : PendingInference
