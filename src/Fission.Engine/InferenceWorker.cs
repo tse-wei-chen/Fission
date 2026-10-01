@@ -360,16 +360,18 @@ public sealed class InferenceWorker : IAsyncDisposable
                 continue;
             }
 
-            var snapshot = _engine.GetSnapshot(item.SequenceId);
-            if (snapshot.GeneratedTokens.Count <= session.PublishedTokenCount)
+            if (!_engine.TryReadGeneratedToken(
+                    item.SequenceId,
+                    session.PublishedTokenCount,
+                    out var token,
+                    out var generatedTokenCount))
             {
                 throw new InvalidOperationException(
                     $"Decode work for {item.SequenceId} did not produce a new token.");
             }
 
-            while (session.PublishedTokenCount < snapshot.GeneratedTokens.Count)
+            while (true)
             {
-                var token = snapshot.GeneratedTokens[session.PublishedTokenCount];
                 if (!session.Writer.TryWrite(token))
                 {
                     throw new InvalidOperationException(
@@ -377,6 +379,20 @@ public sealed class InferenceWorker : IAsyncDisposable
                 }
 
                 session.PublishedTokenCount++;
+                if (session.PublishedTokenCount >= generatedTokenCount)
+                {
+                    break;
+                }
+
+                if (!_engine.TryReadGeneratedToken(
+                        item.SequenceId,
+                        session.PublishedTokenCount,
+                        out token,
+                        out generatedTokenCount))
+                {
+                    throw new InvalidOperationException(
+                        $"Generated token history for {item.SequenceId} changed while publishing its decode result.");
+                }
             }
         }
     }
