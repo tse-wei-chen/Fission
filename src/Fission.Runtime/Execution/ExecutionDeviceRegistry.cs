@@ -90,7 +90,7 @@ public sealed class ExecutionDeviceRegistry
         ResolveRegistered(actorDevice).InferenceCapacity;
 
     internal IReadOnlyList<RuntimeDeviceMemoryPressure> GetDeviceMemoryPressure() =>
-        GetDeviceMemoryPressure(
+        GetDeviceMemoryPressureNormalized(
             _devices.Keys
                 .OrderBy(static device => device.Value, StringComparer.Ordinal)
                 .ToArray());
@@ -104,9 +104,15 @@ public sealed class ExecutionDeviceRegistry
             .Distinct()
             .OrderBy(static device => device.Value, StringComparer.Ordinal)
             .ToArray();
-        var pressure = new List<RuntimeDeviceMemoryPressure>(normalized.Length);
+        return GetDeviceMemoryPressureNormalized(normalized);
+    }
 
-        foreach (var deviceId in normalized)
+    internal IReadOnlyList<RuntimeDeviceMemoryPressure> GetDeviceMemoryPressureNormalized(
+        IReadOnlyList<DeviceId> devices)
+    {
+        var pressure = new List<RuntimeDeviceMemoryPressure>(devices.Count);
+
+        foreach (var deviceId in devices)
         {
             var executor = ResolveRegistered(deviceId);
             if (!executor.TryGetDeviceMemoryPressure(out var snapshot))
