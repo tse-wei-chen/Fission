@@ -133,13 +133,12 @@ internal sealed class ScheduledDeviceGroup(DeviceId device)
     internal void DisposeSubmission() => _submission?.Dispose();
 }
 
-internal sealed class ScheduledBatchFailureCoordinator(
-    Dictionary<DeviceId, ScheduledDeviceGroup> groups)
+internal sealed class ScheduledDeviceGroupTable : Dictionary<DeviceId, ScheduledDeviceGroup>
 {
     internal void Abort(Exception exception)
     {
         ArgumentNullException.ThrowIfNull(exception);
-        foreach (var group in groups.Values)
+        foreach (var group in Values)
         {
             group.Submission.Abort(exception);
         }
@@ -258,7 +257,7 @@ public sealed class ScheduledBatchExecutor
         ArgumentNullException.ThrowIfNull(batch);
         ArgumentNullException.ThrowIfNull(bindings);
 
-        var groupsByDevice = new Dictionary<DeviceId, ScheduledDeviceGroup>();
+        var groupsByDevice = new ScheduledDeviceGroupTable();
         var prepared = Prepare(batch, bindings, groupsByDevice);
         if (prepared.Length == 0)
         {
@@ -283,7 +282,6 @@ public sealed class ScheduledBatchExecutor
                 group.InitializeSubmission(onDeviceCompleted);
             }
 
-            var failureCoordinator = new ScheduledBatchFailureCoordinator(groupsByDevice);
             for (var index = 0; index < prepared.Length; index++)
             {
                 ref var item = ref prepared[index];
@@ -293,7 +291,7 @@ public sealed class ScheduledBatchExecutor
                     item.PrefillTokens,
                     item.Group,
                     item.Slot,
-                    failureCoordinator,
+                    groupsByDevice,
                     cancellationToken);
             }
 
@@ -348,7 +346,7 @@ public sealed class ScheduledBatchExecutor
     private PreparedItem[] Prepare(
         ScheduledBatch batch,
         ScheduledExecutionBindings bindings,
-        Dictionary<DeviceId, ScheduledDeviceGroup> groupsByDevice)
+        ScheduledDeviceGroupTable groupsByDevice)
     {
         var prepared = new PreparedItem[batch.Items.Count];
         var sequences = new HashSet<SequenceId>();
