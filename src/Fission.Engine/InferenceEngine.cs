@@ -599,7 +599,7 @@ public sealed class InferenceEngine : IDisposable
             decision = ScheduleOnce(
                 scheduleId,
                 now,
-                kvBefore: kvCapacity,
+                kvCapacity,
                 maxBatchSequences,
                 availableKvBytes,
                 candidates,
