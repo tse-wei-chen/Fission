@@ -983,7 +983,10 @@ public sealed partial class InferenceEngine : IDisposable
             SchedulingKernelResult decision,
             Dictionary<SequenceId, SchedulingCandidate> candidateBySequence)
     {
-        var bytesByDevice = new Dictionary<DeviceId, long>();
+        Dictionary<DeviceId, long>? bytesByDevice = null;
+        DeviceId singleDevice = default;
+        long singleBytes = 0;
+        var hasSingleDevice = false;
 
         foreach (var item in decision.Batch.Items)
         {
@@ -994,9 +997,45 @@ public sealed partial class InferenceEngine : IDisposable
                 continue;
             }
 
-            bytesByDevice.TryGetValue(device, out var existing);
-            bytesByDevice[device] = checked(
-                existing + item.TransientKvByteGrant);
+            if (bytesByDevice is not null)
+            {
+                bytesByDevice.TryGetValue(device, out var existing);
+                bytesByDevice[device] = checked(
+                    existing + item.TransientKvByteGrant);
+                continue;
+            }
+
+            if (!hasSingleDevice)
+            {
+                singleDevice = device;
+                singleBytes = item.TransientKvByteGrant;
+                hasSingleDevice = true;
+                continue;
+            }
+
+            if (singleDevice.Equals(device))
+            {
+                singleBytes = checked(singleBytes + item.TransientKvByteGrant);
+                continue;
+            }
+
+            bytesByDevice = new Dictionary<DeviceId, long>(2)
+            {
+                [singleDevice] = singleBytes,
+                [device] = item.TransientKvByteGrant
+            };
+        }
+
+        if (bytesByDevice is null)
+        {
+            return hasSingleDevice
+                ? new[]
+                {
+                    new RuntimeDeviceMemoryReservationRequest(
+                        singleDevice,
+                        singleBytes)
+                }
+                : Array.Empty<RuntimeDeviceMemoryReservationRequest>();
         }
 
         return bytesByDevice
@@ -1012,7 +1051,10 @@ public sealed partial class InferenceEngine : IDisposable
             SchedulingKernelResult decision,
             Dictionary<SequenceId, SchedulingCandidate> candidateBySequence)
     {
-        var itemsByDevice = new Dictionary<DeviceId, int>();
+        Dictionary<DeviceId, int>? itemsByDevice = null;
+        DeviceId singleDevice = default;
+        var singleItems = 0;
+        var hasSingleDevice = false;
 
         foreach (var item in decision.Batch.Items)
         {
@@ -1022,8 +1064,44 @@ public sealed partial class InferenceEngine : IDisposable
                 continue;
             }
 
-            itemsByDevice.TryGetValue(device, out var existing);
-            itemsByDevice[device] = checked(existing + 1);
+            if (itemsByDevice is not null)
+            {
+                itemsByDevice.TryGetValue(device, out var existing);
+                itemsByDevice[device] = checked(existing + 1);
+                continue;
+            }
+
+            if (!hasSingleDevice)
+            {
+                singleDevice = device;
+                singleItems = 1;
+                hasSingleDevice = true;
+                continue;
+            }
+
+            if (singleDevice.Equals(device))
+            {
+                singleItems = checked(singleItems + 1);
+                continue;
+            }
+
+            itemsByDevice = new Dictionary<DeviceId, int>(2)
+            {
+                [singleDevice] = singleItems,
+                [device] = 1
+            };
+        }
+
+        if (itemsByDevice is null)
+        {
+            return hasSingleDevice
+                ? new[]
+                {
+                    new RuntimeDeviceInferenceReservationRequest(
+                        singleDevice,
+                        singleItems)
+                }
+                : Array.Empty<RuntimeDeviceInferenceReservationRequest>();
         }
 
         return itemsByDevice
