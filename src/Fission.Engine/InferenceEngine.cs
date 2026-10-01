@@ -521,7 +521,7 @@ public sealed class InferenceEngine : IDisposable
                 cancellationToken)
             .ConfigureAwait(false);
 
-        var deviceMemory = GetDeviceMemoryBudgets(candidates);
+        var deviceMemory = GetDeviceMemoryBudgets(admissionDevices);
         var decision = ScheduleOnce(
             scheduleId,
             now,
@@ -537,7 +537,7 @@ public sealed class InferenceEngine : IDisposable
                 cancellationToken)
             .ConfigureAwait(false))
         {
-            deviceMemory = GetDeviceMemoryBudgets(candidates);
+            deviceMemory = GetDeviceMemoryBudgets(admissionDevices);
             decision = ScheduleOnce(
                 scheduleId,
                 now,
@@ -578,7 +578,7 @@ public sealed class InferenceEngine : IDisposable
             candidates);
 
     private DeviceMemoryBudgetSnapshot GetDeviceMemoryBudgets(
-        IReadOnlyList<SchedulingCandidate> candidates)
+        IReadOnlyList<DeviceId> devices)
     {
         if (_options.MaxDeviceBytes is not { } maxDeviceBytes)
         {
@@ -586,22 +586,15 @@ public sealed class InferenceEngine : IDisposable
                 "Device-memory budgets require MaxDeviceBytes to be configured.");
         }
 
-        var pressureByDevice = _runtime.GetDeviceMemoryPressure()
+        var pressureByDevice = _runtime.GetDeviceMemoryPressureCore(devices)
             .ToDictionary(static pressure => pressure.Device);
-        var reservationState = _runtime.GetDeviceMemoryReservationState();
+        var reservationState = _runtime.GetDeviceMemoryReservationState(devices);
         var reservedByDevice = reservationState.Reservations
             .ToDictionary(static reservation => reservation.Device,
                 static reservation => reservation.Bytes);
-        var devices = candidates
-            .Select(static candidate => candidate.ExecutionDevice)
-            .Where(static device => device.HasValue)
-            .Select(static device => device!.Value)
-            .Distinct()
-            .OrderBy(static device => device.Value, StringComparer.Ordinal)
-            .ToArray();
-        var budgets = new SchedulingDeviceMemoryBudget[devices.Length];
+        var budgets = new SchedulingDeviceMemoryBudget[devices.Count];
 
-        for (var index = 0; index < devices.Length; index++)
+        for (var index = 0; index < devices.Count; index++)
         {
             var device = devices[index];
             if (!pressureByDevice.TryGetValue(device, out var pressure))
@@ -740,9 +733,12 @@ public sealed class InferenceEngine : IDisposable
             return false;
         }
 
-        var pressureByDevice = _runtime.GetDeviceMemoryPressure()
+        var blockedDevices = firstBlockedByDevice.Keys
+            .OrderBy(static device => device.Value, StringComparer.Ordinal)
+            .ToArray();
+        var pressureByDevice = _runtime.GetDeviceMemoryPressureCore(blockedDevices)
             .ToDictionary(static pressure => pressure.Device);
-        var reservedByDevice = _runtime.GetDeviceMemoryReservations()
+        var reservedByDevice = _runtime.GetDeviceMemoryReservations(blockedDevices)
             .ToDictionary(static reservation => reservation.Device,
                 static reservation => reservation.Bytes);
         var shouldReschedule = false;
