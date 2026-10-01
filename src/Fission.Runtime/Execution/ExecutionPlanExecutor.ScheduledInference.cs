@@ -61,11 +61,11 @@ public sealed partial class ExecutionPlanExecutor
         ReadOnlyMemory<int> prefillTokens,
         ScheduledDeviceGroup deviceGroup,
         int slot,
-        ScheduledBatchFailureCoordinator failureCoordinator,
+        ScheduledDeviceGroupTable groups,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(deviceGroup);
-        ArgumentNullException.ThrowIfNull(failureCoordinator);
+        ArgumentNullException.ThrowIfNull(groups);
 
         try
         {
@@ -132,7 +132,7 @@ public sealed partial class ExecutionPlanExecutor
         }
         catch (Exception exception)
         {
-            failureCoordinator.Abort(exception);
+            groups.Abort(exception);
             throw;
         }
         finally
