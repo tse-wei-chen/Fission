@@ -496,21 +496,23 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         IDisposable
     {
         private readonly object _gate = new();
-        private readonly PendingInference?[] _slots;
+        private readonly PooledReferenceSlots<PendingInference> _slots;
         private ContinuousBatchExecutor? _executor;
         private Exception? _failure;
         private int _registeredCount;
         private bool _enqueued;
         private bool _atomicOwnershipReleased;
+        private int _actorOwned;
         private int _disposed;
 
         internal AtomicSubmissionBatch(int itemCount)
         {
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(itemCount);
-            _slots = new PendingInference[itemCount];
+            _slots = new PooledReferenceSlots<PendingInference>(itemCount);
         }
 
         public int Count => _slots.Length;
+        internal bool SlotStorageReturned => _slots.IsReturned;
 
         public PendingInference this[int index] =>
             _slots[index] ?? throw new InvalidOperationException(
@@ -610,8 +612,8 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
             catch (Exception exception)
             {
                 ReleaseCredits();
-                ReleaseActorOwnership();
                 Abort(exception);
+                ReleaseActorOwnership();
                 throw;
             }
         }
@@ -619,7 +621,6 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         internal void Abort(Exception exception)
         {
             ArgumentNullException.ThrowIfNull(exception);
-            bool releaseOwnership;
 
             lock (_gate)
             {
@@ -629,21 +630,21 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                 }
 
                 _failure = exception;
-                releaseOwnership = !_atomicOwnershipReleased;
+                var releaseOwnership = !_atomicOwnershipReleased;
                 _atomicOwnershipReleased = true;
-            }
 
-            for (var index = 0; index < _slots.Length; index++)
-            {
-                if (_slots[index] is not { } work)
+                for (var index = 0; index < _slots.Length; index++)
                 {
-                    continue;
-                }
+                    if (_slots[index] is not { } work)
+                    {
+                        continue;
+                    }
 
-                work.Fail(exception);
-                if (releaseOwnership)
-                {
-                    work.ReleaseAtomicOwnership();
+                    work.Fail(exception);
+                    if (releaseOwnership)
+                    {
+                        work.ReleaseAtomicOwnership();
+                    }
                 }
             }
         }
@@ -657,6 +658,8 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                 {
                     this[retained].RetainActorOwnership();
                 }
+
+                Volatile.Write(ref _actorOwned, 1);
             }
             catch
             {
@@ -675,6 +678,9 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
             {
                 this[index].ReleaseActorOwnership();
             }
+
+            Volatile.Write(ref _actorOwned, 0);
+            TryReturnSlotStorage();
         }
 
         public IEnumerator<PendingInference> GetEnumerator()
@@ -700,10 +706,9 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                 return;
             }
 
-            Exception? incompleteFailure = null;
-            bool releaseOwnership;
             lock (_gate)
             {
+                Exception? incompleteFailure = null;
                 if (!_enqueued && _failure is null)
                 {
                     incompleteFailure = new InvalidOperationException(
@@ -711,23 +716,43 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                     _failure = incompleteFailure;
                 }
 
-                releaseOwnership = !_atomicOwnershipReleased;
+                var releaseOwnership = !_atomicOwnershipReleased;
                 _atomicOwnershipReleased = true;
-            }
 
-            if (incompleteFailure is not null)
-            {
-                for (var index = 0; index < _slots.Length; index++)
+                if (incompleteFailure is not null)
                 {
-                    _slots[index]?.Fail(incompleteFailure);
+                    for (var index = 0; index < _slots.Length; index++)
+                    {
+                        _slots[index]?.Fail(incompleteFailure);
+                    }
+                }
+
+                if (releaseOwnership)
+                {
+                    for (var index = 0; index < _slots.Length; index++)
+                    {
+                        _slots[index]?.ReleaseAtomicOwnership();
+                    }
                 }
             }
 
-            if (releaseOwnership)
+            TryReturnSlotStorage();
+        }
+
+        private void TryReturnSlotStorage()
+        {
+            if (Volatile.Read(ref _disposed) == 0 ||
+                Volatile.Read(ref _actorOwned) != 0)
             {
-                for (var index = 0; index < _slots.Length; index++)
+                return;
+            }
+
+            lock (_gate)
+            {
+                if (Volatile.Read(ref _disposed) != 0 &&
+                    Volatile.Read(ref _actorOwned) == 0)
                 {
-                    _slots[index]?.ReleaseAtomicOwnership();
+                    _slots.Return();
                 }
             }
         }
