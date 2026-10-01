@@ -55,7 +55,7 @@ public sealed partial class ExecutionPlanExecutor
     /// reservation/result bookkeeping. Atomic actor registration is passed
     /// explicitly so the scheduled hot path does not need an AsyncLocal slot scope.
     /// </summary>
-    internal async ValueTask<ExecutionPlanResult> ExecuteScheduledInferenceAsync(
+    internal async ValueTask<BackendStepResult> ExecuteScheduledInferenceAsync(
         Guid planId,
         ScheduledInferenceStep step,
         ReadOnlyMemory<int> prefillTokens,
@@ -123,11 +123,7 @@ public sealed partial class ExecutionPlanExecutor
                     1,
                     "Plan"));
 
-                return new ExecutionPlanResult(
-                    planId,
-                    new[] { result },
-                    Array.Empty<KvSnapshotId>(),
-                    Array.Empty<ForkExecutionResult>());
+                return result;
             }
             finally
             {

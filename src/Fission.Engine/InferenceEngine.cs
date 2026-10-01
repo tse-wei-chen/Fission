@@ -309,11 +309,11 @@ public sealed class InferenceEngine : IDisposable
             }
 
             var executionBindings = new ScheduledExecutionBindings(prefillBindings);
-            ScheduledBatchResult batchResult;
+            BackendStepResult[] backendResults;
             if (admission.DeviceMemoryReservation is null &&
                 admission.DeviceInferenceReservation is null)
             {
-                batchResult = await _scheduledExecutor.ExecuteAsync(
+                backendResults = await _scheduledExecutor.ExecuteBackendAsync(
                         admission.Decision.Batch,
                         executionBindings,
                         cancellationToken)
@@ -321,7 +321,7 @@ public sealed class InferenceEngine : IDisposable
             }
             else
             {
-                batchResult = await _scheduledExecutor.ExecuteAsync(
+                backendResults = await _scheduledExecutor.ExecuteBackendAsync(
                         admission.Decision.Batch,
                         executionBindings,
                         device => ReleaseDeviceAdmissionReservations(
@@ -332,7 +332,7 @@ public sealed class InferenceEngine : IDisposable
                     .ConfigureAwait(false);
             }
 
-            if (batchResult.ItemResults.Count != admission.Decision.Batch.Items.Count)
+            if (backendResults.Length != admission.Decision.Batch.Items.Count)
             {
                 throw new InvalidOperationException(
                     "Scheduled execution result count does not match selected work count.");
@@ -342,15 +342,7 @@ public sealed class InferenceEngine : IDisposable
             for (var index = 0; index < admission.Decision.Batch.Items.Count; index++)
             {
                 var item = admission.Decision.Batch.Items[index];
-                var itemResult = batchResult.ItemResults[index];
-
-                if (itemResult.BackendResults.Count != 1)
-                {
-                    throw new InvalidOperationException(
-                        $"Scheduled work {item.SequenceId} returned {itemResult.BackendResults.Count} backend results; expected one.");
-                }
-
-                var backendResult = itemResult.BackendResults[0];
+                var backendResult = backendResults[index];
                 if (backendResult.SequenceId != item.SequenceId)
                 {
                     throw new InvalidOperationException(
