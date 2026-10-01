@@ -15,38 +15,75 @@ public sealed partial class ContinuousBatchExecutor
         Volatile.Read(ref _inferenceWorkCreatedCount);
 
     internal (int Prefill, int Decode) InferenceWorkPoolCounts =>
-        (Volatile.Read(ref _pooledPrefillCount), Volatile.Read(ref _pooledDecodeCount));
+        (_prefillWorkPool.Count, _decodeWorkPool.Count);
 
     private PendingPrefill RentPrefill(PrefillItem item)
     {
-        if (!_prefillWorkPool.TryDequeue(out var work))
-        {
-            work = new PendingPrefill();
-            Interlocked.Increment(ref _inferenceWorkCreatedCount);
-        }
-        else
-        {
-            Interlocked.Decrement(ref _pooledPrefillCount);
-        }
-
+        var work = TryRentPrefill() ?? CreatePrefill();
         work.Initialize(this, item);
         return work;
     }
 
     private PendingDecode RentDecode(DecodeItem item)
     {
-        if (!_decodeWorkPool.TryDequeue(out var work))
-        {
-            work = new PendingDecode();
-            Interlocked.Increment(ref _inferenceWorkCreatedCount);
-        }
-        else
-        {
-            Interlocked.Decrement(ref _pooledDecodeCount);
-        }
-
+        var work = TryRentDecode() ?? CreateDecode();
         work.Initialize(this, item);
         return work;
+    }
+
+    private PendingPrefill? TryRentPrefill()
+    {
+        var spinner = new SpinWait();
+        while (true)
+        {
+            if (_prefillWorkPool.TryDequeue(out var work))
+            {
+                Interlocked.Decrement(ref _pooledPrefillCount);
+                return work;
+            }
+
+            if (Volatile.Read(ref _pooledPrefillCount) == 0 || spinner.NextSpinWillYield)
+            {
+                return null;
+            }
+
+            // Returners reserve the bounded pool count before publishing into the
+            // concurrent queue. Spin only through that very small publication gap;
+            // if the owner was descheduled, allocate rather than blocking submitters.
+            spinner.SpinOnce();
+        }
+    }
+
+    private PendingDecode? TryRentDecode()
+    {
+        var spinner = new SpinWait();
+        while (true)
+        {
+            if (_decodeWorkPool.TryDequeue(out var work))
+            {
+                Interlocked.Decrement(ref _pooledDecodeCount);
+                return work;
+            }
+
+            if (Volatile.Read(ref _pooledDecodeCount) == 0 || spinner.NextSpinWillYield)
+            {
+                return null;
+            }
+
+            spinner.SpinOnce();
+        }
+    }
+
+    private PendingPrefill CreatePrefill()
+    {
+        Interlocked.Increment(ref _inferenceWorkCreatedCount);
+        return new PendingPrefill();
+    }
+
+    private PendingDecode CreateDecode()
+    {
+        Interlocked.Increment(ref _inferenceWorkCreatedCount);
+        return new PendingDecode();
     }
 
     private void ReturnInferenceWorkToPool(PendingInference work)
@@ -55,12 +92,18 @@ public sealed partial class ContinuousBatchExecutor
         {
             case PendingPrefill prefill:
                 prefill.ClearItemForPool();
-                ReturnPrefillToPool(prefill);
+                if (TryReservePoolSlot(ref _pooledPrefillCount))
+                {
+                    _prefillWorkPool.Enqueue(prefill);
+                }
                 break;
 
             case PendingDecode decode:
                 decode.ClearItemForPool();
-                ReturnDecodeToPool(decode);
+                if (TryReservePoolSlot(ref _pooledDecodeCount))
+                {
+                    _decodeWorkPool.Enqueue(decode);
+                }
                 break;
 
             default:
@@ -69,27 +112,20 @@ public sealed partial class ContinuousBatchExecutor
         }
     }
 
-    private void ReturnPrefillToPool(PendingPrefill work)
+    private bool TryReservePoolSlot(ref int count)
     {
-        var count = Interlocked.Increment(ref _pooledPrefillCount);
-        if (count <= InferenceCapacity)
+        while (true)
         {
-            _prefillWorkPool.Enqueue(work);
-            return;
+            var current = Volatile.Read(ref count);
+            if (current >= InferenceCapacity)
+            {
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(ref count, current + 1, current) == current)
+            {
+                return true;
+            }
         }
-
-        Interlocked.Decrement(ref _pooledPrefillCount);
-    }
-
-    private void ReturnDecodeToPool(PendingDecode work)
-    {
-        var count = Interlocked.Increment(ref _pooledDecodeCount);
-        if (count <= InferenceCapacity)
-        {
-            _decodeWorkPool.Enqueue(work);
-            return;
-        }
-
-        Interlocked.Decrement(ref _pooledDecodeCount);
     }
 }
