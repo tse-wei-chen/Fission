@@ -308,14 +308,18 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                     }
 
                     var count = end - index;
-                    var items = new PrefillItem[count];
-                    for (var offset = 0; offset < count; offset++)
+                    IReadOnlyList<BackendStepResult> results;
+                    try
                     {
-                        items[offset] = ((PendingPrefill)segment[index + offset]).Item;
+                        results = await _backend.PrefillAsync(
+                                PreparePrefillBatch(segment, index, count))
+                            .ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        ClearPrefillBatch();
                     }
 
-                    var results = await _backend.PrefillAsync(
-                        new PrefillBatch(items)).ConfigureAwait(false);
                     Complete(segment, index, count, results);
                     index = end;
                     break;
@@ -332,14 +336,18 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                     }
 
                     var count = end - index;
-                    var items = new DecodeItem[count];
-                    for (var offset = 0; offset < count; offset++)
+                    IReadOnlyList<BackendStepResult> results;
+                    try
                     {
-                        items[offset] = ((PendingDecode)segment[index + offset]).Item;
+                        results = await _backend.DecodeAsync(
+                                PrepareDecodeBatch(segment, index, count))
+                            .ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        ClearDecodeBatch();
                     }
 
-                    var results = await _backend.DecodeAsync(
-                        new DecodeBatch(items)).ConfigureAwait(false);
                     Complete(segment, index, count, results);
                     index = end;
                     break;

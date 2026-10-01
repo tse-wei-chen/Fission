@@ -149,7 +149,7 @@ public sealed class OnnxRuntimeBackend :
         CancellationToken cancellationToken = default)
     {
         var session = GetSession();
-        ValidateModels(batch.Items.Select(static item => item.ModelId));
+        ValidateModels(batch.Items);
         return _adapter.PrefillAsync(session, batch, cancellationToken);
     }
 
@@ -158,7 +158,7 @@ public sealed class OnnxRuntimeBackend :
         CancellationToken cancellationToken = default)
     {
         var session = GetSession();
-        ValidateModels(batch.Items.Select(static item => item.ModelId));
+        ValidateModels(batch.Items);
         return _adapter.DecodeAsync(session, batch, cancellationToken);
     }
 
@@ -214,15 +214,28 @@ public sealed class OnnxRuntimeBackend :
         return _adapter.ReleaseSequenceAsync(sequenceId, cancellationToken);
     }
 
-    private void ValidateModels(IEnumerable<ModelId> modelIds)
+    private void ValidateModels(IReadOnlyList<PrefillItem> items)
     {
-        foreach (var modelId in modelIds)
+        for (var index = 0; index < items.Count; index++)
         {
-            if (modelId != _options.ModelId)
-            {
-                throw new InvalidOperationException(
-                    $"ONNX Runtime backend is bound to model {_options.ModelId}, not {modelId}.");
-            }
+            ValidateModel(items[index].ModelId);
+        }
+    }
+
+    private void ValidateModels(IReadOnlyList<DecodeItem> items)
+    {
+        for (var index = 0; index < items.Count; index++)
+        {
+            ValidateModel(items[index].ModelId);
+        }
+    }
+
+    private void ValidateModel(ModelId modelId)
+    {
+        if (modelId != _options.ModelId)
+        {
+            throw new InvalidOperationException(
+                $"ONNX Runtime backend is bound to model {_options.ModelId}, not {modelId}.");
         }
     }
 
