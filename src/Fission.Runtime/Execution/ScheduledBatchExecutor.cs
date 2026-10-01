@@ -134,14 +134,142 @@ internal sealed class ScheduledDeviceGroup(DeviceId device)
     internal void DisposeSubmission() => _submission?.Dispose();
 }
 
-internal sealed class ScheduledDeviceGroupTable : Dictionary<DeviceId, ScheduledDeviceGroup>
+internal sealed class ScheduledDeviceGroupTable
 {
+    private DeviceId _singleDevice;
+    private ScheduledDeviceGroup? _singleGroup;
+    private Dictionary<DeviceId, ScheduledDeviceGroup>? _multipleGroups;
+
+    internal GroupEnumerable Values => new(_singleGroup, _multipleGroups);
+
+    internal bool TryGetValue(
+        DeviceId device,
+        out ScheduledDeviceGroup group)
+    {
+        if (_multipleGroups is not null)
+        {
+            return _multipleGroups.TryGetValue(device, out group!);
+        }
+
+        if (_singleGroup is { } singleGroup && _singleDevice.Equals(device))
+        {
+            group = singleGroup;
+            return true;
+        }
+
+        group = null!;
+        return false;
+    }
+
+    internal void Add(DeviceId device, ScheduledDeviceGroup group)
+    {
+        ArgumentNullException.ThrowIfNull(group);
+
+        if (_multipleGroups is not null)
+        {
+            _multipleGroups.Add(device, group);
+            return;
+        }
+
+        if (_singleGroup is null)
+        {
+            _singleDevice = device;
+            _singleGroup = group;
+            return;
+        }
+
+        var multipleGroups = new Dictionary<DeviceId, ScheduledDeviceGroup>(2)
+        {
+            [_singleDevice] = _singleGroup
+        };
+        multipleGroups.Add(device, group);
+
+        _singleDevice = default;
+        _singleGroup = null;
+        _multipleGroups = multipleGroups;
+    }
+
     internal void Abort(Exception exception)
     {
         ArgumentNullException.ThrowIfNull(exception);
         foreach (var group in Values)
         {
             group.Submission.Abort(exception);
+        }
+    }
+
+    internal readonly struct GroupEnumerable
+    {
+        private readonly ScheduledDeviceGroup? _singleGroup;
+        private readonly Dictionary<DeviceId, ScheduledDeviceGroup>? _multipleGroups;
+
+        internal GroupEnumerable(
+            ScheduledDeviceGroup? singleGroup,
+            Dictionary<DeviceId, ScheduledDeviceGroup>? multipleGroups)
+        {
+            _singleGroup = singleGroup;
+            _multipleGroups = multipleGroups;
+        }
+
+        public GroupEnumerator GetEnumerator() =>
+            new(_singleGroup, _multipleGroups);
+    }
+
+    internal struct GroupEnumerator
+    {
+        private readonly ScheduledDeviceGroup? _singleGroup;
+        private Dictionary<DeviceId, ScheduledDeviceGroup>.ValueCollection.Enumerator
+            _multipleEnumerator;
+        private readonly bool _useMultiple;
+        private bool _singlePending;
+        private ScheduledDeviceGroup? _current;
+
+        internal GroupEnumerator(
+            ScheduledDeviceGroup? singleGroup,
+            Dictionary<DeviceId, ScheduledDeviceGroup>? multipleGroups)
+        {
+            _singleGroup = singleGroup;
+            _multipleEnumerator = multipleGroups is null
+                ? default
+                : multipleGroups.Values.GetEnumerator();
+            _useMultiple = multipleGroups is not null;
+            _singlePending = multipleGroups is null && singleGroup is not null;
+            _current = null;
+        }
+
+        public ScheduledDeviceGroup Current => _current!;
+
+        public bool MoveNext()
+        {
+            if (_useMultiple)
+            {
+                if (_multipleEnumerator.MoveNext())
+                {
+                    _current = _multipleEnumerator.Current;
+                    return true;
+                }
+
+                _current = null;
+                return false;
+            }
+
+            if (_singlePending)
+            {
+                _singlePending = false;
+                _current = _singleGroup;
+                return true;
+            }
+
+            _current = null;
+            return false;
+        }
+
+        public void Dispose()
+        {
+            if (_useMultiple)
+            {
+                _multipleEnumerator.Dispose();
+            }
         }
     }
 }
