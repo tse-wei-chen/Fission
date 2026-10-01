@@ -273,6 +273,31 @@ public sealed partial class ExecutionPlanExecutor
         return normalized;
     }
 
+    private void ReleaseDeviceMemoryReservation(DeviceId device, long bytes)
+    {
+        var ledger = GetExistingDeviceMemoryReservationLedger(device);
+        TaskCompletionSource<long>? releasedSignal;
+        long releaseVersion;
+
+        lock (ledger.Gate)
+        {
+            if (ledger.ReservedBytes < bytes)
+            {
+                throw new InvalidOperationException(
+                    $"Device-memory reservation ledger underflow for {ledger.Device}: " +
+                    $"reserved={ledger.ReservedBytes}, releasing={bytes}.");
+            }
+
+            ledger.ReservedBytes -= bytes;
+            releaseVersion = checked(ledger.ReleaseVersion + 1);
+            ledger.ReleaseVersion = releaseVersion;
+            releasedSignal = ledger.ReleaseSignal;
+            ledger.ReleaseSignal = null;
+        }
+
+        releasedSignal?.TrySetResult(releaseVersion);
+    }
+
     private void ReleaseDeviceMemoryReservations(
         IReadOnlyDictionary<DeviceId, long> reservations)
     {
@@ -569,7 +594,7 @@ public sealed partial class ExecutionPlanExecutor
 
         public DeviceMemoryReservationLeaseSet(
             ExecutionPlanExecutor owner,
-            IReadOnlyDictionary<DeviceId, long> reservations)
+            Dictionary<DeviceId, long> reservations)
         {
             if (reservations.Count == 0)
             {
@@ -577,9 +602,7 @@ public sealed partial class ExecutionPlanExecutor
             }
 
             _owner = owner;
-            _remaining = reservations.ToDictionary(
-                static pair => pair.Key,
-                static pair => pair.Value);
+            _remaining = reservations;
         }
 
         public void Release(DeviceId device)
@@ -593,11 +616,7 @@ public sealed partial class ExecutionPlanExecutor
                     return;
                 }
 
-                _owner.ReleaseDeviceMemoryReservations(
-                    new Dictionary<DeviceId, long>
-                    {
-                        [device] = bytes
-                    });
+                _owner.ReleaseDeviceMemoryReservation(device, bytes);
                 _remaining.Remove(device);
                 if (_remaining.Count == 0)
                 {
