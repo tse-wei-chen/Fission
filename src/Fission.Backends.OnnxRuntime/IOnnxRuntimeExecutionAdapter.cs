@@ -10,7 +10,10 @@ namespace Fission.Backends.OnnxRuntime;
 /// and per-sequence/snapshot state such as logits or KV OrtValues.
 ///
 /// Calls are serialized by ContinuousBatchExecutor, so implementations do not
-/// need to make their mutable state concurrently writable.
+/// need to make their mutable state concurrently writable. Prefill/decode batches
+/// forwarded by the backend are borrowed inputs: adapters may use them across
+/// awaits inside the returned ValueTask, but must not retain the batch or its Items
+/// collection after that ValueTask completes.
 /// </summary>
 public interface IOnnxRuntimeExecutionAdapter : IDisposable
 {
