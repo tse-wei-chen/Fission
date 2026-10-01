@@ -272,8 +272,8 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                 inference.ReleaseActorOwnership();
                 break;
 
-            case PendingInferenceEnvelope envelope:
-                envelope.ReleaseActorOwnership();
+            case AtomicSubmissionBatch submission:
+                submission.ReleaseActorOwnership();
                 break;
         }
     }
@@ -297,14 +297,14 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
 
             switch (work)
             {
-                case PendingInferenceEnvelope envelope:
+                case AtomicSubmissionBatch submission:
                     try
                     {
-                        await ExecuteInferenceSegmentAsync(envelope.Items).ConfigureAwait(false);
+                        await ExecuteInferenceSegmentAsync(submission).ConfigureAwait(false);
                     }
                     finally
                     {
-                        envelope.ReleaseCredits();
+                        submission.ReleaseCredits();
                     }
                     break;
 
@@ -490,7 +490,10 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         }
     }
 
-    internal sealed class AtomicSubmissionBatch : IDisposable
+    internal sealed class AtomicSubmissionBatch :
+        PendingWork,
+        IReadOnlyList<PendingInference>,
+        IDisposable
     {
         private readonly object _gate = new();
         private readonly PendingInference?[] _slots;
@@ -506,6 +509,12 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(itemCount);
             _slots = new PendingInference[itemCount];
         }
+
+        public int Count => _slots.Length;
+
+        public PendingInference this[int index] =>
+            _slots[index] ?? throw new InvalidOperationException(
+                $"Atomic inference envelope slot {index} was not registered.");
 
         internal IDisposable EnterSlot(int index)
         {
@@ -527,7 +536,7 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
             PendingInference work,
             CancellationToken cancellationToken)
         {
-            PendingInferenceEnvelope? envelope = null;
+            var shouldSubmit = false;
 
             lock (_gate)
             {
@@ -562,12 +571,12 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                 _registeredCount++;
                 if (_registeredCount == _slots.Length)
                 {
-                    envelope = new PendingInferenceEnvelope(_slots);
-                    envelope.RetainActorOwnership();
+                    RetainActorOwnership();
+                    shouldSubmit = true;
                 }
             }
 
-            if (envelope is null)
+            if (!shouldSubmit)
             {
                 return;
             }
@@ -589,8 +598,8 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                     }
                 }
 
-                envelope.AttachCredits(credits);
-                await executor._queue.Writer.WriteAsync(envelope, cancellationToken)
+                AttachCredits(credits);
+                await executor._queue.Writer.WriteAsync(this, cancellationToken)
                     .ConfigureAwait(false);
 
                 lock (_gate)
@@ -600,8 +609,8 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
             }
             catch (Exception exception)
             {
-                envelope.ReleaseCredits();
-                envelope.ReleaseActorOwnership();
+                ReleaseCredits();
+                ReleaseActorOwnership();
                 Abort(exception);
                 throw;
             }
@@ -637,6 +646,51 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                     work.ReleaseAtomicOwnership();
                 }
             }
+        }
+
+        internal void RetainActorOwnership()
+        {
+            var retained = 0;
+            try
+            {
+                for (; retained < _slots.Length; retained++)
+                {
+                    this[retained].RetainActorOwnership();
+                }
+            }
+            catch
+            {
+                for (var index = 0; index < retained; index++)
+                {
+                    this[index].ReleaseActorOwnership();
+                }
+
+                throw;
+            }
+        }
+
+        internal void ReleaseActorOwnership()
+        {
+            for (var index = 0; index < _slots.Length; index++)
+            {
+                this[index].ReleaseActorOwnership();
+            }
+        }
+
+        public IEnumerator<PendingInference> GetEnumerator()
+        {
+            for (var index = 0; index < _slots.Length; index++)
+            {
+                yield return this[index];
+            }
+        }
+
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+        public override void Fail(Exception exception)
+        {
+            Abort(exception);
+            ReleaseCredits();
         }
 
         public void Dispose()
@@ -891,67 +945,6 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         }
 
         internal void ClearItemForPool() => Item = default;
-    }
-
-    private sealed class PendingInferenceEnvelope(PendingInference?[] items) :
-        PendingWork,
-        IReadOnlyList<PendingInference>
-    {
-        public IReadOnlyList<PendingInference> Items => this;
-        public int Count => items.Length;
-
-        public PendingInference this[int index] =>
-            items[index] ?? throw new InvalidOperationException(
-                $"Atomic inference envelope slot {index} was not registered.");
-
-        internal void RetainActorOwnership()
-        {
-            var retained = 0;
-            try
-            {
-                for (; retained < items.Length; retained++)
-                {
-                    this[retained].RetainActorOwnership();
-                }
-            }
-            catch
-            {
-                for (var index = 0; index < retained; index++)
-                {
-                    this[index].ReleaseActorOwnership();
-                }
-
-                throw;
-            }
-        }
-
-        internal void ReleaseActorOwnership()
-        {
-            for (var index = 0; index < items.Length; index++)
-            {
-                this[index].ReleaseActorOwnership();
-            }
-        }
-
-        public IEnumerator<PendingInference> GetEnumerator()
-        {
-            for (var index = 0; index < items.Length; index++)
-            {
-                yield return this[index];
-            }
-        }
-
-        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
-
-        public override void Fail(Exception exception)
-        {
-            for (var index = 0; index < items.Length; index++)
-            {
-                this[index].Fail(exception);
-            }
-
-            ReleaseCredits();
-        }
     }
 
     private abstract class PendingControl : PendingWork
