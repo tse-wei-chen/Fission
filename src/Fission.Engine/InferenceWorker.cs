@@ -302,23 +302,13 @@ public sealed class InferenceWorker : IAsyncDisposable
     {
         try
         {
-            SequenceId sequenceId;
-            try
-            {
-                sequenceId = _engine.Submit(
-                    pending.ModelId,
-                    pending.PromptTokens,
-                    pending.MaxNewTokens,
-                    pending.Priority,
-                    pending.Deadline,
-                    pending.EnqueuedAt);
-            }
-            finally
-            {
-                // The engine owns its own prompt copy after Submit returns. Do not
-                // retain the worker's queue-owned prompt through source consumption.
-                pending.ClearPromptTokens();
-            }
+            var sequenceId = _engine.SubmitOwned(
+                pending.ModelId,
+                pending.TakePromptTokens(),
+                pending.MaxNewTokens,
+                pending.Priority,
+                pending.Deadline,
+                pending.EnqueuedAt);
 
             var tokenChannel = Channel.CreateUnbounded<int>(
                 new UnboundedChannelOptions
@@ -473,6 +463,7 @@ public sealed class InferenceWorker : IAsyncDisposable
     private sealed class PendingSubmission : IValueTaskSource<InferenceStream>
     {
         private ManualResetValueTaskSourceCore<InferenceStream> _completion;
+        private int[] _promptTokens;
         private int _terminal;
 
         internal PendingSubmission(
@@ -485,7 +476,7 @@ public sealed class InferenceWorker : IAsyncDisposable
         {
             _completion.RunContinuationsAsynchronously = true;
             ModelId = modelId;
-            PromptTokens = promptTokens;
+            _promptTokens = promptTokens;
             MaxNewTokens = maxNewTokens;
             Priority = priority;
             Deadline = deadline;
@@ -493,7 +484,6 @@ public sealed class InferenceWorker : IAsyncDisposable
         }
 
         internal ModelId ModelId { get; }
-        internal int[] PromptTokens { get; private set; }
         internal int MaxNewTokens { get; }
         internal int Priority { get; }
         internal DateTimeOffset? Deadline { get; }
@@ -501,6 +491,13 @@ public sealed class InferenceWorker : IAsyncDisposable
 
         internal ValueTask<InferenceStream> WaitAsync() =>
             new(this, _completion.Version);
+
+        internal int[] TakePromptTokens()
+        {
+            var promptTokens = _promptTokens;
+            _promptTokens = Array.Empty<int>();
+            return promptTokens;
+        }
 
         internal void Complete(InferenceStream stream)
         {
@@ -520,7 +517,7 @@ public sealed class InferenceWorker : IAsyncDisposable
             }
         }
 
-        internal void ClearPromptTokens() => PromptTokens = Array.Empty<int>();
+        private void ClearPromptTokens() => _promptTokens = Array.Empty<int>();
 
         InferenceStream IValueTaskSource<InferenceStream>.GetResult(short token) =>
             _completion.GetResult(token);
