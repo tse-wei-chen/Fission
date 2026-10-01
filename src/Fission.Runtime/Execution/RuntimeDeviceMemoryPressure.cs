@@ -20,6 +20,13 @@ public sealed partial class ExecutionPlanExecutor
     internal IReadOnlyList<RuntimeDeviceMemoryPressure>
         GetDeviceMemoryPressureCore() =>
         _devices.GetDeviceMemoryPressure();
+
+    internal IReadOnlyList<RuntimeDeviceMemoryPressure>
+        GetDeviceMemoryPressureCore(IReadOnlyList<DeviceId> devices)
+    {
+        ArgumentNullException.ThrowIfNull(devices);
+        return _devices.GetDeviceMemoryPressure(devices);
+    }
 }
 
 public static class ExecutionPlanExecutorMemoryPressureExtensions
