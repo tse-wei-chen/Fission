@@ -90,6 +90,11 @@ public sealed partial class ExecutionPlanExecutor
             return GetDeviceMemoryReservationState((IReadOnlyList<DeviceId>)devices);
         }
 
+        if (devices.Length == 1)
+        {
+            return SnapshotSingleDeviceMemoryReservationState(devices[0]);
+        }
+
         List<RuntimeDeviceMemoryReservationSnapshot>? reservations = null;
 
         foreach (var device in devices)
@@ -134,6 +139,11 @@ public sealed partial class ExecutionPlanExecutor
             return GetDeviceInferenceReservationState((IReadOnlyList<DeviceId>)devices);
         }
 
+        if (devices.Length == 1)
+        {
+            return SnapshotSingleDeviceInferenceReservationState(devices[0]);
+        }
+
         List<RuntimeDeviceInferenceReservationSnapshot>? reservations = null;
 
         foreach (var device in devices)
@@ -171,6 +181,58 @@ public sealed partial class ExecutionPlanExecutor
         return IsNormalizedAdmissionDeviceArray(devices)
             ? _devices.GetDeviceMemoryPressureNormalized(devices)
             : GetDeviceMemoryPressureCore((IReadOnlyList<DeviceId>)devices);
+    }
+
+    private RuntimeDeviceMemoryReservationState SnapshotSingleDeviceMemoryReservationState(
+        DeviceId device)
+    {
+        if (!_deviceMemoryReservationLedgers.TryGetValue(device, out var ledger))
+        {
+            return EmptyDeviceMemoryReservationState;
+        }
+
+        lock (ledger.Gate)
+        {
+            if (ledger.ReservedBytes == 0)
+            {
+                return EmptyDeviceMemoryReservationState;
+            }
+
+            return new RuntimeDeviceMemoryReservationState(
+                new[]
+                {
+                    new RuntimeDeviceMemoryReservationSnapshot(
+                        ledger.Device,
+                        ledger.ReservedBytes,
+                        ledger.ReleaseVersion)
+                });
+        }
+    }
+
+    private RuntimeDeviceInferenceReservationState SnapshotSingleDeviceInferenceReservationState(
+        DeviceId device)
+    {
+        if (!_deviceInferenceReservationLedgers.TryGetValue(device, out var ledger))
+        {
+            return EmptyDeviceInferenceReservationState;
+        }
+
+        lock (ledger.Gate)
+        {
+            if (ledger.ReservedItems == 0)
+            {
+                return EmptyDeviceInferenceReservationState;
+            }
+
+            return new RuntimeDeviceInferenceReservationState(
+                new[]
+                {
+                    new RuntimeDeviceInferenceReservationSnapshot(
+                        ledger.Device,
+                        ledger.ReservedItems,
+                        ledger.ReleaseVersion)
+                });
+        }
     }
 
     private static bool IsNormalizedAdmissionDeviceArray(DeviceId[] devices)
