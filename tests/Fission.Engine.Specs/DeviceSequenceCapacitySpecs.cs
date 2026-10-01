@@ -51,14 +51,18 @@ internal static class DeviceSequenceCapacitySpecs
         var unrelatedBackend = new CapacityProbeBackend(
             new DeviceId("cpu:sequence-capacity-unrelated-small"));
 
+        // Device sequence admission is bounded by inference item credits, not by
+        // the backend micro-batch size. The primary actor can admit four items but
+        // deliberately executes them one at a time; the unrelated actor has only
+        // one admission credit and must not clamp work targeted at the primary.
         await using var primary = await ContinuousBatchExecutor.CreateAsync(
             primaryBackend,
-            capacity: 8,
-            maxBatchSize: 4);
+            capacity: 4,
+            maxBatchSize: 1);
         await using var unrelated = await ContinuousBatchExecutor.CreateAsync(
             unrelatedBackend,
-            capacity: 8,
-            maxBatchSize: 1);
+            capacity: 1,
+            maxBatchSize: 4);
         using var runtime = new ExecutionPlanExecutor(
             new ExecutionDeviceRegistry(primary, unrelated),
             kvPagePool: new KvPagePool(capacity: 16, tokensPerPage: 4));
@@ -80,15 +84,15 @@ internal static class DeviceSequenceCapacitySpecs
 
         Require(
             cycle.Batch.Items.Count == 3,
-            "An unrelated maxBatchSize=1 actor must not clamp a maxBatchSize=4 default actor to one selected item.");
+            "An unrelated capacity=1 actor must not clamp a capacity=4 default actor to one selected item.");
         Require(
             cycle.CompletedSequences.Count == 3 &&
             sequences.All(sequence => cycle.CompletedSequences.Contains(sequence)),
             "All three requests admitted to the larger default actor must complete in the same cycle.");
         Require(
             primaryBackend.PrefillItems == 3 &&
-            primaryBackend.MaxObservedPrefillBatch == 3,
-            "The larger actor should receive the three-item prefill batch allowed by its own capacity.");
+            primaryBackend.MaxObservedPrefillBatch == 1,
+            "The primary actor should admit three selected items while honoring its independent maxBatchSize=1 backend chunking limit.");
         Require(
             unrelatedBackend.PrefillItems == 0,
             "The unrelated smaller actor must not receive default-device inference work.");
@@ -101,14 +105,17 @@ internal static class DeviceSequenceCapacitySpecs
         var unrelatedBackend = new CapacityProbeBackend(
             new DeviceId("cpu:sequence-capacity-unrelated-large"));
 
+        // The target actor can execute a four-item backend micro-batch, but only
+        // two inference items may be admitted atomically because its credit
+        // capacity is two. The scheduler must therefore defer the third item.
         await using var primary = await ContinuousBatchExecutor.CreateAsync(
             primaryBackend,
-            capacity: 8,
-            maxBatchSize: 2);
+            capacity: 2,
+            maxBatchSize: 4);
         await using var unrelated = await ContinuousBatchExecutor.CreateAsync(
             unrelatedBackend,
-            capacity: 8,
-            maxBatchSize: 4);
+            capacity: 4,
+            maxBatchSize: 1);
         using var runtime = new ExecutionPlanExecutor(
             new ExecutionDeviceRegistry(primary, unrelated),
             kvPagePool: new KvPagePool(capacity: 16, tokensPerPage: 4));
@@ -130,7 +137,7 @@ internal static class DeviceSequenceCapacitySpecs
 
         Require(
             cycle.Batch.Items.Count == 2,
-            "A maxBatchSize=2 target actor must never receive more than two selected items even when global MaxBatchSequences is four.");
+            "A capacity=2 target actor must never receive more than two selected items even when global MaxBatchSequences is four.");
         Require(
             cycle.Deferred.Count == 1 &&
             cycle.Deferred[0].Reason == SchedulingDeferralReason.DeviceSequenceBudget,
@@ -138,7 +145,7 @@ internal static class DeviceSequenceCapacitySpecs
         Require(
             primaryBackend.PrefillItems == 2 &&
             primaryBackend.MaxObservedPrefillBatch == 2,
-            "The target actor must receive exactly its two-item capacity in the first cycle.");
+            "The target actor must receive exactly its two-item admission capacity in the first cycle.");
         Require(
             unrelatedBackend.PrefillItems == 0,
             "A larger unrelated actor must not absorb work without explicit placement.");
