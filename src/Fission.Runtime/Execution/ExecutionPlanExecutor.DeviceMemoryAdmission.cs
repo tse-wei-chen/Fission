@@ -397,6 +397,8 @@ public sealed partial class ExecutionPlanExecutor
             signal.TrySetException(
                 new ObjectDisposedException(nameof(ExecutionPlanExecutor)));
         }
+
+        DisposeDeviceInferenceReservationWaiters();
     }
 
     private static TaskCompletionSource<long> CreateReservationReleaseSignal() =>
