@@ -620,13 +620,7 @@ public sealed partial class InferenceEngine : IDisposable
         IReadOnlyList<SchedulingCandidate> candidates,
         CancellationToken cancellationToken)
     {
-        var admissionDevices = candidates
-            .Select(static candidate => candidate.ExecutionDevice)
-            .Where(static device => device.HasValue)
-            .Select(static device => device!.Value)
-            .Distinct()
-            .OrderBy(static device => device.Value, StringComparer.Ordinal)
-            .ToArray();
+        var admissionDevices = BuildAdmissionDevices(candidates);
 
         // The per-device gate now protects both physical-memory and inference-item
         // scheduler admission. It is required even when MaxDeviceBytes is disabled.
