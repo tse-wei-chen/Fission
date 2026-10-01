@@ -24,7 +24,8 @@ public static class ExecutionPlanExecutorDeviceCapacityExtensions
         GetDeviceExecutionCapacities(this ExecutionPlanExecutor executor)
     {
         ArgumentNullException.ThrowIfNull(executor);
-        return executor.GetDeviceExecutionCapacitiesCore(executor.RegisteredDevices);
+        return executor.GetDeviceExecutionCapacitiesCore(
+            executor.RegisteredDevices.ToArray());
     }
 
     /// <summary>
@@ -55,7 +56,7 @@ public static class ExecutionPlanExecutorDeviceCapacityExtensions
 
 public sealed partial class ExecutionPlanExecutor
 {
-    internal IReadOnlyList<DeviceId> RegisteredDevices => _devices.Devices;
+    internal IReadOnlyCollection<DeviceId> RegisteredDevices => _devices.Devices;
 
     internal IReadOnlyList<RuntimeDeviceExecutionCapacity>
         GetDeviceExecutionCapacitiesCore(IReadOnlyList<DeviceId> devices)
