@@ -36,11 +36,7 @@ public sealed partial class InferenceEngine
             deadline,
             enqueuedAt ?? DateTimeOffset.UtcNow);
 
-        lock (_gate)
-        {
-            _requests.Add(sequenceId, state);
-        }
-
+        AddRequest(state);
         return sequenceId;
     }
 }
