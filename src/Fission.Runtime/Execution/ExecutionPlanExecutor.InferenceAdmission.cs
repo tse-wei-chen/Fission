@@ -297,6 +297,31 @@ public sealed partial class ExecutionPlanExecutor
         await completed.ConfigureAwait(false);
     }
 
+    private void ReleaseDeviceInferenceReservation(DeviceId device, int items)
+    {
+        var ledger = GetExistingDeviceInferenceReservationLedger(device);
+        TaskCompletionSource<long>? releasedSignal;
+        long releaseVersion;
+
+        lock (ledger.Gate)
+        {
+            if (ledger.ReservedItems < items)
+            {
+                throw new InvalidOperationException(
+                    $"Device inference reservation ledger underflow for {ledger.Device}: " +
+                    $"reserved={ledger.ReservedItems}, releasing={items}.");
+            }
+
+            ledger.ReservedItems -= items;
+            releaseVersion = checked(ledger.ReleaseVersion + 1);
+            ledger.ReleaseVersion = releaseVersion;
+            releasedSignal = ledger.ReleaseSignal;
+            ledger.ReleaseSignal = null;
+        }
+
+        releasedSignal?.TrySetResult(releaseVersion);
+    }
+
     private void ReleaseDeviceInferenceReservations(
         IReadOnlyDictionary<DeviceId, int> reservations)
     {
@@ -417,7 +442,7 @@ public sealed partial class ExecutionPlanExecutor
 
         public DeviceInferenceReservationLeaseSet(
             ExecutionPlanExecutor owner,
-            IReadOnlyDictionary<DeviceId, int> reservations)
+            Dictionary<DeviceId, int> reservations)
         {
             if (reservations.Count == 0)
             {
@@ -425,9 +450,7 @@ public sealed partial class ExecutionPlanExecutor
             }
 
             _owner = owner;
-            _remaining = reservations.ToDictionary(
-                static pair => pair.Key,
-                static pair => pair.Value);
+            _remaining = reservations;
         }
 
         public void Release(DeviceId device)
@@ -441,11 +464,7 @@ public sealed partial class ExecutionPlanExecutor
                     return;
                 }
 
-                _owner.ReleaseDeviceInferenceReservations(
-                    new Dictionary<DeviceId, int>
-                    {
-                        [device] = items
-                    });
+                _owner.ReleaseDeviceInferenceReservation(device, items);
                 _remaining.Remove(device);
                 if (_remaining.Count == 0)
                 {
