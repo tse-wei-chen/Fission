@@ -230,13 +230,14 @@ public sealed class ScheduledBatchExecutor
         {
             var item = prepared[index];
             var submission = submissions[item.Device];
-            using var slot = submission.EnterSlot(item.Slot);
             try
             {
                 return await _runtime.ExecuteScheduledInferenceAsync(
                         item.PlanId,
                         item.Step,
                         item.Bindings,
+                        submission,
+                        item.Slot,
                         cancellationToken)
                     .ConfigureAwait(false);
             }
