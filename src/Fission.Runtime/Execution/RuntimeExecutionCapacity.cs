@@ -1,9 +1,10 @@
 namespace Fission.Runtime.Execution;
 
 /// <summary>
-/// Stable runtime feedback describing the maximum number of inference items that
-/// one atomic scheduler submission may contain for the current execution target.
-/// This intentionally exposes capacity rather than the device actor itself.
+/// Backward-compatible conservative runtime view of inference item-credit
+/// capacity. In a multi-device runtime this is the minimum credit capacity across
+/// all registered physical actors; it does not describe backend micro-batch width.
+/// Prefer GetDeviceExecutionCapacities when device-local limits matter.
 /// </summary>
 public readonly record struct RuntimeExecutionCapacity(int MaxInferenceItems);
 
