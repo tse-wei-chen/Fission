@@ -110,24 +110,55 @@ public sealed class ExecutionDeviceRegistry
     internal IReadOnlyList<RuntimeDeviceMemoryPressure> GetDeviceMemoryPressureNormalized(
         IReadOnlyList<DeviceId> devices)
     {
-        var pressure = new List<RuntimeDeviceMemoryPressure>(devices.Count);
+        if (devices.Count == 0)
+        {
+            return Array.Empty<RuntimeDeviceMemoryPressure>();
+        }
 
+        if (devices.Count == 1)
+        {
+            return TryGetDeviceMemoryPressureSnapshot(devices[0], out var snapshot)
+                ? new[] { snapshot }
+                : Array.Empty<RuntimeDeviceMemoryPressure>();
+        }
+
+        List<RuntimeDeviceMemoryPressure>? pressure = null;
         foreach (var deviceId in devices)
         {
-            var executor = ResolveRegistered(deviceId);
-            if (!executor.TryGetDeviceMemoryPressure(out var snapshot))
+            if (!TryGetDeviceMemoryPressureSnapshot(deviceId, out var snapshot))
             {
                 continue;
             }
 
-            pressure.Add(new RuntimeDeviceMemoryPressure(
-                deviceId,
-                snapshot.ActiveBytes,
-                snapshot.ReclaimableBytes,
-                snapshot.ReservedBytes,
-                snapshot.PeakReservedBytes));
+            (pressure ??= new List<RuntimeDeviceMemoryPressure>(devices.Count))
+                .Add(snapshot);
+        }
+
+        if (pressure is null)
+        {
+            return Array.Empty<RuntimeDeviceMemoryPressure>();
         }
 
         return pressure;
+    }
+
+    private bool TryGetDeviceMemoryPressureSnapshot(
+        DeviceId deviceId,
+        out RuntimeDeviceMemoryPressure pressure)
+    {
+        var executor = ResolveRegistered(deviceId);
+        if (!executor.TryGetDeviceMemoryPressure(out var snapshot))
+        {
+            pressure = default;
+            return false;
+        }
+
+        pressure = new RuntimeDeviceMemoryPressure(
+            deviceId,
+            snapshot.ActiveBytes,
+            snapshot.ReclaimableBytes,
+            snapshot.ReservedBytes,
+            snapshot.PeakReservedBytes);
+        return true;
     }
 }
