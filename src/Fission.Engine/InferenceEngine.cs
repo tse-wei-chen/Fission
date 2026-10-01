@@ -299,10 +299,25 @@ public sealed class InferenceEngine : IDisposable
                     new ScheduledPrefillBinding(request.ModelId, request.PromptTokens));
             }
 
-            var batchResult = await _scheduledExecutor.ExecuteAsync(
-                decision.Batch,
-                new ScheduledExecutionBindings(prefillBindings),
-                cancellationToken).ConfigureAwait(false);
+            ScheduledBatchResult batchResult;
+            var executionBindings = new ScheduledExecutionBindings(prefillBindings);
+            if (deviceMemoryReservation is null)
+            {
+                batchResult = await _scheduledExecutor.ExecuteAsync(
+                        decision.Batch,
+                        executionBindings,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                batchResult = await _scheduledExecutor.ExecuteAsync(
+                        decision.Batch,
+                        executionBindings,
+                        deviceMemoryReservation.Release,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
 
             if (batchResult.ItemResults.Count != decision.Batch.Items.Count)
             {
@@ -480,7 +495,7 @@ public sealed class InferenceEngine : IDisposable
 
     private async ValueTask<(
         SchedulingKernelResult Decision,
-        IDisposable? Reservation,
+        IRuntimeDeviceMemoryReservationLease? Reservation,
         IReadOnlyList<RuntimeDeviceMemoryReservationVersion>? BackpressureReservations)>
         ScheduleWithDeviceMemoryAdmissionAsync(
             Guid scheduleId,
@@ -549,8 +564,12 @@ public sealed class InferenceEngine : IDisposable
             decision,
             candidates,
             deviceMemory.ReservationState);
-        var reservation = _runtime.ReserveDeviceMemory(
-            BuildDeviceMemoryReservationRequests(decision, candidates));
+        var reservationRequests = BuildDeviceMemoryReservationRequests(
+            decision,
+            candidates);
+        var reservation = reservationRequests.Count == 0
+            ? null
+            : _runtime.ReserveDeviceMemoryByDevice(reservationRequests);
         return (decision, reservation, backpressureReservations);
     }
 
