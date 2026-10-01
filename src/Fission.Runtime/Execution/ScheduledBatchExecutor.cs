@@ -62,31 +62,54 @@ public sealed record ScheduledBatchResult(
     Guid ScheduleId,
     IReadOnlyList<ExecutionPlanResult> ItemResults);
 
-internal sealed class ScheduledBatchFailureCoordinator(
-    Dictionary<DeviceId, ContinuousBatchExecutor.AtomicSubmissionBatch> submissions)
+internal sealed class ScheduledDeviceGroup(DeviceId device)
 {
-    internal void Abort(Exception exception)
+    private ContinuousBatchExecutor.AtomicSubmissionBatch? _submission;
+    private Action<DeviceId>? _onCompleted;
+    private int _remaining;
+    private ExceptionDispatchInfo? _completionFailure;
+
+    internal DeviceId Device { get; } = device;
+    internal int Count { get; private set; }
+
+    internal ContinuousBatchExecutor.AtomicSubmissionBatch Submission =>
+        _submission ?? throw new InvalidOperationException(
+            $"Scheduled device group {Device} has not initialized its atomic submission.");
+
+    internal int RegisterItem()
     {
-        ArgumentNullException.ThrowIfNull(exception);
-        foreach (var submission in submissions.Values)
-        {
-            submission.Abort(exception);
-        }
+        var slot = Count;
+        Count = checked(Count + 1);
+        return slot;
     }
-}
 
-internal sealed class ScheduledDeviceCompletionTracker(
-    DeviceId device,
-    int remaining,
-    Action<DeviceId> onCompleted)
-{
-    private int _remaining = remaining > 0
-        ? remaining
-        : throw new ArgumentOutOfRangeException(nameof(remaining));
-    private ExceptionDispatchInfo? _failure;
-
-    internal void Complete()
+    internal void InitializeSubmission(Action<DeviceId>? onCompleted)
     {
+        if (_submission is not null)
+        {
+            throw new InvalidOperationException(
+                $"Scheduled device group {Device} already initialized its atomic submission.");
+        }
+
+        if (Count <= 0)
+        {
+            throw new InvalidOperationException(
+                $"Scheduled device group {Device} cannot initialize without work items.");
+        }
+
+        _submission = ContinuousBatchExecutor.BeginAtomicSubmission(Count);
+        _onCompleted = onCompleted;
+        _remaining = Count;
+    }
+
+    internal void CompleteItem()
+    {
+        var onCompleted = _onCompleted;
+        if (onCompleted is null)
+        {
+            return;
+        }
+
         if (Interlocked.Decrement(ref _remaining) != 0)
         {
             return;
@@ -94,15 +117,33 @@ internal sealed class ScheduledDeviceCompletionTracker(
 
         try
         {
-            onCompleted(device);
+            onCompleted(Device);
         }
         catch (Exception exception)
         {
-            Volatile.Write(ref _failure, ExceptionDispatchInfo.Capture(exception));
+            Volatile.Write(
+                ref _completionFailure,
+                ExceptionDispatchInfo.Capture(exception));
         }
     }
 
-    internal void ThrowIfFailed() => Volatile.Read(ref _failure)?.Throw();
+    internal void ThrowIfCompletionFailed() =>
+        Volatile.Read(ref _completionFailure)?.Throw();
+
+    internal void DisposeSubmission() => _submission?.Dispose();
+}
+
+internal sealed class ScheduledBatchFailureCoordinator(
+    Dictionary<DeviceId, ScheduledDeviceGroup> groups)
+{
+    internal void Abort(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+        foreach (var group in groups.Values)
+        {
+            group.Submission.Abort(exception);
+        }
+    }
 }
 
 /// <summary>
@@ -217,74 +258,52 @@ public sealed class ScheduledBatchExecutor
         ArgumentNullException.ThrowIfNull(batch);
         ArgumentNullException.ThrowIfNull(bindings);
 
-        var countsByDevice = new Dictionary<DeviceId, int>();
-        var prepared = Prepare(batch, bindings, countsByDevice);
+        var groupsByDevice = new Dictionary<DeviceId, ScheduledDeviceGroup>();
+        var prepared = Prepare(batch, bindings, groupsByDevice);
         if (prepared.Length == 0)
         {
             return Array.Empty<BackendStepResult>();
         }
 
-        foreach (var (device, count) in countsByDevice)
+        foreach (var group in groupsByDevice.Values)
         {
-            var capacity = _runtime.GetDeviceInferenceCapacity(device);
-            if (count > capacity)
+            var capacity = _runtime.GetDeviceInferenceCapacity(group.Device);
+            if (group.Count > capacity)
             {
                 throw new InvalidOperationException(
-                    $"Scheduled batch {batch.ScheduleId} contains {count} inference item(s) " +
-                    $"for device {device}, but that device actor capacity is {capacity}.");
+                    $"Scheduled batch {batch.ScheduleId} contains {group.Count} inference item(s) " +
+                    $"for device {group.Device}, but that device actor capacity is {capacity}.");
             }
-        }
-
-        var submissions = new Dictionary<DeviceId, ContinuousBatchExecutor.AtomicSubmissionBatch>(
-            countsByDevice.Count);
-        foreach (var (device, count) in countsByDevice)
-        {
-            submissions.Add(
-                device,
-                ContinuousBatchExecutor.BeginAtomicSubmission(count));
         }
 
         try
         {
-            var failureCoordinator = new ScheduledBatchFailureCoordinator(submissions);
-            Dictionary<DeviceId, ScheduledDeviceCompletionTracker>? completionTrackers = null;
-            if (onDeviceCompleted is not null)
+            foreach (var group in groupsByDevice.Values)
             {
-                completionTrackers = new Dictionary<DeviceId, ScheduledDeviceCompletionTracker>(
-                    countsByDevice.Count);
-                foreach (var (device, count) in countsByDevice)
-                {
-                    completionTrackers.Add(
-                        device,
-                        new ScheduledDeviceCompletionTracker(device, count, onDeviceCompleted));
-                }
+                group.InitializeSubmission(onDeviceCompleted);
             }
 
+            var failureCoordinator = new ScheduledBatchFailureCoordinator(groupsByDevice);
             var pending = new ValueTask<BackendStepResult>[prepared.Length];
             for (var index = 0; index < prepared.Length; index++)
             {
                 var item = prepared[index];
-                var completionTracker = completionTrackers is null
-                    ? null
-                    : completionTrackers[item.Device];
-
                 pending[index] = _runtime.ExecuteScheduledInferenceAsync(
                     item.PlanId,
                     item.Step,
                     item.PrefillTokens,
-                    submissions[item.Device],
+                    item.Group,
                     item.Slot,
                     failureCoordinator,
-                    completionTracker,
                     cancellationToken);
             }
 
             var results = await AwaitAllAsync(pending).ConfigureAwait(false);
-            if (completionTrackers is not null)
+            if (onDeviceCompleted is not null)
             {
-                foreach (var tracker in completionTrackers.Values)
+                foreach (var group in groupsByDevice.Values)
                 {
-                    tracker.ThrowIfFailed();
+                    group.ThrowIfCompletionFailed();
                 }
             }
 
@@ -292,9 +311,9 @@ public sealed class ScheduledBatchExecutor
         }
         finally
         {
-            foreach (var submission in submissions.Values)
+            foreach (var group in groupsByDevice.Values)
             {
-                submission.Dispose();
+                group.DisposeSubmission();
             }
         }
     }
@@ -330,7 +349,7 @@ public sealed class ScheduledBatchExecutor
     private PreparedItem[] Prepare(
         ScheduledBatch batch,
         ScheduledExecutionBindings bindings,
-        Dictionary<DeviceId, int> countsByDevice)
+        Dictionary<DeviceId, ScheduledDeviceGroup> groupsByDevice)
     {
         var prepared = new PreparedItem[batch.Items.Count];
         var sequences = new HashSet<SequenceId>();
@@ -413,15 +432,19 @@ public sealed class ScheduledBatchExecutor
             }
 
             var device = _runtime.ResolveExecutionDevice(item.SequenceId);
-            countsByDevice.TryGetValue(device, out var deviceCount);
-            countsByDevice[device] = checked(deviceCount + 1);
+            if (!groupsByDevice.TryGetValue(device, out var group))
+            {
+                group = new ScheduledDeviceGroup(device);
+                groupsByDevice.Add(device, group);
+            }
 
+            var slot = group.RegisterItem();
             prepared[index] = new PreparedItem(
                 DerivePlanId(batch.ScheduleId, index),
                 step,
                 prefillTokens,
-                device,
-                deviceCount);
+                group,
+                slot);
         }
 
         if (consumedTokens != batch.ConsumedTokens)
@@ -476,6 +499,6 @@ public sealed class ScheduledBatchExecutor
         Guid PlanId,
         ScheduledInferenceStep Step,
         ReadOnlyMemory<int> PrefillTokens,
-        DeviceId Device,
+        ScheduledDeviceGroup Group,
         int Slot);
 }
