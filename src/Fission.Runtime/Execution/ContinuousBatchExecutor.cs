@@ -197,12 +197,14 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
     private async Task PumpAsync()
     {
         var reader = _queue.Reader;
+        var batch = new List<PendingWork>(_maxBatchSize);
+        var inferenceSegment = new List<PendingInference>(_maxBatchSize);
 
         try
         {
             while (await reader.WaitToReadAsync().ConfigureAwait(false))
             {
-                var batch = new List<PendingWork>(_maxBatchSize);
+                batch.Clear();
                 while (batch.Count < _maxBatchSize && reader.TryRead(out var work))
                 {
                     batch.Add(work);
@@ -210,7 +212,7 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
 
                 try
                 {
-                    await ExecuteBatchAsync(batch).ConfigureAwait(false);
+                    await ExecuteBatchAsync(batch, inferenceSegment).ConfigureAwait(false);
                 }
                 catch (Exception exception)
                 {
@@ -235,9 +237,11 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         }
     }
 
-    private async Task ExecuteBatchAsync(IReadOnlyList<PendingWork> batch)
+    private async Task ExecuteBatchAsync(
+        IReadOnlyList<PendingWork> batch,
+        List<PendingInference> inferenceSegment)
     {
-        var inferenceSegment = new List<PendingInference>(_maxBatchSize);
+        inferenceSegment.Clear();
 
         foreach (var work in batch)
         {
@@ -282,6 +286,7 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         }
 
         await ExecuteInferenceSegmentAsync(inferenceSegment).ConfigureAwait(false);
+        inferenceSegment.Clear();
     }
 
     private async Task ExecuteInferenceSegmentAsync(
