@@ -1,6 +1,5 @@
 using System.Buffers.Binary;
 using Fission.Abstractions;
-using Fission.Abstractions.Execution;
 using Fission.Abstractions.Scheduling;
 
 namespace Fission.Runtime.Execution;
@@ -314,7 +313,7 @@ public sealed class ScheduledBatchExecutor
             consumedTransientKvBytes = checked(
                 consumedTransientKvBytes + item.TransientKvByteGrant);
 
-            ExecutionStep step;
+            ScheduledInferenceStep step;
             ReadOnlyMemory<int> prefillTokens = default;
 
             switch (item.Kind)
@@ -326,7 +325,7 @@ public sealed class ScheduledBatchExecutor
                         position,
                         item.TokenGrant,
                         item.CompletesPrefill);
-                    step = new PrefillExecutionStep(
+                    step = ScheduledInferenceStep.Prefill(
                         item.SequenceId,
                         binding.ModelId,
                         item.TokenGrant,
@@ -348,7 +347,7 @@ public sealed class ScheduledBatchExecutor
                             $"Decode schedule for {item.SequenceId} must grant exactly one token.");
                     }
 
-                    step = new DecodeExecutionStep(item.SequenceId, 1);
+                    step = ScheduledInferenceStep.Decode(item.SequenceId);
                     break;
 
                 default:
@@ -418,7 +417,7 @@ public sealed class ScheduledBatchExecutor
 
     private readonly record struct PreparedItem(
         Guid PlanId,
-        ExecutionStep Step,
+        ScheduledInferenceStep Step,
         ReadOnlyMemory<int> PrefillTokens,
         DeviceId Device,
         int Slot);

@@ -5,32 +5,68 @@ using Fission.Runtime.Tracing;
 
 namespace Fission.Runtime.Execution;
 
+internal enum ScheduledInferenceKind
+{
+    Prefill,
+    Decode
+}
+
+internal readonly record struct ScheduledInferenceStep(
+    ScheduledInferenceKind Kind,
+    SequenceId SequenceId,
+    ModelId ModelId,
+    int TokenCount,
+    bool CompletesPrefill)
+{
+    internal static ScheduledInferenceStep Prefill(
+        SequenceId sequenceId,
+        ModelId modelId,
+        int tokenCount,
+        bool completesPrefill) =>
+        new(
+            ScheduledInferenceKind.Prefill,
+            sequenceId,
+            modelId,
+            tokenCount,
+            completesPrefill);
+
+    internal static ScheduledInferenceStep Decode(SequenceId sequenceId) =>
+        new(
+            ScheduledInferenceKind.Decode,
+            sequenceId,
+            default,
+            TokenCount: 1,
+            CompletesPrefill: false);
+
+    internal string Operation => Kind switch
+    {
+        ScheduledInferenceKind.Prefill => nameof(PrefillExecutionStep),
+        ScheduledInferenceKind.Decode => nameof(DecodeExecutionStep),
+        _ => throw new NotSupportedException(
+            $"Unsupported scheduled inference kind {Kind}.")
+    };
+}
+
 public sealed partial class ExecutionPlanExecutor
 {
     /// <summary>
-    /// Executes the scheduler's validated one-step prefill/decode plan without
-    /// materializing a generic CompiledExecutionPlan and its reservation/result
-    /// bookkeeping. Atomic actor registration is passed explicitly so the
-    /// scheduled hot path does not need an AsyncLocal slot scope.
+    /// Executes the scheduler's validated one-step prefill/decode work without
+    /// materializing a generic ExecutionStep or CompiledExecutionPlan and their
+    /// reservation/result bookkeeping. Atomic actor registration is passed
+    /// explicitly so the scheduled hot path does not need an AsyncLocal slot scope.
     /// </summary>
     internal async ValueTask<ExecutionPlanResult> ExecuteScheduledInferenceAsync(
         Guid planId,
-        ExecutionStep step,
+        ScheduledInferenceStep step,
         ReadOnlyMemory<int> prefillTokens,
         ContinuousBatchExecutor.AtomicSubmissionBatch submission,
         int slot,
         CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        ArgumentNullException.ThrowIfNull(step);
         ArgumentNullException.ThrowIfNull(submission);
 
-        if (step is not PrefillExecutionStep and not DecodeExecutionStep)
-        {
-            throw new NotSupportedException(
-                $"Scheduled single-inference execution does not support {step.GetType().Name}.");
-        }
-
+        var operation = step.Operation;
         ReserveSequence(step.SequenceId, $"plan {planId}");
         try
         {
@@ -42,7 +78,6 @@ public sealed partial class ExecutionPlanExecutor
 
             cancellationToken.ThrowIfCancellationRequested();
 
-            var operation = step.GetType().Name;
             RecordSequenceState(
                 planId,
                 ExecutionTraceKind.StepStarted,
@@ -50,23 +85,23 @@ public sealed partial class ExecutionPlanExecutor
                 operation,
                 step.SequenceId);
 
-            BackendStepResult result = step switch
+            BackendStepResult result = step.Kind switch
             {
-                PrefillExecutionStep prefill => await ExecuteScheduledPrefillAsync(
-                        prefill,
+                ScheduledInferenceKind.Prefill => await ExecuteScheduledPrefillAsync(
+                        step,
                         prefillTokens,
                         submission,
                         slot,
                         cancellationToken)
                     .ConfigureAwait(false),
-                DecodeExecutionStep decode => await ExecuteScheduledDecodeAsync(
-                        decode,
+                ScheduledInferenceKind.Decode => await ExecuteScheduledDecodeAsync(
+                        step,
                         submission,
                         slot,
                         cancellationToken)
                     .ConfigureAwait(false),
-                _ => throw new InvalidOperationException(
-                    $"Unsupported scheduled inference step {step.GetType().Name}.")
+                _ => throw new NotSupportedException(
+                    $"Unsupported scheduled inference kind {step.Kind}.")
             };
 
             RecordSequenceState(
@@ -95,7 +130,7 @@ public sealed partial class ExecutionPlanExecutor
     }
 
     private async ValueTask<BackendStepResult> ExecuteScheduledPrefillAsync(
-        PrefillExecutionStep step,
+        ScheduledInferenceStep step,
         ReadOnlyMemory<int> tokens,
         ContinuousBatchExecutor.AtomicSubmissionBatch submission,
         int slot,
@@ -147,12 +182,12 @@ public sealed partial class ExecutionPlanExecutor
     }
 
     private async ValueTask<BackendStepResult> ExecuteScheduledDecodeAsync(
-        DecodeExecutionStep step,
+        ScheduledInferenceStep step,
         ContinuousBatchExecutor.AtomicSubmissionBatch submission,
         int slot,
         CancellationToken cancellationToken)
     {
-        if (step.MaxTokens != 1)
+        if (step.TokenCount != 1)
         {
             throw new InvalidOperationException(
                 "Scheduled decode execution must contain exactly one token step.");
