@@ -527,9 +527,9 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                 throw new ArgumentOutOfRangeException(nameof(index));
             }
 
-            var previous = AmbientAtomicSlot.Value;
-            AmbientAtomicSlot.Value = new AtomicSubmissionSlot(this, index);
-            return new AtomicSlotLease(previous);
+            var slot = new AtomicSubmissionSlot(this, index, AmbientAtomicSlot.Value);
+            AmbientAtomicSlot.Value = slot;
+            return slot;
         }
 
         internal async ValueTask RegisterAsync(
@@ -758,9 +758,15 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         }
     }
 
-    private sealed class AtomicSlotLease(AtomicSubmissionSlot? previous) : IDisposable
+    private sealed class AtomicSubmissionSlot(
+        AtomicSubmissionBatch batch,
+        int index,
+        AtomicSubmissionSlot? previous) : IDisposable
     {
         private int _disposed;
+
+        internal AtomicSubmissionBatch Batch { get; } = batch;
+        internal int Index { get; } = index;
 
         public void Dispose()
         {
@@ -770,10 +776,6 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
             }
         }
     }
-
-    private sealed record AtomicSubmissionSlot(
-        AtomicSubmissionBatch Batch,
-        int Index);
 
     internal abstract class PendingWork
     {
