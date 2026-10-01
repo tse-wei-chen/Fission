@@ -289,11 +289,11 @@ public sealed class InferenceWorker : IAsyncDisposable
                     session.Completion.TrySetResult(snapshot);
                 }
 
-                pending.Completed.TrySetResult(snapshot);
+                pending.Complete(snapshot);
             }
             catch (Exception exception)
             {
-                pending.Completed.TrySetException(exception);
+                pending.Fail(exception);
             }
         }
     }
@@ -336,18 +336,49 @@ public sealed class InferenceWorker : IAsyncDisposable
         }
     }
 
-    private async ValueTask<InferenceRequestSnapshot> RequestCancellationAsync(
+    private ValueTask<InferenceRequestSnapshot> RequestCancellationAsync(
         SequenceId sequenceId,
         CancellationToken cancellationToken)
     {
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        PendingCancellation? pending = null;
 
-        var pending = new PendingCancellation(sequenceId);
-        await _cancellation.Writer.WriteAsync(pending, cancellationToken)
-            .ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+            pending = new PendingCancellation(sequenceId, cancellationToken);
+            var write = _cancellation.Writer.WriteAsync(pending, cancellationToken);
+            if (write.IsCompletedSuccessfully)
+            {
+                SignalWork();
+                return pending.WaitAsync();
+            }
+
+            return AwaitCancellationAdmissionAsync(write, pending);
+        }
+        catch (Exception exception)
+        {
+            pending?.DisposeCancellationRegistration();
+            return ValueTask.FromException<InferenceRequestSnapshot>(exception);
+        }
+    }
+
+    private async ValueTask<InferenceRequestSnapshot> AwaitCancellationAdmissionAsync(
+        ValueTask write,
+        PendingCancellation pending)
+    {
+        try
+        {
+            await write.ConfigureAwait(false);
+        }
+        catch
+        {
+            pending.DisposeCancellationRegistration();
+            throw;
+        }
+
         SignalWork();
-        return await pending.Completed.Task.WaitAsync(cancellationToken)
-            .ConfigureAwait(false);
+        return await pending.WaitAsync().ConfigureAwait(false);
     }
 
     private void PublishDecodeTokens(InferenceCycleResult cycle)
@@ -426,15 +457,8 @@ public sealed class InferenceWorker : IAsyncDisposable
     {
         while (_cancellation.Reader.TryRead(out var pending))
         {
-            if (failure is null)
-            {
-                pending.Completed.TrySetException(
-                    new ObjectDisposedException(nameof(InferenceWorker)));
-            }
-            else
-            {
-                pending.Completed.TrySetException(failure);
-            }
+            pending.Fail(
+                failure ?? new ObjectDisposedException(nameof(InferenceWorker)));
         }
     }
 
@@ -549,10 +573,84 @@ public sealed class InferenceWorker : IAsyncDisposable
             _completion.OnCompleted(continuation, state, token, flags);
     }
 
-    private sealed record PendingCancellation(SequenceId SequenceId)
+    private sealed class PendingCancellation : IValueTaskSource<InferenceRequestSnapshot>
     {
-        public TaskCompletionSource<InferenceRequestSnapshot> Completed { get; } = new(
-            TaskCreationOptions.RunContinuationsAsynchronously);
+        private ManualResetValueTaskSourceCore<InferenceRequestSnapshot> _completion;
+        private readonly CancellationToken _consumerCancellation;
+        private CancellationTokenRegistration _cancellationRegistration;
+        private int _terminal;
+
+        internal PendingCancellation(
+            SequenceId sequenceId,
+            CancellationToken consumerCancellation)
+        {
+            _completion.RunContinuationsAsynchronously = true;
+            SequenceId = sequenceId;
+            _consumerCancellation = consumerCancellation;
+
+            if (consumerCancellation.CanBeCanceled)
+            {
+                _cancellationRegistration = consumerCancellation.UnsafeRegister(
+                    static state => ((PendingCancellation)state!).CancelFromConsumer(),
+                    this);
+
+                if (Volatile.Read(ref _terminal) != 0)
+                {
+                    _cancellationRegistration.Dispose();
+                }
+            }
+        }
+
+        internal SequenceId SequenceId { get; }
+
+        internal ValueTask<InferenceRequestSnapshot> WaitAsync() =>
+            new(this, _completion.Version);
+
+        internal void Complete(InferenceRequestSnapshot snapshot)
+        {
+            if (Interlocked.CompareExchange(ref _terminal, 1, 0) == 0)
+            {
+                _completion.SetResult(snapshot);
+            }
+
+            DisposeCancellationRegistration();
+        }
+
+        internal void Fail(Exception exception)
+        {
+            ArgumentNullException.ThrowIfNull(exception);
+            if (Interlocked.CompareExchange(ref _terminal, 1, 0) == 0)
+            {
+                _completion.SetException(exception);
+            }
+
+            DisposeCancellationRegistration();
+        }
+
+        internal void DisposeCancellationRegistration() =>
+            _cancellationRegistration.Dispose();
+
+        private void CancelFromConsumer()
+        {
+            if (Interlocked.CompareExchange(ref _terminal, 1, 0) == 0)
+            {
+                _completion.SetException(
+                    new OperationCanceledException(_consumerCancellation));
+            }
+        }
+
+        InferenceRequestSnapshot IValueTaskSource<InferenceRequestSnapshot>.GetResult(short token) =>
+            _completion.GetResult(token);
+
+        ValueTaskSourceStatus IValueTaskSource<InferenceRequestSnapshot>.GetStatus(short token) =>
+            _completion.GetStatus(token);
+
+        void IValueTaskSource<InferenceRequestSnapshot>.OnCompleted(
+            Action<object?> continuation,
+            object? state,
+            short token,
+            ValueTaskSourceOnCompletedFlags flags) =>
+            _completion.OnCompleted(continuation, state, token, flags);
     }
 
     private sealed class SessionState
