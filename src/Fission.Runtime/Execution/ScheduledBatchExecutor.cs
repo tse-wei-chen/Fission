@@ -80,10 +80,40 @@ public sealed class ScheduledBatchExecutor
         _runtime = runtime;
     }
 
-    public async ValueTask<ScheduledBatchResult> ExecuteAsync(
+    public ValueTask<ScheduledBatchResult> ExecuteAsync(
         ScheduledBatch batch,
         ScheduledExecutionBindings bindings,
+        CancellationToken cancellationToken = default) =>
+        ExecuteCoreAsync(
+            batch,
+            bindings,
+            onDeviceCompleted: null,
+            cancellationToken);
+
+    /// <summary>
+    /// Runtime-internal execution path that reports each physical device exactly
+    /// once after every scheduled plan targeting that actor reaches a terminal
+    /// state. Other device groups may still be executing when the callback runs.
+    /// </summary>
+    internal ValueTask<ScheduledBatchResult> ExecuteAsync(
+        ScheduledBatch batch,
+        ScheduledExecutionBindings bindings,
+        Action<DeviceId> onDeviceCompleted,
         CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(onDeviceCompleted);
+        return ExecuteCoreAsync(
+            batch,
+            bindings,
+            onDeviceCompleted,
+            cancellationToken);
+    }
+
+    private async ValueTask<ScheduledBatchResult> ExecuteCoreAsync(
+        ScheduledBatch batch,
+        ScheduledExecutionBindings bindings,
+        Action<DeviceId>? onDeviceCompleted,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(batch);
         ArgumentNullException.ThrowIfNull(bindings);
@@ -127,13 +157,61 @@ public sealed class ScheduledBatchExecutor
         try
         {
             var pending = new Task<ExecutionPlanResult>[prepared.Length];
+            var pendingByDevice = new Dictionary<DeviceId, List<Task<ExecutionPlanResult>>>();
             for (var index = 0; index < prepared.Length; index++)
             {
-                pending[index] = ExecutePreparedAsync(index);
+                var task = ExecutePreparedAsync(index);
+                pending[index] = task;
+
+                var device = deviceByIndex[index];
+                if (!pendingByDevice.TryGetValue(device, out var devicePending))
+                {
+                    devicePending = new List<Task<ExecutionPlanResult>>(countsByDevice[device]);
+                    pendingByDevice.Add(device, devicePending);
+                }
+
+                devicePending.Add(task);
             }
 
-            var results = await Task.WhenAll(pending).ConfigureAwait(false);
-            return new ScheduledBatchResult(batch.ScheduleId, results);
+            Task[]? deviceCompletionObservers = null;
+            if (onDeviceCompleted is not null)
+            {
+                deviceCompletionObservers = pendingByDevice
+                    .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal)
+                    .Select(pair => ObserveDeviceCompletionAsync(
+                        pair.Key,
+                        pair.Value,
+                        onDeviceCompleted))
+                    .ToArray();
+            }
+
+            try
+            {
+                var results = await Task.WhenAll(pending).ConfigureAwait(false);
+                if (deviceCompletionObservers is not null)
+                {
+                    await Task.WhenAll(deviceCompletionObservers).ConfigureAwait(false);
+                }
+
+                return new ScheduledBatchResult(batch.ScheduleId, results);
+            }
+            catch
+            {
+                if (deviceCompletionObservers is not null)
+                {
+                    try
+                    {
+                        await Task.WhenAll(deviceCompletionObservers).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // Preserve the scheduled execution failure. Device-completion
+                        // observers exist for cleanup and must not replace its cause.
+                    }
+                }
+
+                throw;
+            }
         }
         finally
         {
@@ -164,6 +242,27 @@ public sealed class ScheduledBatchExecutor
 
                 throw;
             }
+        }
+    }
+
+    private static async Task ObserveDeviceCompletionAsync(
+        DeviceId device,
+        IReadOnlyList<Task<ExecutionPlanResult>> pending,
+        Action<DeviceId> onDeviceCompleted)
+    {
+        try
+        {
+            await Task.WhenAll(pending).ConfigureAwait(false);
+        }
+        catch
+        {
+            // The main batch await owns execution failure propagation. The device
+            // observer still runs its terminal callback so per-device resources can
+            // be released even when this group faults or is cancelled.
+        }
+        finally
+        {
+            onDeviceCompleted(device);
         }
     }
 
