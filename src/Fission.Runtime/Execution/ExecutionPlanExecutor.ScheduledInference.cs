@@ -16,14 +16,13 @@ public sealed partial class ExecutionPlanExecutor
     internal async ValueTask<ExecutionPlanResult> ExecuteScheduledInferenceAsync(
         Guid planId,
         ExecutionStep step,
-        ExecutionBindings bindings,
+        ReadOnlyMemory<int> prefillTokens,
         ContinuousBatchExecutor.AtomicSubmissionBatch submission,
         int slot,
         CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         ArgumentNullException.ThrowIfNull(step);
-        ArgumentNullException.ThrowIfNull(bindings);
         ArgumentNullException.ThrowIfNull(submission);
 
         if (step is not PrefillExecutionStep and not DecodeExecutionStep)
@@ -55,7 +54,7 @@ public sealed partial class ExecutionPlanExecutor
             {
                 PrefillExecutionStep prefill => await ExecuteScheduledPrefillAsync(
                         prefill,
-                        bindings,
+                        prefillTokens,
                         submission,
                         slot,
                         cancellationToken)
@@ -97,12 +96,18 @@ public sealed partial class ExecutionPlanExecutor
 
     private async ValueTask<BackendStepResult> ExecuteScheduledPrefillAsync(
         PrefillExecutionStep step,
-        ExecutionBindings bindings,
+        ReadOnlyMemory<int> tokens,
         ContinuousBatchExecutor.AtomicSubmissionBatch submission,
         int slot,
         CancellationToken cancellationToken)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(step.TokenCount);
+        if (tokens.Length != step.TokenCount)
+        {
+            throw new InvalidOperationException(
+                $"Plan expects {step.TokenCount} prefill tokens for {step.SequenceId}, " +
+                $"but binding contains {tokens.Length}.");
+        }
 
         var sequence = _sequences.GetOrAdd(
             step.SequenceId,
@@ -124,7 +129,6 @@ public sealed partial class ExecutionPlanExecutor
                 $"Cannot prefill sequence {step.SequenceId} while it is {sequence.Status}.");
         }
 
-        var tokens = bindings.ResolvePrefill(step.SequenceId, step.TokenCount);
         var device = _devices.ResolvePlacement(sequence.Device);
         var result = await device.SubmitPrefillAsync(
                 new PrefillItem(step.SequenceId, step.ModelId, tokens),
