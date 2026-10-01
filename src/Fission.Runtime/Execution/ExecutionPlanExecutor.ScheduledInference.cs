@@ -59,18 +59,18 @@ public sealed partial class ExecutionPlanExecutor
         Guid planId,
         ScheduledInferenceStep step,
         ReadOnlyMemory<int> prefillTokens,
-        ContinuousBatchExecutor.AtomicSubmissionBatch submission,
+        ScheduledDeviceGroup deviceGroup,
         int slot,
         ScheduledBatchFailureCoordinator failureCoordinator,
-        ScheduledDeviceCompletionTracker? completionTracker,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(deviceGroup);
         ArgumentNullException.ThrowIfNull(failureCoordinator);
 
         try
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-            ArgumentNullException.ThrowIfNull(submission);
+            var submission = deviceGroup.Submission;
 
             var operation = step.Operation;
             ReserveSequence(step.SequenceId, $"plan {planId}");
@@ -137,7 +137,7 @@ public sealed partial class ExecutionPlanExecutor
         }
         finally
         {
-            completionTracker?.Complete();
+            deviceGroup.CompleteItem();
         }
     }
 
