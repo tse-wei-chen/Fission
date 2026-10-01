@@ -118,25 +118,11 @@ public sealed class ScheduledBatchExecutor
         ArgumentNullException.ThrowIfNull(batch);
         ArgumentNullException.ThrowIfNull(bindings);
 
-        var prepared = Prepare(batch, bindings);
+        var countsByDevice = new Dictionary<DeviceId, int>();
+        var prepared = Prepare(batch, bindings, countsByDevice);
         if (prepared.Length == 0)
         {
             return new ScheduledBatchResult(batch.ScheduleId, Array.Empty<ExecutionPlanResult>());
-        }
-
-        var deviceByIndex = new DeviceId[prepared.Length];
-        var slotByIndex = new int[prepared.Length];
-        var countsByDevice = new Dictionary<DeviceId, int>();
-
-        for (var index = 0; index < prepared.Length; index++)
-        {
-            var sequenceId = prepared[index].Plan.Steps[0].SequenceId;
-            var device = _runtime.ResolveExecutionDevice(sequenceId);
-            deviceByIndex[index] = device;
-
-            countsByDevice.TryGetValue(device, out var count);
-            slotByIndex[index] = count;
-            countsByDevice[device] = checked(count + 1);
         }
 
         foreach (var (device, count) in countsByDevice)
@@ -150,39 +136,58 @@ public sealed class ScheduledBatchExecutor
             }
         }
 
-        var submissions = countsByDevice.ToDictionary(
-            static entry => entry.Key,
-            static entry => ContinuousBatchExecutor.BeginAtomicSubmission(entry.Value));
+        var submissions = new Dictionary<DeviceId, ContinuousBatchExecutor.AtomicSubmissionBatch>(
+            countsByDevice.Count);
+        foreach (var (device, count) in countsByDevice)
+        {
+            submissions.Add(
+                device,
+                ContinuousBatchExecutor.BeginAtomicSubmission(count));
+        }
 
         try
         {
             var pending = new Task<ExecutionPlanResult>[prepared.Length];
-            var pendingByDevice = new Dictionary<DeviceId, List<Task<ExecutionPlanResult>>>();
+            Dictionary<DeviceId, List<Task<ExecutionPlanResult>>>? pendingByDevice =
+                onDeviceCompleted is null
+                    ? null
+                    : new Dictionary<DeviceId, List<Task<ExecutionPlanResult>>>(
+                        countsByDevice.Count);
+
             for (var index = 0; index < prepared.Length; index++)
             {
                 var task = ExecutePreparedAsync(index);
                 pending[index] = task;
 
-                var device = deviceByIndex[index];
-                if (!pendingByDevice.TryGetValue(device, out var devicePending))
+                if (pendingByDevice is null)
                 {
-                    devicePending = new List<Task<ExecutionPlanResult>>(countsByDevice[device]);
-                    pendingByDevice.Add(device, devicePending);
+                    continue;
+                }
+
+                var item = prepared[index];
+                if (!pendingByDevice.TryGetValue(item.Device, out var devicePending))
+                {
+                    devicePending = new List<Task<ExecutionPlanResult>>(
+                        countsByDevice[item.Device]);
+                    pendingByDevice.Add(item.Device, devicePending);
                 }
 
                 devicePending.Add(task);
             }
 
             Task[]? deviceCompletionObservers = null;
-            if (onDeviceCompleted is not null)
+            if (pendingByDevice is not null)
             {
-                deviceCompletionObservers = pendingByDevice
-                    .OrderBy(static pair => pair.Key.Value, StringComparer.Ordinal)
-                    .Select(pair => ObserveDeviceCompletionAsync(
-                        pair.Key,
-                        pair.Value,
-                        onDeviceCompleted))
-                    .ToArray();
+                deviceCompletionObservers = new Task[pendingByDevice.Count];
+                var observerIndex = 0;
+                foreach (var (device, devicePending) in pendingByDevice)
+                {
+                    deviceCompletionObservers[observerIndex++] =
+                        ObserveDeviceCompletionAsync(
+                            device,
+                            devicePending,
+                            onDeviceCompleted!);
+                }
             }
 
             try
@@ -223,13 +228,14 @@ public sealed class ScheduledBatchExecutor
 
         async Task<ExecutionPlanResult> ExecutePreparedAsync(int index)
         {
-            var submission = submissions[deviceByIndex[index]];
-            using var slot = submission.EnterSlot(slotByIndex[index]);
+            var item = prepared[index];
+            var submission = submissions[item.Device];
+            using var slot = submission.EnterSlot(item.Slot);
             try
             {
                 return await _runtime.ExecuteAsync(
-                        prepared[index].Plan,
-                        prepared[index].Bindings,
+                        item.Plan,
+                        item.Bindings,
                         cancellationToken)
                     .ConfigureAwait(false);
             }
@@ -268,7 +274,8 @@ public sealed class ScheduledBatchExecutor
 
     private PreparedItem[] Prepare(
         ScheduledBatch batch,
-        ScheduledExecutionBindings bindings)
+        ScheduledExecutionBindings bindings,
+        Dictionary<DeviceId, int> countsByDevice)
     {
         var prepared = new PreparedItem[batch.Items.Count];
         var sequences = new HashSet<SequenceId>();
@@ -355,12 +362,18 @@ public sealed class ScheduledBatchExecutor
                         $"Unsupported scheduled work kind {item.Kind}.");
             }
 
+            var device = _runtime.ResolveExecutionDevice(item.SequenceId);
+            countsByDevice.TryGetValue(device, out var deviceCount);
+            countsByDevice[device] = checked(deviceCount + 1);
+
             prepared[index] = new PreparedItem(
                 new CompiledExecutionPlan(
                     DerivePlanId(batch.ScheduleId, index),
                     item.Priority,
                     new[] { step }),
-                executionBindings);
+                executionBindings,
+                device,
+                deviceCount);
         }
 
         if (consumedTokens != batch.ConsumedTokens)
@@ -413,5 +426,7 @@ public sealed class ScheduledBatchExecutor
 
     private readonly record struct PreparedItem(
         CompiledExecutionPlan Plan,
-        ExecutionBindings Bindings);
+        ExecutionBindings Bindings,
+        DeviceId Device,
+        int Slot);
 }
