@@ -334,10 +334,9 @@ public sealed class ScheduledBatchExecutor
                         item.TokenGrant,
                         item.CompletesPrefill);
                     executionBindings = new ExecutionBindings(
-                        new Dictionary<SequenceId, ReadOnlyMemory<int>>
-                        {
-                            [item.SequenceId] = binding.Tokens
-                        });
+                        new SingleEntryReadOnlyDictionary<SequenceId, ReadOnlyMemory<int>>(
+                            item.SequenceId,
+                            binding.Tokens));
                     break;
                 }
 
