@@ -70,9 +70,6 @@ public sealed record ScheduledBatchResult(
 /// </summary>
 public sealed class ScheduledBatchExecutor
 {
-    private static readonly ExecutionBindings EmptyExecutionBindings =
-        new(new Dictionary<SequenceId, ReadOnlyMemory<int>>());
-
     private readonly ExecutionPlanExecutor _runtime;
 
     public ScheduledBatchExecutor(ExecutionPlanExecutor runtime)
@@ -235,7 +232,7 @@ public sealed class ScheduledBatchExecutor
                 return await _runtime.ExecuteScheduledInferenceAsync(
                         item.PlanId,
                         item.Step,
-                        item.Bindings,
+                        item.PrefillTokens,
                         submission,
                         item.Slot,
                         cancellationToken)
@@ -318,7 +315,7 @@ public sealed class ScheduledBatchExecutor
                 consumedTransientKvBytes + item.TransientKvByteGrant);
 
             ExecutionStep step;
-            ExecutionBindings executionBindings;
+            ReadOnlyMemory<int> prefillTokens = default;
 
             switch (item.Kind)
             {
@@ -334,11 +331,7 @@ public sealed class ScheduledBatchExecutor
                         binding.ModelId,
                         item.TokenGrant,
                         item.CompletesPrefill);
-                    executionBindings = new ExecutionBindings(
-                        new Dictionary<SequenceId, ReadOnlyMemory<int>>
-                        {
-                            [item.SequenceId] = binding.Tokens
-                        });
+                    prefillTokens = binding.Tokens;
                     break;
                 }
 
@@ -356,7 +349,6 @@ public sealed class ScheduledBatchExecutor
                     }
 
                     step = new DecodeExecutionStep(item.SequenceId, 1);
-                    executionBindings = EmptyExecutionBindings;
                     break;
 
                 default:
@@ -371,7 +363,7 @@ public sealed class ScheduledBatchExecutor
             prepared[index] = new PreparedItem(
                 DerivePlanId(batch.ScheduleId, index),
                 step,
-                executionBindings,
+                prefillTokens,
                 device,
                 deviceCount);
         }
@@ -427,7 +419,7 @@ public sealed class ScheduledBatchExecutor
     private readonly record struct PreparedItem(
         Guid PlanId,
         ExecutionStep Step,
-        ExecutionBindings Bindings,
+        ReadOnlyMemory<int> PrefillTokens,
         DeviceId Device,
         int Slot);
 }
