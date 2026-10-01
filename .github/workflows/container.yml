@@ -1,0 +1,84 @@
+name: container
+
+on:
+  push:
+    branches: [ develop ]
+    paths:
+      - Dockerfile
+      - compose.yaml
+      - .dockerignore
+      - .env.example
+      - Directory.Build.props
+      - global.json
+      - src/**
+      - .github/workflows/container.yml
+  pull_request:
+    branches: [ develop ]
+    paths:
+      - Dockerfile
+      - compose.yaml
+      - .dockerignore
+      - .env.example
+      - Directory.Build.props
+      - global.json
+      - src/**
+      - .github/workflows/container.yml
+
+jobs:
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Build image
+        run: docker build --tag fission:ci .
+
+      - name: Smoke test server image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker run --detach \
+            --name fission-container-ci \
+            --publish 18000:8000 \
+            fission:ci
+
+          cleanup() {
+            docker logs fission-container-ci || true
+            docker rm --force fission-container-ci || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for _ in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:18000/healthz > /dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "Fission container did not become ready." >&2
+            exit 1
+          fi
+
+          curl --fail --silent --show-error \
+            --header 'Content-Type: application/json' \
+            --data '{"model":"container-smoke","prompt":"hello","max_tokens":2,"stream":false}' \
+            http://127.0.0.1:18000/v1/completions > /tmp/fission-response.json
+
+          python3 - <<'PY'
+          import json
+
+          with open('/tmp/fission-response.json', encoding='utf-8') as handle:
+              payload = json.load(handle)
+
+          assert payload['object'] == 'text_completion', payload
+          assert len(payload['choices']) == 1, payload
+          assert payload['choices'][0]['finish_reason'] == 'length', payload
+          assert payload['usage']['completion_tokens'] == 2, payload
+          PY
