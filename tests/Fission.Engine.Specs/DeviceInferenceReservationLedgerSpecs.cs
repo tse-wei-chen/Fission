@@ -160,7 +160,7 @@ internal static class DeviceInferenceReservationLedgerSpecs
             "Inference reservation must reject unregistered physical devices.");
 
         using var start = new ManualResetEventSlim(false);
-        Task<(bool Success, IDisposable Lease)> CompeteAsync() => Task.Run(() =>
+        Task<(bool Success, IRuntimeDeviceInferenceReservationLease Lease)> CompeteAsync() => Task.Run(() =>
         {
             start.Wait();
             var success = runtime.TryReserveDeviceInference(
