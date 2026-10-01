@@ -45,6 +45,7 @@ public sealed class InferenceWorker : IAsyncDisposable
     private readonly InferenceEngine _engine;
     private readonly Channel<PendingSubmission> _admission;
     private readonly Channel<PendingCancellation> _cancellation;
+    private readonly Channel<byte> _workSignal;
     private readonly Dictionary<SequenceId, SessionState> _sessions = new();
     private readonly Task _pump;
     private int _disposed;
@@ -72,6 +73,14 @@ public sealed class InferenceWorker : IAsyncDisposable
                 SingleWriter = false,
                 AllowSynchronousContinuations = false
             });
+        _workSignal = Channel.CreateBounded<byte>(
+            new BoundedChannelOptions(1)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.DropWrite,
+                AllowSynchronousContinuations = false
+            });
         _pump = Task.Run(PumpAsync);
     }
 
@@ -96,6 +105,7 @@ public sealed class InferenceWorker : IAsyncDisposable
 
         await _admission.Writer.WriteAsync(pending, cancellationToken)
             .ConfigureAwait(false);
+        SignalWork();
 
         // Once admitted to the bounded queue, ownership has transferred to the
         // worker. Do not abandon the accepted task because that would create an
@@ -165,28 +175,23 @@ public sealed class InferenceWorker : IAsyncDisposable
     private async ValueTask<bool> WaitForWorkAsync(
         CancellationToken cancellationToken = default)
     {
-        while (true)
+        while (await _workSignal.Reader.WaitToReadAsync(cancellationToken)
+                   .ConfigureAwait(false))
         {
-            var admissionWait = _admission.Reader
-                .WaitToReadAsync(cancellationToken)
-                .AsTask();
-            var cancellationWait = _cancellation.Reader
-                .WaitToReadAsync(cancellationToken)
-                .AsTask();
-            var completed = await Task.WhenAny(admissionWait, cancellationWait)
-                .ConfigureAwait(false);
+            while (_workSignal.Reader.TryRead(out _))
+            {
+            }
 
-            if (await completed.ConfigureAwait(false))
+            // A capacity-one signal may remain buffered after a busy pump already
+            // drained all corresponding commands. Ignore that stale notification
+            // and continue waiting instead of spinning one scheduler iteration.
+            if (HasImmediatelyAvailableWork())
             {
                 return true;
             }
-
-            if (_admission.Reader.Completion.IsCompleted &&
-                _cancellation.Reader.Completion.IsCompleted)
-            {
-                return false;
-            }
         }
+
+        return false;
     }
 
     private async Task WaitForBackpressureOrWorkAsync(Task backpressureWait)
@@ -231,10 +236,12 @@ public sealed class InferenceWorker : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            // Cancellation only stops the losing channel-readiness wait after the
+            // Cancellation only stops the losing readiness wait after the
             // reservation-release signal won Task.WhenAny.
         }
     }
+
+    private void SignalWork() => _workSignal.Writer.TryWrite(0);
 
     private void DrainAdmissions()
     {
@@ -315,6 +322,7 @@ public sealed class InferenceWorker : IAsyncDisposable
         var pending = new PendingCancellation(sequenceId);
         await _cancellation.Writer.WriteAsync(pending, cancellationToken)
             .ConfigureAwait(false);
+        SignalWork();
         return await pending.Completed.Task.WaitAsync(cancellationToken)
             .ConfigureAwait(false);
     }
@@ -427,6 +435,12 @@ public sealed class InferenceWorker : IAsyncDisposable
 
         _admission.Writer.TryComplete();
         _cancellation.Writer.TryComplete();
+
+        // Wake the pump even when a command was accepted just before the command
+        // writers were closed but its producer had not published the coalesced
+        // readiness signal yet. Buffered work remains visible before shutdown.
+        SignalWork();
+        _workSignal.Writer.TryComplete();
         await _pump.ConfigureAwait(false);
     }
 
