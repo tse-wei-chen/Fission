@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Runtime.ExceptionServices;
 using Fission.Abstractions;
 using Fission.Abstractions.Scheduling;
 
@@ -59,6 +60,49 @@ public sealed class ScheduledExecutionBindings
 public sealed record ScheduledBatchResult(
     Guid ScheduleId,
     IReadOnlyList<ExecutionPlanResult> ItemResults);
+
+internal sealed class ScheduledBatchFailureCoordinator(
+    Dictionary<DeviceId, ContinuousBatchExecutor.AtomicSubmissionBatch> submissions)
+{
+    internal void Abort(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+        foreach (var submission in submissions.Values)
+        {
+            submission.Abort(exception);
+        }
+    }
+}
+
+internal sealed class ScheduledDeviceCompletionTracker(
+    DeviceId device,
+    int remaining,
+    Action<DeviceId> onCompleted)
+{
+    private int _remaining = remaining > 0
+        ? remaining
+        : throw new ArgumentOutOfRangeException(nameof(remaining));
+    private ExceptionDispatchInfo? _failure;
+
+    internal void Complete()
+    {
+        if (Interlocked.Decrement(ref _remaining) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            onCompleted(device);
+        }
+        catch (Exception exception)
+        {
+            Volatile.Write(ref _failure, ExceptionDispatchInfo.Capture(exception));
+        }
+    }
+
+    internal void ThrowIfFailed() => Volatile.Read(ref _failure)?.Throw();
+}
 
 /// <summary>
 /// Bridges the F# scheduling policy and the C# stateful runtime. The whole
@@ -143,76 +187,49 @@ public sealed class ScheduledBatchExecutor
 
         try
         {
-            var pending = new Task<ExecutionPlanResult>[prepared.Length];
-            Dictionary<DeviceId, List<Task<ExecutionPlanResult>>>? pendingByDevice =
-                onDeviceCompleted is null
-                    ? null
-                    : new Dictionary<DeviceId, List<Task<ExecutionPlanResult>>>(
-                        countsByDevice.Count);
+            var failureCoordinator = new ScheduledBatchFailureCoordinator(submissions);
+            Dictionary<DeviceId, ScheduledDeviceCompletionTracker>? completionTrackers = null;
+            if (onDeviceCompleted is not null)
+            {
+                completionTrackers = new Dictionary<DeviceId, ScheduledDeviceCompletionTracker>(
+                    countsByDevice.Count);
+                foreach (var (device, count) in countsByDevice)
+                {
+                    completionTrackers.Add(
+                        device,
+                        new ScheduledDeviceCompletionTracker(device, count, onDeviceCompleted));
+                }
+            }
 
+            var pending = new ValueTask<ExecutionPlanResult>[prepared.Length];
             for (var index = 0; index < prepared.Length; index++)
             {
-                var task = ExecutePreparedAsync(index);
-                pending[index] = task;
-
-                if (pendingByDevice is null)
-                {
-                    continue;
-                }
-
                 var item = prepared[index];
-                if (!pendingByDevice.TryGetValue(item.Device, out var devicePending))
-                {
-                    devicePending = new List<Task<ExecutionPlanResult>>(
-                        countsByDevice[item.Device]);
-                    pendingByDevice.Add(item.Device, devicePending);
-                }
+                var completionTracker = completionTrackers is null
+                    ? null
+                    : completionTrackers[item.Device];
 
-                devicePending.Add(task);
+                pending[index] = _runtime.ExecuteScheduledInferenceAsync(
+                    item.PlanId,
+                    item.Step,
+                    item.PrefillTokens,
+                    submissions[item.Device],
+                    item.Slot,
+                    failureCoordinator,
+                    completionTracker,
+                    cancellationToken);
             }
 
-            Task[]? deviceCompletionObservers = null;
-            if (pendingByDevice is not null)
+            var results = await AwaitAllAsync(pending).ConfigureAwait(false);
+            if (completionTrackers is not null)
             {
-                deviceCompletionObservers = new Task[pendingByDevice.Count];
-                var observerIndex = 0;
-                foreach (var (device, devicePending) in pendingByDevice)
+                foreach (var tracker in completionTrackers.Values)
                 {
-                    deviceCompletionObservers[observerIndex++] =
-                        ObserveDeviceCompletionAsync(
-                            device,
-                            devicePending,
-                            onDeviceCompleted!);
+                    tracker.ThrowIfFailed();
                 }
             }
 
-            try
-            {
-                var results = await Task.WhenAll(pending).ConfigureAwait(false);
-                if (deviceCompletionObservers is not null)
-                {
-                    await Task.WhenAll(deviceCompletionObservers).ConfigureAwait(false);
-                }
-
-                return new ScheduledBatchResult(batch.ScheduleId, results);
-            }
-            catch
-            {
-                if (deviceCompletionObservers is not null)
-                {
-                    try
-                    {
-                        await Task.WhenAll(deviceCompletionObservers).ConfigureAwait(false);
-                    }
-                    catch
-                    {
-                        // Preserve the scheduled execution failure. Device-completion
-                        // observers exist for cleanup and must not replace its cause.
-                    }
-                }
-
-                throw;
-            }
+            return new ScheduledBatchResult(batch.ScheduleId, results);
         }
         finally
         {
@@ -221,53 +238,34 @@ public sealed class ScheduledBatchExecutor
                 submission.Dispose();
             }
         }
+    }
 
-        async Task<ExecutionPlanResult> ExecutePreparedAsync(int index)
+    private static async ValueTask<ExecutionPlanResult[]> AwaitAllAsync(
+        ValueTask<ExecutionPlanResult>[] pending)
+    {
+        var results = new ExecutionPlanResult[pending.Length];
+        ExceptionDispatchInfo? firstFailure = null;
+        ExceptionDispatchInfo? firstCancellation = null;
+
+        for (var index = 0; index < pending.Length; index++)
         {
-            var item = prepared[index];
-            var submission = submissions[item.Device];
             try
             {
-                return await _runtime.ExecuteScheduledInferenceAsync(
-                        item.PlanId,
-                        item.Step,
-                        item.PrefillTokens,
-                        submission,
-                        item.Slot,
-                        cancellationToken)
-                    .ConfigureAwait(false);
+                results[index] = await pending[index].ConfigureAwait(false);
+            }
+            catch (OperationCanceledException exception)
+            {
+                firstCancellation ??= ExceptionDispatchInfo.Capture(exception);
             }
             catch (Exception exception)
             {
-                foreach (var pendingSubmission in submissions.Values)
-                {
-                    pendingSubmission.Abort(exception);
-                }
-
-                throw;
+                firstFailure ??= ExceptionDispatchInfo.Capture(exception);
             }
         }
-    }
 
-    private static async Task ObserveDeviceCompletionAsync(
-        DeviceId device,
-        IReadOnlyList<Task<ExecutionPlanResult>> pending,
-        Action<DeviceId> onDeviceCompleted)
-    {
-        try
-        {
-            await Task.WhenAll(pending).ConfigureAwait(false);
-        }
-        catch
-        {
-            // The main batch await owns execution failure propagation. The device
-            // observer still runs its terminal callback so per-device resources can
-            // be released even when this group faults or is cancelled.
-        }
-        finally
-        {
-            onDeviceCompleted(device);
-        }
+        firstFailure?.Throw();
+        firstCancellation?.Throw();
+        return results;
     }
 
     private PreparedItem[] Prepare(
