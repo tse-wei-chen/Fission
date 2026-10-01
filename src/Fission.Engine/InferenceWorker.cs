@@ -513,6 +513,7 @@ public sealed class InferenceWorker : IAsyncDisposable
         internal void Fail(Exception exception)
         {
             ArgumentNullException.ThrowIfNull(exception);
+            ClearPromptTokens();
             if (Interlocked.CompareExchange(ref _terminal, 1, 0) == 0)
             {
                 _completion.SetException(exception);
