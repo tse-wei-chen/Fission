@@ -1,4 +1,5 @@
 using System.Threading.Channels;
+using System.Threading.Tasks.Sources;
 using Fission.Abstractions;
 using Fission.Abstractions.Scheduling;
 
@@ -84,7 +85,7 @@ public sealed class InferenceWorker : IAsyncDisposable
         _pump = Task.Run(PumpAsync);
     }
 
-    public async ValueTask<InferenceStream> SubmitAsync(
+    public ValueTask<InferenceStream> SubmitAsync(
         ModelId modelId,
         ReadOnlyMemory<int> promptTokens,
         int maxNewTokens,
@@ -93,24 +94,46 @@ public sealed class InferenceWorker : IAsyncDisposable
         DateTimeOffset? enqueuedAt = null,
         CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        try
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        var pending = new PendingSubmission(
-            modelId,
-            promptTokens.ToArray(),
-            maxNewTokens,
-            priority,
-            deadline,
-            enqueuedAt ?? DateTimeOffset.UtcNow);
+            var pending = new PendingSubmission(
+                modelId,
+                promptTokens.ToArray(),
+                maxNewTokens,
+                priority,
+                deadline,
+                enqueuedAt ?? DateTimeOffset.UtcNow);
 
-        await _admission.Writer.WriteAsync(pending, cancellationToken)
-            .ConfigureAwait(false);
+            var write = _admission.Writer.WriteAsync(pending, cancellationToken);
+            if (write.IsCompletedSuccessfully)
+            {
+                SignalWork();
+                return pending.WaitAsync();
+            }
+
+            return AwaitAdmissionAsync(write, pending);
+        }
+        catch (Exception exception)
+        {
+            // Preserve the previous async method contract: setup failures are
+            // represented by the returned ValueTask rather than thrown directly.
+            return ValueTask.FromException<InferenceStream>(exception);
+        }
+    }
+
+    private async ValueTask<InferenceStream> AwaitAdmissionAsync(
+        ValueTask write,
+        PendingSubmission pending)
+    {
+        await write.ConfigureAwait(false);
         SignalWork();
 
         // Once admitted to the bounded queue, ownership has transferred to the
-        // worker. Do not abandon the accepted task because that would create an
-        // orphan request after producer-side cancellation.
-        return await pending.Accepted.Task.ConfigureAwait(false);
+        // worker. Do not abandon the accepted result because producer-side
+        // cancellation after admission must not create an orphan request.
+        return await pending.WaitAsync().ConfigureAwait(false);
     }
 
     private async Task PumpAsync()
@@ -279,13 +302,23 @@ public sealed class InferenceWorker : IAsyncDisposable
     {
         try
         {
-            var sequenceId = _engine.Submit(
-                pending.ModelId,
-                pending.PromptTokens,
-                pending.MaxNewTokens,
-                pending.Priority,
-                pending.Deadline,
-                pending.EnqueuedAt);
+            SequenceId sequenceId;
+            try
+            {
+                sequenceId = _engine.Submit(
+                    pending.ModelId,
+                    pending.PromptTokens,
+                    pending.MaxNewTokens,
+                    pending.Priority,
+                    pending.Deadline,
+                    pending.EnqueuedAt);
+            }
+            finally
+            {
+                // The engine owns its own prompt copy after Submit returns. Do not
+                // retain the worker's queue-owned prompt through source consumption.
+                pending.ClearPromptTokens();
+            }
 
             var tokenChannel = Channel.CreateUnbounded<int>(
                 new UnboundedChannelOptions
@@ -305,11 +338,11 @@ public sealed class InferenceWorker : IAsyncDisposable
             _sessions.Add(
                 sequenceId,
                 new SessionState(tokenChannel.Writer, completion));
-            pending.Accepted.TrySetResult(stream);
+            pending.Complete(stream);
         }
         catch (Exception exception)
         {
-            pending.Accepted.TrySetException(exception);
+            pending.Fail(exception);
         }
     }
 
@@ -378,15 +411,8 @@ public sealed class InferenceWorker : IAsyncDisposable
     {
         while (_admission.Reader.TryRead(out var pending))
         {
-            if (failure is null)
-            {
-                pending.Accepted.TrySetException(
-                    new ObjectDisposedException(nameof(InferenceWorker)));
-            }
-            else
-            {
-                pending.Accepted.TrySetException(failure);
-            }
+            pending.Fail(
+                failure ?? new ObjectDisposedException(nameof(InferenceWorker)));
         }
     }
 
@@ -444,16 +470,69 @@ public sealed class InferenceWorker : IAsyncDisposable
         await _pump.ConfigureAwait(false);
     }
 
-    private sealed record PendingSubmission(
-        ModelId ModelId,
-        int[] PromptTokens,
-        int MaxNewTokens,
-        int Priority,
-        DateTimeOffset? Deadline,
-        DateTimeOffset EnqueuedAt)
+    private sealed class PendingSubmission : IValueTaskSource<InferenceStream>
     {
-        public TaskCompletionSource<InferenceStream> Accepted { get; } = new(
-            TaskCreationOptions.RunContinuationsAsynchronously);
+        private ManualResetValueTaskSourceCore<InferenceStream> _completion;
+        private int _terminal;
+
+        internal PendingSubmission(
+            ModelId modelId,
+            int[] promptTokens,
+            int maxNewTokens,
+            int priority,
+            DateTimeOffset? deadline,
+            DateTimeOffset enqueuedAt)
+        {
+            _completion.RunContinuationsAsynchronously = true;
+            ModelId = modelId;
+            PromptTokens = promptTokens;
+            MaxNewTokens = maxNewTokens;
+            Priority = priority;
+            Deadline = deadline;
+            EnqueuedAt = enqueuedAt;
+        }
+
+        internal ModelId ModelId { get; }
+        internal int[] PromptTokens { get; private set; }
+        internal int MaxNewTokens { get; }
+        internal int Priority { get; }
+        internal DateTimeOffset? Deadline { get; }
+        internal DateTimeOffset EnqueuedAt { get; }
+
+        internal ValueTask<InferenceStream> WaitAsync() =>
+            new(this, _completion.Version);
+
+        internal void Complete(InferenceStream stream)
+        {
+            if (Interlocked.CompareExchange(ref _terminal, 1, 0) == 0)
+            {
+                _completion.SetResult(stream);
+            }
+        }
+
+        internal void Fail(Exception exception)
+        {
+            ArgumentNullException.ThrowIfNull(exception);
+            if (Interlocked.CompareExchange(ref _terminal, 1, 0) == 0)
+            {
+                _completion.SetException(exception);
+            }
+        }
+
+        internal void ClearPromptTokens() => PromptTokens = Array.Empty<int>();
+
+        InferenceStream IValueTaskSource<InferenceStream>.GetResult(short token) =>
+            _completion.GetResult(token);
+
+        ValueTaskSourceStatus IValueTaskSource<InferenceStream>.GetStatus(short token) =>
+            _completion.GetStatus(token);
+
+        void IValueTaskSource<InferenceStream>.OnCompleted(
+            Action<object?> continuation,
+            object? state,
+            short token,
+            ValueTaskSourceOnCompletedFlags flags) =>
+            _completion.OnCompleted(continuation, state, token, flags);
     }
 
     private sealed record PendingCancellation(SequenceId SequenceId)
