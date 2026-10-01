@@ -134,7 +134,12 @@ public sealed class ExecutionDeviceRegistry
                 .Add(snapshot);
         }
 
-        return pressure ?? Array.Empty<RuntimeDeviceMemoryPressure>();
+        if (pressure is null)
+        {
+            return Array.Empty<RuntimeDeviceMemoryPressure>();
+        }
+
+        return pressure;
     }
 
     private bool TryGetDeviceMemoryPressureSnapshot(
