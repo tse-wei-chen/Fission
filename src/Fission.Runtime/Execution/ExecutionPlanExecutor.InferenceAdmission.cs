@@ -144,6 +144,40 @@ public sealed partial class ExecutionPlanExecutor
         ArgumentNullException.ThrowIfNull(requests);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
+        if (requests.Count == 1)
+        {
+            var request = requests[0];
+            ArgumentOutOfRangeException.ThrowIfNegative(request.Items);
+            if (request.Items == 0)
+            {
+                reservation = EmptyInferenceReservationLease.Instance;
+                return true;
+            }
+
+            var capacity = GetDeviceExecutionCapacityCore(request.Device)
+                .InferenceCreditCapacity;
+            var ledger = GetOrCreateDeviceInferenceReservationLedger(request.Device);
+            lock (ledger.Gate)
+            {
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+                var updated = checked(ledger.ReservedItems + request.Items);
+                if (updated > capacity)
+                {
+                    reservation = EmptyInferenceReservationLease.Instance;
+                    return false;
+                }
+
+                ledger.ReservedItems = updated;
+            }
+
+            reservation = new SingleDeviceInferenceReservationLease(
+                this,
+                request.Device,
+                request.Items);
+            return true;
+        }
+
         var normalized = NormalizeInferenceReservationRequests(requests);
         if (normalized.Count == 0)
         {
@@ -430,6 +464,42 @@ public sealed partial class ExecutionPlanExecutor
             {
                 ReleaseInferenceReservationLedgerLocks(ledgers, ledgers.Length);
             }
+        }
+    }
+
+    private sealed class SingleDeviceInferenceReservationLease :
+        IRuntimeDeviceInferenceReservationLease
+    {
+        private ExecutionPlanExecutor? _owner;
+        private readonly DeviceId _device;
+        private readonly int _items;
+
+        public SingleDeviceInferenceReservationLease(
+            ExecutionPlanExecutor owner,
+            DeviceId device,
+            int items)
+        {
+            _owner = owner;
+            _device = device;
+            _items = items;
+        }
+
+        public void Release(DeviceId device)
+        {
+            if (!device.Equals(_device))
+            {
+                return;
+            }
+
+            ReleaseCore();
+        }
+
+        public void Dispose() => ReleaseCore();
+
+        private void ReleaseCore()
+        {
+            Interlocked.Exchange(ref _owner, null)?
+                .ReleaseDeviceInferenceReservation(_device, _items);
         }
     }
 
