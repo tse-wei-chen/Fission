@@ -284,11 +284,10 @@ public sealed class ScheduledBatchExecutor
             }
 
             var failureCoordinator = new ScheduledBatchFailureCoordinator(groupsByDevice);
-            var pending = new ValueTask<BackendStepResult>[prepared.Length];
             for (var index = 0; index < prepared.Length; index++)
             {
-                var item = prepared[index];
-                pending[index] = _runtime.ExecuteScheduledInferenceAsync(
+                ref var item = ref prepared[index];
+                item.Pending = _runtime.ExecuteScheduledInferenceAsync(
                     item.PlanId,
                     item.Step,
                     item.PrefillTokens,
@@ -298,7 +297,7 @@ public sealed class ScheduledBatchExecutor
                     cancellationToken);
             }
 
-            var results = await AwaitAllAsync(pending).ConfigureAwait(false);
+            var results = await AwaitAllAsync(prepared).ConfigureAwait(false);
             if (onDeviceCompleted is not null)
             {
                 foreach (var group in groupsByDevice.Values)
@@ -319,17 +318,17 @@ public sealed class ScheduledBatchExecutor
     }
 
     private static async ValueTask<BackendStepResult[]> AwaitAllAsync(
-        ValueTask<BackendStepResult>[] pending)
+        PreparedItem[] prepared)
     {
-        var results = new BackendStepResult[pending.Length];
+        var results = new BackendStepResult[prepared.Length];
         ExceptionDispatchInfo? firstFailure = null;
         ExceptionDispatchInfo? firstCancellation = null;
 
-        for (var index = 0; index < pending.Length; index++)
+        for (var index = 0; index < prepared.Length; index++)
         {
             try
             {
-                results[index] = await pending[index].ConfigureAwait(false);
+                results[index] = await prepared[index].Pending.ConfigureAwait(false);
             }
             catch (OperationCanceledException exception)
             {
@@ -495,10 +494,28 @@ public sealed class ScheduledBatchExecutor
         return new Guid(bytes);
     }
 
-    private readonly record struct PreparedItem(
-        Guid PlanId,
-        ScheduledInferenceStep Step,
-        ReadOnlyMemory<int> PrefillTokens,
-        ScheduledDeviceGroup Group,
-        int Slot);
+    private struct PreparedItem
+    {
+        internal PreparedItem(
+            Guid planId,
+            ScheduledInferenceStep step,
+            ReadOnlyMemory<int> prefillTokens,
+            ScheduledDeviceGroup group,
+            int slot)
+        {
+            PlanId = planId;
+            Step = step;
+            PrefillTokens = prefillTokens;
+            Group = group;
+            Slot = slot;
+            Pending = default;
+        }
+
+        internal Guid PlanId { get; }
+        internal ScheduledInferenceStep Step { get; }
+        internal ReadOnlyMemory<int> PrefillTokens { get; }
+        internal ScheduledDeviceGroup Group { get; }
+        internal int Slot { get; }
+        internal ValueTask<BackendStepResult> Pending { get; set; }
+    }
 }
