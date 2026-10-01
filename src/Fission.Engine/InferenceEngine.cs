@@ -275,7 +275,7 @@ public sealed partial class InferenceEngine : IDisposable
             }
 
             var maxBatchSequences = _options.MaxBatchSequences;
-            var availableKvBytes = GetAvailableKvBytes(active);
+            var availableKvBytes = GetAvailableKvBytes(candidates);
             var admission = await ScheduleWithDeviceAdmissionAsync(
                     scheduleId,
                     now,
@@ -1006,7 +1006,7 @@ public sealed partial class InferenceEngine : IDisposable
         return shouldReschedule;
     }
 
-    private long GetAvailableKvBytes(RequestView[] active)
+    private long GetAvailableKvBytes(SchedulingCandidate[] candidates)
     {
         if (_options.MaxKvBytes is not { } maxKvBytes)
         {
@@ -1014,16 +1014,11 @@ public sealed partial class InferenceEngine : IDisposable
         }
 
         long retainedBytes = 0;
-        foreach (var request in active)
+        foreach (var candidate in candidates)
         {
-            if (!_runtime.TryGetSequence(request.SequenceId, out var sequence) || sequence is null)
-            {
-                continue;
-            }
-
-            var bytesPerToken = GetKvBytesPerToken(request.ModelId);
             retainedBytes = checked(
-                retainedBytes + checked((long)sequence.Position * bytesPerToken));
+                retainedBytes + checked(
+                    (long)candidate.Position * candidate.KvBytesPerToken));
         }
 
         return retainedBytes >= maxKvBytes
