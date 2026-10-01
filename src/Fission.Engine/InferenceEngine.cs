@@ -630,11 +630,12 @@ public sealed partial class InferenceEngine : IDisposable
             candidates,
             deviceMemory?.Budgets,
             deviceSequences);
+        var candidateBySequence = BuildCandidateIndex(candidates);
 
         if (_options.MaxDeviceBytes is not null &&
             await TryReclaimBlockedDeviceMemoryAsync(
                     decision,
-                    candidates,
+                    candidateBySequence,
                     cancellationToken)
                 .ConfigureAwait(false))
         {
@@ -656,17 +657,17 @@ public sealed partial class InferenceEngine : IDisposable
             ? null
             : GetDeviceMemoryBackpressureReservations(
                 decision,
-                candidates,
+                candidateBySequence,
                 deviceMemory.ReservationState);
         var inferenceBackpressure = GetDeviceInferenceBackpressureReservations(
             decision,
-            candidates,
+            candidateBySequence,
             inferenceState);
 
         IRuntimeDeviceInferenceReservationLease? inferenceReservation = null;
         var inferenceRequests = BuildDeviceInferenceReservationRequests(
             decision,
-            candidates);
+            candidateBySequence);
         if (inferenceRequests.Count != 0)
         {
             if (!_runtime.TryReserveDeviceInference(
@@ -686,7 +687,7 @@ public sealed partial class InferenceEngine : IDisposable
             {
                 var memoryRequests = BuildDeviceMemoryReservationRequests(
                     decision,
-                    candidates);
+                    candidateBySequence);
                 if (memoryRequests.Count != 0)
                 {
                     memoryReservation = _runtime.ReserveDeviceMemoryByDevice(memoryRequests);
@@ -705,6 +706,19 @@ public sealed partial class InferenceEngine : IDisposable
             inferenceReservation?.Dispose();
             throw;
         }
+    }
+
+    private static Dictionary<SequenceId, SchedulingCandidate> BuildCandidateIndex(
+        IReadOnlyList<SchedulingCandidate> candidates)
+    {
+        var candidateBySequence = new Dictionary<SequenceId, SchedulingCandidate>(candidates.Count);
+        for (var index = 0; index < candidates.Count; index++)
+        {
+            var candidate = candidates[index];
+            candidateBySequence.Add(candidate.SequenceId, candidate);
+        }
+
+        return candidateBySequence;
     }
 
     private SchedulingKernelResult ScheduleOnce(
@@ -794,7 +808,7 @@ public sealed partial class InferenceEngine : IDisposable
     private static IReadOnlyList<RuntimeDeviceMemoryReservationVersion>?
         GetDeviceMemoryBackpressureReservations(
             SchedulingKernelResult decision,
-            IReadOnlyList<SchedulingCandidate> candidates,
+            Dictionary<SequenceId, SchedulingCandidate> candidateBySequence,
             RuntimeDeviceMemoryReservationState reservationState)
     {
         if (decision.Batch.Items.Count != 0 ||
@@ -803,8 +817,6 @@ public sealed partial class InferenceEngine : IDisposable
             return null;
         }
 
-        var candidateBySequence = candidates.ToDictionary(
-            static candidate => candidate.SequenceId);
         var reservationByDevice = reservationState.Reservations
             .Where(static reservation => reservation.Bytes > 0)
             .ToDictionary(static reservation => reservation.Device);
@@ -836,7 +848,7 @@ public sealed partial class InferenceEngine : IDisposable
     private static IReadOnlyList<RuntimeDeviceInferenceReservationVersion>?
         GetDeviceInferenceBackpressureReservations(
             SchedulingKernelResult decision,
-            IReadOnlyList<SchedulingCandidate> candidates,
+            Dictionary<SequenceId, SchedulingCandidate> candidateBySequence,
             RuntimeDeviceInferenceReservationState reservationState)
     {
         if (decision.Batch.Items.Count != 0 ||
@@ -845,8 +857,6 @@ public sealed partial class InferenceEngine : IDisposable
             return null;
         }
 
-        var candidateBySequence = candidates.ToDictionary(
-            static candidate => candidate.SequenceId);
         var reservationByDevice = reservationState.Reservations
             .Where(static reservation => reservation.Items > 0)
             .ToDictionary(static reservation => reservation.Device);
@@ -878,10 +888,8 @@ public sealed partial class InferenceEngine : IDisposable
     private IReadOnlyList<RuntimeDeviceMemoryReservationRequest>
         BuildDeviceMemoryReservationRequests(
             SchedulingKernelResult decision,
-            IReadOnlyList<SchedulingCandidate> candidates)
+            Dictionary<SequenceId, SchedulingCandidate> candidateBySequence)
     {
-        var candidateBySequence = candidates.ToDictionary(
-            static candidate => candidate.SequenceId);
         var bytesByDevice = new Dictionary<DeviceId, long>();
 
         foreach (var item in decision.Batch.Items)
@@ -909,10 +917,8 @@ public sealed partial class InferenceEngine : IDisposable
     private IReadOnlyList<RuntimeDeviceInferenceReservationRequest>
         BuildDeviceInferenceReservationRequests(
             SchedulingKernelResult decision,
-            IReadOnlyList<SchedulingCandidate> candidates)
+            Dictionary<SequenceId, SchedulingCandidate> candidateBySequence)
     {
-        var candidateBySequence = candidates.ToDictionary(
-            static candidate => candidate.SequenceId);
         var itemsByDevice = new Dictionary<DeviceId, int>();
 
         foreach (var item in decision.Batch.Items)
@@ -937,7 +943,7 @@ public sealed partial class InferenceEngine : IDisposable
 
     private async ValueTask<bool> TryReclaimBlockedDeviceMemoryAsync(
         SchedulingKernelResult decision,
-        IReadOnlyList<SchedulingCandidate> candidates,
+        Dictionary<SequenceId, SchedulingCandidate> candidateBySequence,
         CancellationToken cancellationToken)
     {
         if (_options.MaxDeviceBytes is not { } maxDeviceBytes)
@@ -945,8 +951,6 @@ public sealed partial class InferenceEngine : IDisposable
             return false;
         }
 
-        var candidateBySequence = candidates.ToDictionary(
-            static candidate => candidate.SequenceId);
         var selectedTransientByDevice = new Dictionary<DeviceId, long>();
         foreach (var item in decision.Batch.Items)
         {
