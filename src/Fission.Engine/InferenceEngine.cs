@@ -271,7 +271,7 @@ public sealed partial class InferenceEngine : IDisposable
             var candidates = new SchedulingCandidate[active.Length];
             for (var index = 0; index < active.Length; index++)
             {
-                candidates[index] = BuildCandidate(active[index], kvBefore.TokensPerPage);
+                candidates[index] = BuildCandidate(in active[index], kvBefore.TokensPerPage);
             }
 
             var maxBatchSequences = _options.MaxBatchSequences;
@@ -487,7 +487,7 @@ public sealed partial class InferenceEngine : IDisposable
         }
     }
 
-    private SchedulingCandidate BuildCandidate(RequestView request, int tokensPerKvPage)
+    private SchedulingCandidate BuildCandidate(in RequestView request, int tokensPerKvPage)
     {
         var kvBytesPerToken = GetKvBytesPerToken(request.ModelId);
         var executionDevice = _runtime.GetExecutionDevice(request.SequenceId);
@@ -514,7 +514,7 @@ public sealed partial class InferenceEngine : IDisposable
                 SchedulingPhase.Prefilling,
                 request.Deadline,
                 request.EnqueuedAt,
-                RemainingPromptTokens(request, sequence.Position),
+                RemainingPromptTokens(in request, sequence.Position),
                 sequence.Position,
                 tokensPerKvPage,
                 request.Priority,
@@ -1043,7 +1043,7 @@ public sealed partial class InferenceEngine : IDisposable
         return bytes;
     }
 
-    private static int RemainingPromptTokens(RequestView request, int position)
+    private static int RemainingPromptTokens(in RequestView request, int position)
     {
         var remaining = request.PromptTokens.Length - position;
         if (remaining <= 0)
@@ -1203,7 +1203,7 @@ public sealed partial class InferenceEngine : IDisposable
             Priority);
     }
 
-    private sealed record RequestView(
+    private readonly record struct RequestView(
         SequenceId SequenceId,
         ModelId ModelId,
         int[] PromptTokens,
