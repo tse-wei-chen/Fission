@@ -32,6 +32,9 @@ internal interface IRuntimeDeviceInferenceReservationLease : IDisposable
 /// </summary>
 public sealed partial class ExecutionPlanExecutor
 {
+    private static readonly RuntimeDeviceInferenceReservationState EmptyDeviceInferenceReservationState =
+        new(Array.Empty<RuntimeDeviceInferenceReservationSnapshot>());
+
     private readonly ConcurrentDictionary<DeviceId, DeviceInferenceReservationLedger>
         _deviceInferenceReservationLedgers = new();
 
@@ -50,16 +53,34 @@ public sealed partial class ExecutionPlanExecutor
         ArgumentNullException.ThrowIfNull(devices);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        var ledgers = devices
-            .Distinct()
-            .OrderBy(static device => device.Value, StringComparer.Ordinal)
-            .Select(device => _deviceInferenceReservationLedgers.TryGetValue(device, out var ledger)
-                ? ledger
-                : null)
-            .Where(static ledger => ledger is not null)
-            .Cast<DeviceInferenceReservationLedger>()
-            .ToArray();
-        return SnapshotDeviceInferenceReservationState(ledgers);
+        var normalized = NormalizeDevices(devices);
+        List<RuntimeDeviceInferenceReservationSnapshot>? reservations = null;
+
+        foreach (var device in normalized)
+        {
+            if (!_deviceInferenceReservationLedgers.TryGetValue(device, out var ledger))
+            {
+                continue;
+            }
+
+            lock (ledger.Gate)
+            {
+                if (ledger.ReservedItems == 0)
+                {
+                    continue;
+                }
+
+                (reservations ??= new List<RuntimeDeviceInferenceReservationSnapshot>(normalized.Length))
+                    .Add(new RuntimeDeviceInferenceReservationSnapshot(
+                        ledger.Device,
+                        ledger.ReservedItems,
+                        ledger.ReleaseVersion));
+            }
+        }
+
+        return reservations is null
+            ? EmptyDeviceInferenceReservationState
+            : new RuntimeDeviceInferenceReservationState(reservations);
     }
 
     /// <summary>
@@ -175,7 +196,7 @@ public sealed partial class ExecutionPlanExecutor
         SnapshotDeviceInferenceReservationState(
             IReadOnlyList<DeviceInferenceReservationLedger> ledgers)
     {
-        var reservations = new List<RuntimeDeviceInferenceReservationSnapshot>(ledgers.Count);
+        List<RuntimeDeviceInferenceReservationSnapshot>? reservations = null;
         foreach (var ledger in ledgers)
         {
             lock (ledger.Gate)
@@ -185,14 +206,17 @@ public sealed partial class ExecutionPlanExecutor
                     continue;
                 }
 
-                reservations.Add(new RuntimeDeviceInferenceReservationSnapshot(
-                    ledger.Device,
-                    ledger.ReservedItems,
-                    ledger.ReleaseVersion));
+                (reservations ??= new List<RuntimeDeviceInferenceReservationSnapshot>(ledgers.Count))
+                    .Add(new RuntimeDeviceInferenceReservationSnapshot(
+                        ledger.Device,
+                        ledger.ReservedItems,
+                        ledger.ReleaseVersion));
             }
         }
 
-        return new RuntimeDeviceInferenceReservationState(reservations);
+        return reservations is null
+            ? EmptyDeviceInferenceReservationState
+            : new RuntimeDeviceInferenceReservationState(reservations);
     }
 
     private static Dictionary<DeviceId, int> NormalizeInferenceReservationRequests(
