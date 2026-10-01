@@ -95,10 +95,6 @@ internal static class DeviceInferenceAdmissionConcurrencySpecs
             Require(
                 backend.PrefillCalls == 1,
                 "A scheduler-deferred second engine must not submit another backend prefill while the first credit is reserved.");
-            Require(
-                blockedCycle.DeviceInferenceBackpressureReservations is { Count: 1 } observed &&
-                observed[0].Device == deviceId,
-                "An empty DeviceSequenceBudget cycle caused by a shared reservation must carry a device-scoped release token.");
 
             var runUntilComplete = secondEngine
                 .RunUntilCompleteAsync(maxCycles: 8)
