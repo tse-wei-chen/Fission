@@ -63,7 +63,7 @@ public sealed record InferenceCycleResult(
 /// state, asks the F# scheduling kernel for one quantum, executes that quantum,
 /// then commits generated tokens and releases terminal KV ownership.
 /// </summary>
-public sealed class InferenceEngine : IDisposable
+public sealed partial class InferenceEngine : IDisposable
 {
     private readonly object _gate = new();
     private readonly SemaphoreSlim _cycleGate = new(1, 1);
