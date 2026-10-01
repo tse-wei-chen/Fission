@@ -89,13 +89,26 @@ public sealed class ExecutionDeviceRegistry
     internal int GetInferenceCapacity(DeviceId actorDevice) =>
         ResolveRegistered(actorDevice).InferenceCapacity;
 
-    internal IReadOnlyList<RuntimeDeviceMemoryPressure> GetDeviceMemoryPressure()
+    internal IReadOnlyList<RuntimeDeviceMemoryPressure> GetDeviceMemoryPressure() =>
+        GetDeviceMemoryPressure(
+            _devices.Keys
+                .OrderBy(static device => device.Value, StringComparer.Ordinal)
+                .ToArray());
+
+    internal IReadOnlyList<RuntimeDeviceMemoryPressure> GetDeviceMemoryPressure(
+        IReadOnlyList<DeviceId> devices)
     {
-        var pressure = new List<RuntimeDeviceMemoryPressure>(_devices.Count);
-        foreach (var (deviceId, executor) in _devices.OrderBy(
-                     static pair => pair.Key.Value,
-                     StringComparer.Ordinal))
+        ArgumentNullException.ThrowIfNull(devices);
+
+        var normalized = devices
+            .Distinct()
+            .OrderBy(static device => device.Value, StringComparer.Ordinal)
+            .ToArray();
+        var pressure = new List<RuntimeDeviceMemoryPressure>(normalized.Length);
+
+        foreach (var deviceId in normalized)
         {
+            var executor = ResolveRegistered(deviceId);
             if (!executor.TryGetDeviceMemoryPressure(out var snapshot))
             {
                 continue;
