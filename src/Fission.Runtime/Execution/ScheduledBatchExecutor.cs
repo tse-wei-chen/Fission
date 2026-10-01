@@ -233,8 +233,9 @@ public sealed class ScheduledBatchExecutor
             using var slot = submission.EnterSlot(item.Slot);
             try
             {
-                return await _runtime.ExecuteAsync(
-                        item.Plan,
+                return await _runtime.ExecuteScheduledInferenceAsync(
+                        item.PlanId,
+                        item.Step,
                         item.Bindings,
                         cancellationToken)
                     .ConfigureAwait(false);
@@ -367,10 +368,8 @@ public sealed class ScheduledBatchExecutor
             countsByDevice[device] = checked(deviceCount + 1);
 
             prepared[index] = new PreparedItem(
-                new CompiledExecutionPlan(
-                    DerivePlanId(batch.ScheduleId, index),
-                    item.Priority,
-                    new[] { step }),
+                DerivePlanId(batch.ScheduleId, index),
+                step,
                 executionBindings,
                 device,
                 deviceCount);
@@ -425,7 +424,8 @@ public sealed class ScheduledBatchExecutor
     }
 
     private readonly record struct PreparedItem(
-        CompiledExecutionPlan Plan,
+        Guid PlanId,
+        ExecutionStep Step,
         ExecutionBindings Bindings,
         DeviceId Device,
         int Slot);
