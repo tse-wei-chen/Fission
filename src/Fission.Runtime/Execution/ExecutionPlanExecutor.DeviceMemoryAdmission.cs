@@ -230,8 +230,16 @@ public sealed partial class ExecutionPlanExecutor
     internal IRuntimeDeviceMemoryReservationLease ReserveDeviceMemoryByDevice(
         IReadOnlyList<RuntimeDeviceMemoryReservationRequest> requests)
     {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 1)
+        {
+            return ReserveSingleDeviceMemoryByDevice(requests[0]);
+        }
+
         var normalized = ReserveDeviceMemoryCore(requests);
-        return new DeviceMemoryReservationLeaseSet(this, normalized);
+        return normalized.Count == 0
+            ? EmptyDeviceMemoryReservationLease.Instance
+            : new DeviceMemoryReservationLeaseSet(this, normalized);
     }
 
     private Dictionary<DeviceId, long> ReserveDeviceMemoryCore(
