@@ -289,23 +289,25 @@ public sealed class InferenceEngine : IDisposable
             using var inferenceReservationLease = admission.DeviceInferenceReservation;
 
             var prefillBindings = new Dictionary<SequenceId, ScheduledPrefillBinding>();
-            foreach (var item in admission.Decision.Batch.Items)
+            lock (_gate)
             {
-                if (item.Kind != ScheduledWorkKind.Prefill)
+                foreach (var item in admission.Decision.Batch.Items)
                 {
-                    continue;
-                }
+                    if (item.Kind != ScheduledWorkKind.Prefill)
+                    {
+                        continue;
+                    }
 
-                var request = active.FirstOrDefault(candidate => candidate.SequenceId == item.SequenceId);
-                if (request is null)
-                {
-                    throw new InvalidOperationException(
-                        $"Scheduler selected unknown request {item.SequenceId}.");
-                }
+                    if (!_requests.TryGetValue(item.SequenceId, out var request) || request.IsCompleted)
+                    {
+                        throw new InvalidOperationException(
+                            $"Scheduler selected unknown or inactive request {item.SequenceId}.");
+                    }
 
-                prefillBindings.Add(
-                    item.SequenceId,
-                    new ScheduledPrefillBinding(request.ModelId, request.PromptTokens));
+                    prefillBindings.Add(
+                        item.SequenceId,
+                        new ScheduledPrefillBinding(request.ModelId, request.PromptTokens));
+                }
             }
 
             var executionBindings = new ScheduledExecutionBindings(prefillBindings);
