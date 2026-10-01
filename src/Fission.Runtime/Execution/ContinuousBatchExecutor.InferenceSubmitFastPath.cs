@@ -46,6 +46,7 @@ public sealed partial class ContinuousBatchExecutor
             }
 
             work.AttachCredits(acquisition.Result);
+            work.RetainActorOwnership();
             ValueTask write;
             try
             {
@@ -53,6 +54,7 @@ public sealed partial class ContinuousBatchExecutor
             }
             catch
             {
+                work.ReleaseActorOwnership();
                 work.ReleaseCredits();
                 throw;
             }
@@ -67,6 +69,7 @@ public sealed partial class ContinuousBatchExecutor
             // its returned ValueTask. Preserve that API behavior on the non-async
             // fast path instead of throwing from SubmitPrefill/DecodeAsync itself.
             work.ReleaseCredits();
+            work.AbandonSubmission();
             return ValueTask.FromException<Fission.Abstractions.Execution.BackendStepResult>(
                 exception);
         }
@@ -78,7 +81,16 @@ public sealed partial class ContinuousBatchExecutor
             TWork work)
         where TWork : PendingInference
     {
-        await registration.ConfigureAwait(false);
+        try
+        {
+            await registration.ConfigureAwait(false);
+        }
+        catch
+        {
+            work.AbandonSubmission();
+            throw;
+        }
+
         return await work.WaitAsync().ConfigureAwait(false);
     }
 
@@ -89,15 +101,24 @@ public sealed partial class ContinuousBatchExecutor
             CancellationToken cancellationToken)
         where TWork : PendingInference
     {
+        var actorOwned = false;
         try
         {
             var credits = await acquisition.ConfigureAwait(false);
             work.AttachCredits(credits);
+            work.RetainActorOwnership();
+            actorOwned = true;
             await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
         }
         catch
         {
+            if (actorOwned)
+            {
+                work.ReleaseActorOwnership();
+            }
+
             work.ReleaseCredits();
+            work.AbandonSubmission();
             throw;
         }
 
@@ -116,7 +137,9 @@ public sealed partial class ContinuousBatchExecutor
         }
         catch
         {
+            work.ReleaseActorOwnership();
             work.ReleaseCredits();
+            work.AbandonSubmission();
             throw;
         }
 

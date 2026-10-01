@@ -76,12 +76,12 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
     public ValueTask<BackendStepResult> SubmitPrefillAsync(
         PrefillItem item,
         CancellationToken cancellationToken = default) =>
-        SubmitInferenceAsync(new PendingPrefill(item), cancellationToken);
+        SubmitInferenceAsync(RentPrefill(item), cancellationToken);
 
     public ValueTask<BackendStepResult> SubmitDecodeAsync(
         DecodeItem item,
         CancellationToken cancellationToken = default) =>
-        SubmitInferenceAsync(new PendingDecode(item), cancellationToken);
+        SubmitInferenceAsync(RentDecode(item), cancellationToken);
 
     public ValueTask SnapshotSequenceAsync(
         SequenceId sequenceId,
@@ -156,32 +156,43 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         CancellationToken cancellationToken)
         where TWork : PendingInference
     {
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-
-        if (AmbientAtomicSlot.Value is { } slot)
+        try
         {
-            await slot.Batch.RegisterAsync(
-                    slot.Index,
-                    this,
-                    work,
-                    cancellationToken)
-                .ConfigureAwait(false);
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+            if (AmbientAtomicSlot.Value is { } slot)
+            {
+                await slot.Batch.RegisterAsync(
+                        slot.Index,
+                        this,
+                        work,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                var credits = await _inferenceCredits.AcquireAsync(1, cancellationToken)
+                    .ConfigureAwait(false);
+                work.AttachCredits(credits);
+                work.RetainActorOwnership();
+
+                try
+                {
+                    await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
+                }
+                catch
+                {
+                    work.ReleaseActorOwnership();
+                    work.ReleaseCredits();
+                    throw;
+                }
+            }
         }
-        else
+        catch
         {
-            var credits = await _inferenceCredits.AcquireAsync(1, cancellationToken)
-                .ConfigureAwait(false);
-            work.AttachCredits(credits);
-
-            try
-            {
-                await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
-            }
-            catch
-            {
-                work.ReleaseCredits();
-                throw;
-            }
+            work.ReleaseCredits();
+            work.AbandonSubmission();
+            throw;
         }
 
         return await work.WaitAsync().ConfigureAwait(false);
@@ -225,6 +236,13 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
 
                     throw;
                 }
+                finally
+                {
+                    foreach (var work in batch)
+                    {
+                        ReleaseActorOwnership(work);
+                    }
+                }
             }
         }
         catch (Exception exception)
@@ -232,10 +250,31 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
             _queue.Writer.TryComplete(exception);
             while (reader.TryRead(out var work))
             {
-                work.Fail(exception);
+                try
+                {
+                    work.Fail(exception);
+                }
+                finally
+                {
+                    ReleaseActorOwnership(work);
+                }
             }
 
             throw;
+        }
+    }
+
+    private static void ReleaseActorOwnership(PendingWork work)
+    {
+        switch (work)
+        {
+            case PendingInference inference:
+                inference.ReleaseActorOwnership();
+                break;
+
+            case PendingInferenceEnvelope envelope:
+                envelope.ReleaseActorOwnership();
+                break;
         }
     }
 
@@ -459,6 +498,7 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         private Exception? _failure;
         private int _registeredCount;
         private bool _enqueued;
+        private bool _atomicOwnershipReleased;
         private int _disposed;
 
         internal AtomicSubmissionBatch(int itemCount)
@@ -517,11 +557,13 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                     throw mismatch;
                 }
 
+                work.RetainAtomicOwnership();
                 _slots[index] = work;
                 _registeredCount++;
                 if (_registeredCount == _slots.Length)
                 {
                     envelope = new PendingInferenceEnvelope(_slots);
+                    envelope.RetainActorOwnership();
                 }
             }
 
@@ -559,6 +601,7 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
             catch (Exception exception)
             {
                 envelope.ReleaseCredits();
+                envelope.ReleaseActorOwnership();
                 Abort(exception);
                 throw;
             }
@@ -567,7 +610,7 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         internal void Abort(Exception exception)
         {
             ArgumentNullException.ThrowIfNull(exception);
-            PendingInference[] registered;
+            bool releaseOwnership;
 
             lock (_gate)
             {
@@ -577,15 +620,22 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                 }
 
                 _failure = exception;
-                registered = _slots
-                    .Where(static item => item is not null)
-                    .Select(static item => item!)
-                    .ToArray();
+                releaseOwnership = !_atomicOwnershipReleased;
+                _atomicOwnershipReleased = true;
             }
 
-            foreach (var work in registered)
+            for (var index = 0; index < _slots.Length; index++)
             {
+                if (_slots[index] is not { } work)
+                {
+                    continue;
+                }
+
                 work.Fail(exception);
+                if (releaseOwnership)
+                {
+                    work.ReleaseAtomicOwnership();
+                }
             }
         }
 
@@ -596,10 +646,35 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                 return;
             }
 
-            if (!_enqueued && _failure is null)
+            Exception? incompleteFailure = null;
+            bool releaseOwnership;
+            lock (_gate)
             {
-                Abort(new InvalidOperationException(
-                    "Atomic inference submission ended before every slot registered work."));
+                if (!_enqueued && _failure is null)
+                {
+                    incompleteFailure = new InvalidOperationException(
+                        "Atomic inference submission ended before every slot registered work.");
+                    _failure = incompleteFailure;
+                }
+
+                releaseOwnership = !_atomicOwnershipReleased;
+                _atomicOwnershipReleased = true;
+            }
+
+            if (incompleteFailure is not null)
+            {
+                for (var index = 0; index < _slots.Length; index++)
+                {
+                    _slots[index]?.Fail(incompleteFailure);
+                }
+            }
+
+            if (releaseOwnership)
+            {
+                for (var index = 0; index < _slots.Length; index++)
+                {
+                    _slots[index]?.ReleaseAtomicOwnership();
+                }
             }
         }
     }
@@ -644,24 +719,85 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
     internal abstract class PendingInference : PendingWork, IValueTaskSource<BackendStepResult>
     {
         private ManualResetValueTaskSourceCore<BackendStepResult> _completion;
+        private ContinuousBatchExecutor? _poolOwner;
         private int _terminal;
+        private int _consumerOwned;
+        private int _actorOwned;
+        private int _atomicOwned;
+        private int _recycleReady;
+        private int _returned;
 
         protected PendingInference()
         {
             _completion.RunContinuationsAsynchronously = true;
         }
 
+        protected void InitializeForUse(ContinuousBatchExecutor owner)
+        {
+            ArgumentNullException.ThrowIfNull(owner);
+            _completion.Reset();
+            _poolOwner = owner;
+            _terminal = 0;
+            _consumerOwned = 1;
+            _actorOwned = 0;
+            _atomicOwned = 0;
+            _recycleReady = 0;
+            _returned = 0;
+        }
+
         internal ValueTask<BackendStepResult> WaitAsync() =>
             new(this, _completion.Version);
+
+        internal void RetainActorOwnership()
+        {
+            if (Interlocked.CompareExchange(ref _actorOwned, 1, 0) != 0)
+            {
+                throw new InvalidOperationException(
+                    "Inference work already has actor ownership.");
+            }
+        }
+
+        internal void ReleaseActorOwnership()
+        {
+            if (Interlocked.Exchange(ref _actorOwned, 0) != 0)
+            {
+                TryRecycle();
+            }
+        }
+
+        internal void RetainAtomicOwnership()
+        {
+            if (Interlocked.CompareExchange(ref _atomicOwned, 1, 0) != 0)
+            {
+                throw new InvalidOperationException(
+                    "Inference work already has atomic-submission ownership.");
+            }
+        }
+
+        internal void ReleaseAtomicOwnership()
+        {
+            if (Interlocked.Exchange(ref _atomicOwned, 0) != 0)
+            {
+                TryRecycle();
+            }
+        }
+
+        internal void AbandonSubmission()
+        {
+            Volatile.Write(ref _recycleReady, 1);
+            ReleaseConsumerOwnership();
+        }
 
         internal void Complete(BackendStepResult result)
         {
             if (Interlocked.CompareExchange(ref _terminal, 1, 0) == 0)
             {
                 _completion.SetResult(result);
+                Volatile.Write(ref _recycleReady, 1);
             }
 
             ReleaseCredits();
+            TryRecycle();
         }
 
         public override void Fail(Exception exception)
@@ -670,13 +806,28 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
             if (Interlocked.CompareExchange(ref _terminal, 1, 0) == 0)
             {
                 _completion.SetException(exception);
+                Volatile.Write(ref _recycleReady, 1);
             }
 
             ReleaseCredits();
+            TryRecycle();
         }
 
-        BackendStepResult IValueTaskSource<BackendStepResult>.GetResult(short token) =>
-            _completion.GetResult(token);
+        BackendStepResult IValueTaskSource<BackendStepResult>.GetResult(short token)
+        {
+            var ownsCurrentGeneration = token == _completion.Version;
+            try
+            {
+                return _completion.GetResult(token);
+            }
+            finally
+            {
+                if (ownsCurrentGeneration)
+                {
+                    ReleaseConsumerOwnership();
+                }
+            }
+        }
 
         ValueTaskSourceStatus IValueTaskSource<BackendStepResult>.GetStatus(short token) =>
             _completion.GetStatus(token);
@@ -687,16 +838,59 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
             short token,
             ValueTaskSourceOnCompletedFlags flags) =>
             _completion.OnCompleted(continuation, state, token, flags);
+
+        private void ReleaseConsumerOwnership()
+        {
+            if (Interlocked.Exchange(ref _consumerOwned, 0) != 0)
+            {
+                TryRecycle();
+            }
+        }
+
+        private void TryRecycle()
+        {
+            if (Volatile.Read(ref _recycleReady) == 0 ||
+                Volatile.Read(ref _consumerOwned) != 0 ||
+                Volatile.Read(ref _actorOwned) != 0 ||
+                Volatile.Read(ref _atomicOwned) != 0)
+            {
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref _returned, 1, 0) != 0)
+            {
+                return;
+            }
+
+            var owner = Interlocked.Exchange(ref _poolOwner, null);
+            owner?.ReturnInferenceWorkToPool(this);
+        }
     }
 
-    private sealed class PendingPrefill(PrefillItem item) : PendingInference
+    private sealed class PendingPrefill : PendingInference
     {
-        public PrefillItem Item { get; } = item;
+        public PrefillItem Item { get; private set; }
+
+        internal void Initialize(ContinuousBatchExecutor owner, PrefillItem item)
+        {
+            InitializeForUse(owner);
+            Item = item;
+        }
+
+        internal void ClearItemForPool() => Item = default;
     }
 
-    private sealed class PendingDecode(DecodeItem item) : PendingInference
+    private sealed class PendingDecode : PendingInference
     {
-        public DecodeItem Item { get; } = item;
+        public DecodeItem Item { get; private set; }
+
+        internal void Initialize(ContinuousBatchExecutor owner, DecodeItem item)
+        {
+            InitializeForUse(owner);
+            Item = item;
+        }
+
+        internal void ClearItemForPool() => Item = default;
     }
 
     private sealed class PendingInferenceEnvelope(PendingInference?[] items) :
@@ -709,6 +903,35 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         public PendingInference this[int index] =>
             items[index] ?? throw new InvalidOperationException(
                 $"Atomic inference envelope slot {index} was not registered.");
+
+        internal void RetainActorOwnership()
+        {
+            var retained = 0;
+            try
+            {
+                for (; retained < items.Length; retained++)
+                {
+                    this[retained].RetainActorOwnership();
+                }
+            }
+            catch
+            {
+                for (var index = 0; index < retained; index++)
+                {
+                    this[index].ReleaseActorOwnership();
+                }
+
+                throw;
+            }
+        }
+
+        internal void ReleaseActorOwnership()
+        {
+            for (var index = 0; index < items.Length; index++)
+            {
+                this[index].ReleaseActorOwnership();
+            }
+        }
 
         public IEnumerator<PendingInference> GetEnumerator()
         {
