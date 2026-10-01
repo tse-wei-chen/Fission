@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Runtime.ExceptionServices;
 using System.Threading.Channels;
 using Fission.Abstractions;
@@ -519,13 +520,7 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                 _registeredCount++;
                 if (_registeredCount == _slots.Length)
                 {
-                    var items = new PendingInference[_slots.Length];
-                    for (var slot = 0; slot < _slots.Length; slot++)
-                    {
-                        items[slot] = _slots[slot]!;
-                    }
-
-                    envelope = new PendingInferenceEnvelope(items);
+                    envelope = new PendingInferenceEnvelope(_slots);
                 }
             }
 
@@ -678,15 +673,32 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         public DecodeItem Item { get; } = item;
     }
 
-    private sealed class PendingInferenceEnvelope(PendingInference[] items) : PendingWork
+    private sealed class PendingInferenceEnvelope(PendingInference?[] items) :
+        PendingWork,
+        IReadOnlyList<PendingInference>
     {
-        public IReadOnlyList<PendingInference> Items { get; } = items;
+        public IReadOnlyList<PendingInference> Items => this;
+        public int Count => items.Length;
+
+        public PendingInference this[int index] =>
+            items[index] ?? throw new InvalidOperationException(
+                $"Atomic inference envelope slot {index} was not registered.");
+
+        public IEnumerator<PendingInference> GetEnumerator()
+        {
+            for (var index = 0; index < items.Length; index++)
+            {
+                yield return this[index];
+            }
+        }
+
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
 
         public override void Fail(Exception exception)
         {
-            foreach (var item in Items)
+            for (var index = 0; index < items.Length; index++)
             {
-                item.Fail(exception);
+                this[index].Fail(exception);
             }
 
             ReleaseCredits();
