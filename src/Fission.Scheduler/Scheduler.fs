@@ -17,7 +17,8 @@ module Scheduler =
           UsedKvPages: int
           UsedKvBytes: int64
           UsedTransientKvBytes: int64
-          UsedDeviceTransientBytes: (Fission.Abstractions.DeviceId * int64) list }
+          UsedDeviceTransientBytes: (Fission.Abstractions.DeviceId * int64) list
+          UsedDeviceSequences: (Fission.Abstractions.DeviceId * int) list }
 
     let private isRunnable (sequence: ReadySequence) =
         sequence.Phase = Prefilling || sequence.Phase = Decoding
@@ -123,16 +124,40 @@ module Scheduler =
         |> List.tryPick (fun (candidate, availableBytes) ->
             if candidate = device then Some availableBytes else None)
 
+    let private tryFindDeviceSequenceBudget (budget: ResourceBudget) device =
+        budget.MaxDeviceSequences
+        |> List.tryPick (fun (candidate, maxSequences) ->
+            if candidate = device then Some maxSequences else None)
+
     let private usedDeviceBytes (state: SelectionState) device =
         state.UsedDeviceTransientBytes
         |> List.tryPick (fun (candidate, usedBytes) ->
             if candidate = device then Some usedBytes else None)
         |> Option.defaultValue 0L
 
+    let private usedDeviceSequences (state: SelectionState) device =
+        state.UsedDeviceSequences
+        |> List.tryPick (fun (candidate, usedSequences) ->
+            if candidate = device then Some usedSequences else None)
+        |> Option.defaultValue 0
+
     let private addDeviceBytes device byteGrant used =
+        let current =
+            used
+            |> List.tryPick (fun (candidate, usedBytes) ->
+                if candidate = device then Some usedBytes else None)
+            |> Option.defaultValue 0L
         let withoutDevice = used |> List.filter (fun (candidate, _) -> candidate <> device)
-        (device, usedDeviceBytes { SelectedRev = []; DeferredRev = []; SelectedCount = 0; UsedTokens = 0; UsedKvPages = 0; UsedKvBytes = 0L; UsedTransientKvBytes = 0L; UsedDeviceTransientBytes = used } device + byteGrant)
-        :: withoutDevice
+        (device, current + byteGrant) :: withoutDevice
+
+    let private addDeviceSequence device used =
+        let current =
+            used
+            |> List.tryPick (fun (candidate, usedSequences) ->
+                if candidate = device then Some usedSequences else None)
+            |> Option.defaultValue 0
+        let withoutDevice = used |> List.filter (fun (candidate, _) -> candidate <> device)
+        (device, current + 1) :: withoutDevice
 
     let private classifyAdmission (sequence: ReadySequence) =
         if not (isRunnable sequence) then
@@ -161,77 +186,96 @@ module Scheduler =
                 DeferredRev = { Sequence = sequence; Reason = BatchSequenceBudget } :: state.DeferredRev },
             false
         else
-            let availableTokens = budget.MaxBatchTokens - state.UsedTokens
-            if availableTokens <= 0 then
+            let deviceSequenceCapacityReached =
+                match sequence.ExecutionDevice with
+                | Some device ->
+                    match tryFindDeviceSequenceBudget budget device with
+                    | Some maxSequences -> usedDeviceSequences state device >= maxSequences
+                    | None -> false
+                | None -> false
+
+            if deviceSequenceCapacityReached then
                 { state with
-                    DeferredRev = { Sequence = sequence; Reason = TokenBudget } :: state.DeferredRev },
+                    DeferredRev = { Sequence = sequence; Reason = DeviceSequenceBudget } :: state.DeferredRev },
                 false
             else
-                let desiredTokens =
-                    if sequence.Phase = Decoding then
-                        1
-                    else
-                        min sequence.TokenDemand policy.MaxPrefillChunkTokens
-
-                let availableKvPages = budget.AvailableKvPages - state.UsedKvPages
-                let kvTokenCapacity = tokensWritableWithKvPages sequence availableKvPages
-                let availableKvBytes = budget.AvailableKvBytes - state.UsedKvBytes
-                let kvByteTokenCapacity = tokensWritableWithKvBytes sequence availableKvBytes
-                let availableTransientKvBytes = budget.AvailableKvBytes - state.UsedTransientKvBytes
-                let transientKvByteTokenCapacity =
-                    tokensWritableWithTransientKvBytes sequence availableTransientKvBytes
-                let deviceMemoryTokenCapacity =
-                    match sequence.ExecutionDevice with
-                    | Some device ->
-                        match tryFindDeviceBudget budget device with
-                        | Some availableBytes ->
-                            let remainingBytes = availableBytes - usedDeviceBytes state device
-                            tokensWritableWithTransientKvBytes sequence remainingBytes
-                        | None -> Int32.MaxValue
-                    | None -> Int32.MaxValue
-                let tokenGrant =
-                    min
-                        desiredTokens
-                        (min
-                            availableTokens
-                            (min
-                                kvTokenCapacity
-                                (min kvByteTokenCapacity (min transientKvByteTokenCapacity deviceMemoryTokenCapacity))))
-
-                if tokenGrant <= 0 then
-                    let reason =
-                        if kvTokenCapacity <= 0 then KvBudget
-                        elif kvByteTokenCapacity <= 0 then KvByteBudget
-                        elif transientKvByteTokenCapacity <= 0 then TransientKvByteBudget
-                        elif deviceMemoryTokenCapacity <= 0 then DeviceMemoryBudget
-                        else TokenBudget
+                let availableTokens = budget.MaxBatchTokens - state.UsedTokens
+                if availableTokens <= 0 then
                     { state with
-                        DeferredRev = { Sequence = sequence; Reason = reason } :: state.DeferredRev },
+                        DeferredRev = { Sequence = sequence; Reason = TokenBudget } :: state.DeferredRev },
                     false
                 else
-                    let kvPageGrant = kvPagesForGrant sequence tokenGrant
-                    let kvByteGrant = int64 tokenGrant * sequence.KvBytesPerToken
-                    let transientKvByteGrant = transientKvBytesForGrant sequence tokenGrant
-                    let nextDeviceUsage =
+                    let desiredTokens =
+                        if sequence.Phase = Decoding then
+                            1
+                        else
+                            min sequence.TokenDemand policy.MaxPrefillChunkTokens
+
+                    let availableKvPages = budget.AvailableKvPages - state.UsedKvPages
+                    let kvTokenCapacity = tokensWritableWithKvPages sequence availableKvPages
+                    let availableKvBytes = budget.AvailableKvBytes - state.UsedKvBytes
+                    let kvByteTokenCapacity = tokensWritableWithKvBytes sequence availableKvBytes
+                    let availableTransientKvBytes = budget.AvailableKvBytes - state.UsedTransientKvBytes
+                    let transientKvByteTokenCapacity =
+                        tokensWritableWithTransientKvBytes sequence availableTransientKvBytes
+                    let deviceMemoryTokenCapacity =
                         match sequence.ExecutionDevice with
-                        | Some device when tryFindDeviceBudget budget device |> Option.isSome ->
-                            addDeviceBytes device transientKvByteGrant state.UsedDeviceTransientBytes
-                        | _ -> state.UsedDeviceTransientBytes
-                    { state with
-                        SelectedRev =
-                            { Sequence = sequence
-                              TokenGrant = tokenGrant
-                              KvPageGrant = kvPageGrant
-                              KvByteGrant = kvByteGrant
-                              TransientKvByteGrant = transientKvByteGrant }
-                            :: state.SelectedRev
-                        SelectedCount = state.SelectedCount + 1
-                        UsedTokens = state.UsedTokens + tokenGrant
-                        UsedKvPages = state.UsedKvPages + kvPageGrant
-                        UsedKvBytes = state.UsedKvBytes + kvByteGrant
-                        UsedTransientKvBytes = state.UsedTransientKvBytes + transientKvByteGrant
-                        UsedDeviceTransientBytes = nextDeviceUsage },
-                    true
+                        | Some device ->
+                            match tryFindDeviceBudget budget device with
+                            | Some availableBytes ->
+                                let remainingBytes = availableBytes - usedDeviceBytes state device
+                                tokensWritableWithTransientKvBytes sequence remainingBytes
+                            | None -> Int32.MaxValue
+                        | None -> Int32.MaxValue
+                    let tokenGrant =
+                        min
+                            desiredTokens
+                            (min
+                                availableTokens
+                                (min
+                                    kvTokenCapacity
+                                    (min kvByteTokenCapacity (min transientKvByteTokenCapacity deviceMemoryTokenCapacity))))
+
+                    if tokenGrant <= 0 then
+                        let reason =
+                            if kvTokenCapacity <= 0 then KvBudget
+                            elif kvByteTokenCapacity <= 0 then KvByteBudget
+                            elif transientKvByteTokenCapacity <= 0 then TransientKvByteBudget
+                            elif deviceMemoryTokenCapacity <= 0 then DeviceMemoryBudget
+                            else TokenBudget
+                        { state with
+                            DeferredRev = { Sequence = sequence; Reason = reason } :: state.DeferredRev },
+                        false
+                    else
+                        let kvPageGrant = kvPagesForGrant sequence tokenGrant
+                        let kvByteGrant = int64 tokenGrant * sequence.KvBytesPerToken
+                        let transientKvByteGrant = transientKvBytesForGrant sequence tokenGrant
+                        let nextDeviceUsage =
+                            match sequence.ExecutionDevice with
+                            | Some device when tryFindDeviceBudget budget device |> Option.isSome ->
+                                addDeviceBytes device transientKvByteGrant state.UsedDeviceTransientBytes
+                            | _ -> state.UsedDeviceTransientBytes
+                        let nextDeviceSequenceUsage =
+                            match sequence.ExecutionDevice with
+                            | Some device when tryFindDeviceSequenceBudget budget device |> Option.isSome ->
+                                addDeviceSequence device state.UsedDeviceSequences
+                            | _ -> state.UsedDeviceSequences
+                        { state with
+                            SelectedRev =
+                                { Sequence = sequence
+                                  TokenGrant = tokenGrant
+                                  KvPageGrant = kvPageGrant
+                                  KvByteGrant = kvByteGrant
+                                  TransientKvByteGrant = transientKvByteGrant }
+                                :: state.SelectedRev
+                            SelectedCount = state.SelectedCount + 1
+                            UsedTokens = state.UsedTokens + tokenGrant
+                            UsedKvPages = state.UsedKvPages + kvPageGrant
+                            UsedKvBytes = state.UsedKvBytes + kvByteGrant
+                            UsedTransientKvBytes = state.UsedTransientKvBytes + transientKvByteGrant
+                            UsedDeviceTransientBytes = nextDeviceUsage
+                            UsedDeviceSequences = nextDeviceSequenceUsage },
+                        true
 
     let private reserveDecodeTokens
         (budget: ResourceBudget)
@@ -267,6 +311,10 @@ module Scheduler =
             invalidArg "AvailableDeviceBytes" "Available device bytes cannot be negative."
         if (budget.AvailableDeviceBytes |> List.distinctBy fst |> List.length) <> budget.AvailableDeviceBytes.Length then
             invalidArg "AvailableDeviceBytes" "Each execution device may appear only once in the device-memory budget."
+        if budget.MaxDeviceSequences |> List.exists (fun (_, maxSequences) -> maxSequences < 0) then
+            invalidArg "MaxDeviceSequences" "Per-device sequence capacity cannot be negative."
+        if (budget.MaxDeviceSequences |> List.distinctBy fst |> List.length) <> budget.MaxDeviceSequences.Length then
+            invalidArg "MaxDeviceSequences" "Each execution device may appear only once in the per-device sequence budget."
         if policy.DecodeTokenReserve < 0 then invalidArg "DecodeTokenReserve" "DecodeTokenReserve cannot be negative."
         if policy.MaxPrefillChunkTokens <= 0 then invalidArg "MaxPrefillChunkTokens" "MaxPrefillChunkTokens must be positive."
         if policy.DeadlineUrgencyWindow < TimeSpan.Zero then invalidArg "DeadlineUrgencyWindow" "DeadlineUrgencyWindow cannot be negative."
@@ -299,7 +347,8 @@ module Scheduler =
               UsedKvPages = 0
               UsedKvBytes = 0L
               UsedTransientKvBytes = 0L
-              UsedDeviceTransientBytes = [] }
+              UsedDeviceTransientBytes = []
+              UsedDeviceSequences = [] }
 
         let afterReserve, remainingDecodes =
             reserveDecodeTokens budget policy orderedDecodes initialState
