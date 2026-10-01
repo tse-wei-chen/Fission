@@ -30,6 +30,13 @@ public readonly record struct BackendStepResult(
 /// in their returned result list so the runtime can complete individual tickets
 /// without sequence-id lookups on the hot path.
 ///
+/// Prefill/decode batch objects and their Items collections are borrowed inputs.
+/// Their storage may be reused as soon as the returned ValueTask completes, so an
+/// implementation must not retain a batch, its Items collection, or lazily depend
+/// on either through the returned result collection after completion. Any data
+/// needed beyond the call must be copied into backend-owned state before the
+/// ValueTask completes.
+///
 /// Stateful backends may retain logits, decoder state, physical KV, and snapshot
 /// state between calls. Lifecycle and transaction hooks are serialized by the
 /// device actor. Their default implementations are no-ops for stateless backends.
