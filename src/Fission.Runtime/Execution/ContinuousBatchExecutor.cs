@@ -446,6 +446,7 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         private readonly PendingInference?[] _slots;
         private ContinuousBatchExecutor? _executor;
         private Exception? _failure;
+        private int _registeredCount;
         private bool _enqueued;
         private int _disposed;
 
@@ -506,7 +507,8 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
                 }
 
                 _slots[index] = work;
-                if (_slots.All(static item => item is not null))
+                _registeredCount++;
+                if (_registeredCount == _slots.Length)
                 {
                     var items = new PendingInference[_slots.Length];
                     for (var slot = 0; slot < _slots.Length; slot++)
