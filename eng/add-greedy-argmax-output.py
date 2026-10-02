@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Store tensors in one external .data file next to the output model.",
     )
+    parser.add_argument(
+        "--skip-check",
+        action="store_true",
+        help="Skip ONNX checker for ORT-optimized graphs with nonstandard operators; validate with the target runtime.",
+    )
     return parser.parse_args()
 
 
@@ -152,7 +157,8 @@ def main() -> None:
         )
     )
 
-    onnx.checker.check_model(model)
+    if not args.skip_check:
+        onnx.checker.check_model(model)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     if args.external_data:
