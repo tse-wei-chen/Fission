@@ -23,7 +23,7 @@ let mk sequenceId phase priority deadline enqueuedAt tokenDemand position tokens
       TokensPerKvPage = tokensPerKvPage
       Priority = priority
       KvBytesPerToken = 0L
-      ExecutionDevice = None }
+      ExecutionDevice = ValueNone }
 
 let policy =
     { DecodeTokenReserve = 2
@@ -357,11 +357,11 @@ let deviceB = DeviceId("cuda:device-budget-b")
 let devicePrefillA =
     { mk (sid "00000000-0000-0000-0000-000000000040") Prefilling 0 None now 1 0 blockSize with
         KvBytesPerToken = 128L
-        ExecutionDevice = Some deviceA }
+        ExecutionDevice = ValueSome deviceA }
 let devicePrefillB =
     { mk (sid "00000000-0000-0000-0000-000000000041") Prefilling 0 None now 1 0 blockSize with
         KvBytesPerToken = 128L
-        ExecutionDevice = Some deviceB }
+        ExecutionDevice = ValueSome deviceB }
 let splitDeviceBudget =
     { MaxBatchTokens = 2
       AvailableKvPages = 16
@@ -376,7 +376,7 @@ require
     "Independent devices must consume independent physical-memory headroom."
 
 let sameDevicePrefillB =
-    { devicePrefillB with ExecutionDevice = Some deviceA }
+    { devicePrefillB with ExecutionDevice = ValueSome deviceA }
 let sameDeviceDecision =
     Scheduler.scheduleAt now splitDeviceBudget admissionPolicy [ devicePrefillA; sameDevicePrefillB ]
 require
@@ -404,10 +404,10 @@ let deviceSequenceDecision =
         [ devicePrefillA; devicePrefillB; deviceCapacityA2; deviceCapacityB2 ]
 let deviceSequenceSelectedA =
     deviceSequenceDecision.Selected
-    |> List.filter (fun item -> item.Sequence.ExecutionDevice = Some deviceA)
+    |> List.filter (fun item -> item.Sequence.ExecutionDevice = ValueSome deviceA)
 let deviceSequenceSelectedB =
     deviceSequenceDecision.Selected
-    |> List.filter (fun item -> item.Sequence.ExecutionDevice = Some deviceB)
+    |> List.filter (fun item -> item.Sequence.ExecutionDevice = ValueSome deviceB)
 require
     (deviceSequenceDecision.Selected.Length = 3
      && deviceSequenceSelectedA.Length = 1
