@@ -39,6 +39,9 @@ param(
     [ValidateNotNull()]
     [string] $CudaRuntimeLibraryPath = "",
 
+    [ValidateNotNull()]
+    [string] $SampledTokenIdsOutput = "",
+
     [ValidateNotNullOrEmpty()]
     [string] $StartupProbePrompt = "Hello",
 
@@ -279,6 +282,7 @@ $metadata = [ordered]@{
         vocabulary_size = $VocabularySize
         eos_token_ids = $EosTokenIds
         chat_template = $ChatTemplate
+        sampled_token_ids_output = if ([string]::IsNullOrWhiteSpace($SampledTokenIdsOutput)) { $null } else { $SampledTokenIdsOutput }
     }
     startup_probe = [ordered]@{
         prompt = $StartupProbePrompt
@@ -302,6 +306,7 @@ $settings = [ordered]@{
     "Fission__CudaDeviceId" = "$CudaDeviceId"
     "Fission__CudaRuntimeLibraryPath" = $cudaRuntimeLibrary
     "Fission__CudaPageLockedDecodeLogits" = if ($PageLockedDecodeLogits) { "true" } else { "false" }
+    "Fission__SampledTokenIdsOutput" = $SampledTokenIdsOutput
     "Fission__ModelPath" = $model
     "Fission__ModelId" = $ModelId
     "Fission__NumHiddenLayers" = "$NumHiddenLayers"
