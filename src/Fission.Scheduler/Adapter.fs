@@ -58,9 +58,9 @@ type SchedulingKernel() =
           KvBytesPerToken = candidate.KvBytesPerToken
           ExecutionDevice =
             if candidate.ExecutionDevice.HasValue then
-                Some candidate.ExecutionDevice.Value
+                ValueSome candidate.ExecutionDevice.Value
             else
-                None }
+                ValueNone }
 
     let toDeferralReason reason =
         match reason with
