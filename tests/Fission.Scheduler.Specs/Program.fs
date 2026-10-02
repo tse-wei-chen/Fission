@@ -13,6 +13,10 @@ let sid (value: string) =
 let now = DateTimeOffset(2026, 9, 24, 12, 0, 0, TimeSpan.Zero)
 let blockSize = 4
 
+let Waiting = SchedulingPhase.Waiting
+let Prefilling = SchedulingPhase.Prefilling
+let Decoding = SchedulingPhase.Decoding
+
 let mk sequenceId phase priority (deadline: DateTimeOffset option) (enqueuedAt: DateTimeOffset) tokenDemand position tokensPerKvPage =
     { SequenceId = sequenceId
       Phase = phase
