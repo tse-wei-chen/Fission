@@ -5,6 +5,15 @@ open Fission.Abstractions.Scheduling
 /// C#-friendly adapter that keeps policy implementation in F# while exposing
 /// stable DTO contracts to the orchestration/data-plane layers.
 type SchedulingKernel() =
+    let mapReadOnlyList
+        (mapping: 'T -> 'U)
+        (items: System.Collections.Generic.IReadOnlyList<'T>)
+        =
+        let mutable mapped = []
+        for index = items.Count - 1 downto 0 do
+            mapped <- mapping items[index] :: mapped
+        mapped
+
     let toPhase (phase: SchedulingPhase) =
         match phase with
         | SchedulingPhase.Waiting -> Waiting
@@ -63,17 +72,17 @@ type SchedulingKernel() =
                 match budget.DeviceMemory with
                 | null -> []
                 | deviceMemory ->
-                    deviceMemory
-                    |> Seq.map (fun item -> item.Device, item.AvailableBytes)
-                    |> Seq.toList
+                    mapReadOnlyList
+                        (fun item -> item.Device, item.AvailableBytes)
+                        deviceMemory
 
             let maxDeviceSequences =
                 match budget.DeviceSequences with
                 | null -> []
                 | deviceSequences ->
-                    deviceSequences
-                    |> Seq.map (fun item -> item.Device, item.MaxSequences)
-                    |> Seq.toList
+                    mapReadOnlyList
+                        (fun item -> item.Device, item.MaxSequences)
+                        deviceSequences
 
             let resourceBudget : ResourceBudget =
                 { MaxBatchTokens = budget.MaxBatchTokens
@@ -90,8 +99,7 @@ type SchedulingKernel() =
 
             let decision =
                 candidates
-                |> Seq.map toCandidate
-                |> Seq.toList
+                |> mapReadOnlyList toCandidate
                 |> Scheduler.scheduleAt now resourceBudget schedulingPolicy
 
             let batch = ScheduleCompiler.compile scheduleId decision
