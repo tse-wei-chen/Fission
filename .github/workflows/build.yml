@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [ develop ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,48 +25,9 @@ jobs:
       - run: dotnet build Fission.slnx -c Release --no-restore
       - name: Report scheduler microbenchmark
         run: dotnet run --project benchmarks/Fission.Scheduler.Benchmarks/Fission.Scheduler.Benchmarks.csproj -c Release --no-build -- 2000
-      - run: dotnet run --project samples/Fission.Demo/Fission.Demo.csproj -c Release --no-build
-      - run: dotnet run --project samples/Fission.PlanDemo/Fission.PlanDemo.fsproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.Runtime.Specs/Fission.Runtime.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.DeviceActor.Specs/Fission.DeviceActor.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.DeviceActor.Identity.Specs/Fission.DeviceActor.Identity.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.DeviceCancellation.Specs/Fission.DeviceCancellation.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.Scheduler.Specs/Fission.Scheduler.Specs.fsproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.Engine.Specs/Fission.Engine.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.Server.Specs/Fission.Server.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.Specs/Fission.OnnxRuntime.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.State.Specs/Fission.OnnxRuntime.State.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.Decoder.Specs/Fission.OnnxRuntime.Decoder.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.Geometry.Specs/Fission.OnnxRuntime.Geometry.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.Optimum.Specs/Fission.OnnxRuntime.Optimum.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.Batch.Specs/Fission.OnnxRuntime.Batch.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.OptimumBatch.Specs/Fission.OnnxRuntime.OptimumBatch.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.OptimumPrefillBatch.Specs/Fission.OnnxRuntime.OptimumPrefillBatch.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.Migration.Specs/Fission.OnnxRuntime.Migration.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.MigrationCodec.Specs/Fission.OnnxRuntime.MigrationCodec.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.PinnedStaging.Specs/Fission.OnnxRuntime.PinnedStaging.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaCopy.Specs/Fission.OnnxRuntime.CudaCopy.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaResidentState.Specs/Fission.OnnxRuntime.CudaResidentState.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaD2HStaging.Specs/Fission.OnnxRuntime.CudaD2HStaging.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaH2DState.Specs/Fission.OnnxRuntime.CudaH2DState.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaMigrationCodec.Specs/Fission.OnnxRuntime.CudaMigrationCodec.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaKvArena.Specs/Fission.OnnxRuntime.CudaKvArena.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaPresentKv.Specs/Fission.OnnxRuntime.CudaPresentKv.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaPastKv.Specs/Fission.OnnxRuntime.CudaPastKv.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaBinding.Specs/Fission.OnnxRuntime.CudaBinding.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaSplitFallback.Specs/Fission.OnnxRuntime.CudaSplitFallback.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaGather.Specs/Fission.OnnxRuntime.CudaGather.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.AsyncBatch.Specs/Fission.OnnxRuntime.AsyncBatch.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaGatherBinding.Specs/Fission.OnnxRuntime.CudaGatherBinding.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.OnnxRuntime.CudaDevicePool.Specs/Fission.OnnxRuntime.CudaDevicePool.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.BackendTransactions.Specs/Fission.BackendTransactions.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.Migration.Specs/Fission.Migration.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.MultiDevice.Specs/Fission.MultiDevice.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.MigrationProtocol.Specs/Fission.MigrationProtocol.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.MigrationTransport.Specs/Fission.MigrationTransport.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.MigrationTransportRuntime.Specs/Fission.MigrationTransportRuntime.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.MigrationObservability.Specs/Fission.MigrationObservability.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.MigrationTimeout.Specs/Fission.MigrationTimeout.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.MigrationHealth.Specs/Fission.MigrationHealth.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.TracePersistence.Specs/Fission.TracePersistence.Specs.csproj -c Release --no-build
-      - run: dotnet run --project tests/Fission.TraceStreaming.Specs/Fission.TraceStreaming.Specs.csproj -c Release --no-build
+      - name: Run samples
+        shell: pwsh
+        run: ./eng/run-projects.ps1 -Root samples -Configuration Release -NoBuild
+      - name: Run specs
+        shell: pwsh
+        run: ./eng/run-projects.ps1 -Root tests -Configuration Release -NoBuild

@@ -28,6 +28,13 @@ on:
       - benchmarks/Fission.Serving.LoadGen/**
       - .github/workflows/container.yml
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   container:
     runs-on: ubuntu-latest
