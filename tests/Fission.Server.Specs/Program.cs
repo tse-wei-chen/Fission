@@ -60,6 +60,38 @@ static async Task ValidateBackendCompositionAsync()
     var device = new DeviceId("cpu:composition-spec");
 
     var defaults = new ConfigurationManager();
+    Require(
+        ServerBackendFactory.ResolveDevice(defaults) == new DeviceId("cpu:0"),
+        "Default server device must remain cpu:0.");
+
+    var cudaDevice = new ConfigurationManager();
+    cudaDevice["Fission:Backend"] = "onnx";
+    cudaDevice["Fission:ExecutionProvider"] = "cuda";
+    cudaDevice["Fission:CudaDeviceId"] = "3";
+    Require(
+        ServerBackendFactory.ResolveDevice(cudaDevice) == new DeviceId("cuda:3"),
+        "CUDA composition must derive its default logical device from the CUDA ordinal.");
+
+    cudaDevice["Fission:Device"] = "gpu:primary";
+    Require(
+        ServerBackendFactory.ResolveDevice(cudaDevice) == new DeviceId("gpu:primary"),
+        "An explicit logical device must override provider-derived identity.");
+
+    var invalidProvider = new ConfigurationManager();
+    invalidProvider["Fission:Backend"] = "onnx";
+    invalidProvider["Fission:ExecutionProvider"] = "metal";
+    RequireThrows<InvalidOperationException>(
+        () => ServerBackendFactory.ResolveDevice(invalidProvider),
+        "Unsupported ONNX execution providers must fail during device resolution.");
+
+    var invalidCudaDevice = new ConfigurationManager();
+    invalidCudaDevice["Fission:Backend"] = "onnx";
+    invalidCudaDevice["Fission:ExecutionProvider"] = "cuda";
+    invalidCudaDevice["Fission:CudaDeviceId"] = "-1";
+    RequireThrows<InvalidOperationException>(
+        () => ServerBackendFactory.ResolveDevice(invalidCudaDevice),
+        "Negative CUDA device ordinals must fail before native composition.");
+
     await using (var backend = ServerBackendFactory.Create(defaults, device))
     {
         Require(
@@ -108,11 +140,25 @@ static async Task ValidateBackendCompositionAsync()
         await using var backend = ServerBackendFactory.Create(onnx, device);
         Require(
             backend.Name == "onnxruntime/decoder/optimum-legacy-fp32-greedy",
-            "ONNX composition must build the Optimum legacy decoder backend.");
+            "CPU ONNX composition must build the Optimum legacy decoder backend.");
         Require(
             backend.Device == device,
             "ONNX backend composition must preserve the configured device.");
 
+        onnx["Fission:ExecutionProvider"] = "cuda";
+        onnx["Fission:CudaDeviceId"] = "-1";
+        RequireThrows<InvalidOperationException>(
+            () => ServerBackendFactory.Create(onnx, new DeviceId("cuda:0")),
+            "CUDA composition must validate the device ordinal before loading CUDA Runtime.");
+
+        onnx["Fission:CudaDeviceId"] = "0";
+        onnx["Fission:CudaPoolMaxRetainedBytes"] = "-1";
+        RequireThrows<InvalidOperationException>(
+            () => ServerBackendFactory.Create(onnx, new DeviceId("cuda:0")),
+            "CUDA composition must validate pool retention before loading CUDA Runtime.");
+
+        onnx["Fission:ExecutionProvider"] = "cpu";
+        onnx["Fission:CudaPoolMaxRetainedBytes"] = null;
         onnx["Fission:VocabularySize"] = "0";
         RequireThrows<InvalidOperationException>(
             () => ServerBackendFactory.Create(onnx, device),
@@ -122,6 +168,25 @@ static async Task ValidateBackendCompositionAsync()
     {
         File.Delete(modelPath);
     }
+
+    var failedBackend = new FailingInitializeBackend(device);
+    try
+    {
+        _ = await ContinuousBatchExecutor.CreateAsync(
+            failedBackend,
+            capacity: 1,
+            maxBatchSize: 1);
+        throw new InvalidOperationException(
+            "Backend initialization failure spec unexpectedly created an executor.");
+    }
+    catch (InvalidOperationException exception)
+        when (exception.Message == FailingInitializeBackend.FailureMessage)
+    {
+    }
+
+    Require(
+        failedBackend.DisposeCount == 1,
+        "ContinuousBatchExecutor.CreateAsync must dispose a backend whose initialization fails.");
 }
 
 static async Task ValidateTokenizerCompositionAsync()
@@ -585,6 +650,43 @@ sealed class BufferedSpecTextTokenCodec : ITextTokenCodec
         }
 
         public void Dispose() { }
+    }
+}
+
+sealed class FailingInitializeBackend : IInferenceBackend
+{
+    public const string FailureMessage = "intentional initialize failure";
+    private int _disposeCount;
+
+    public FailingInitializeBackend(DeviceId device)
+    {
+        Device = device;
+    }
+
+    public string Name => "failing-initialize-spec";
+    public DeviceId Device { get; }
+    public int DisposeCount => Volatile.Read(ref _disposeCount);
+
+    public ValueTask InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        throw new InvalidOperationException(FailureMessage);
+    }
+
+    public ValueTask<IReadOnlyList<BackendStepResult>> PrefillAsync(
+        PrefillBatch batch,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException();
+
+    public ValueTask<IReadOnlyList<BackendStepResult>> DecodeAsync(
+        DecodeBatch batch,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException();
+
+    public ValueTask DisposeAsync()
+    {
+        Interlocked.Increment(ref _disposeCount);
+        return ValueTask.CompletedTask;
     }
 }
 
