@@ -367,7 +367,7 @@ let splitDeviceBudget =
       AvailableKvPages = 16
       MaxBatchSequences = 2
       AvailableKvBytes = Int64.MaxValue
-      AvailableDeviceBytes = [ deviceA, 128L; deviceB, 128L ]
+      AvailableDeviceBytes = [ struct (deviceA, 128L); struct (deviceB, 128L) ]
       MaxDeviceSequences = [] }
 let splitDeviceDecision =
     Scheduler.scheduleAt now splitDeviceBudget admissionPolicy [ devicePrefillA; devicePrefillB ]
@@ -395,7 +395,7 @@ let deviceSequenceBudget =
       MaxBatchSequences = 4
       AvailableKvBytes = Int64.MaxValue
       AvailableDeviceBytes = []
-      MaxDeviceSequences = [ deviceA, 1; deviceB, 2 ] }
+      MaxDeviceSequences = [ struct (deviceA, 1); struct (deviceB, 2) ] }
 let deviceSequenceDecision =
     Scheduler.scheduleAt
         now
