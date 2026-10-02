@@ -13,6 +13,9 @@ on:
       - global.json
       - src/**
       - benchmarks/Fission.Serving.LoadGen/**
+      - benchmarks/Fission.Serving.Reporter/**
+      - benchmarks/serving/**
+      - eng/run-serving-suite.ps1
       - .github/workflows/container.yml
   pull_request:
     branches: [ develop ]
@@ -26,6 +29,9 @@ on:
       - global.json
       - src/**
       - benchmarks/Fission.Serving.LoadGen/**
+      - benchmarks/Fission.Serving.Reporter/**
+      - benchmarks/serving/**
+      - eng/run-serving-suite.ps1
       - .github/workflows/container.yml
 
 concurrency:
@@ -98,16 +104,20 @@ jobs:
           assert payload['usage']['completion_tokens'] == 2, payload
           PY
 
-          dotnet run \
-            --project benchmarks/Fission.Serving.LoadGen/Fission.Serving.LoadGen.csproj \
-            -c Release -- \
-            --url http://127.0.0.1:18000 \
-            --model container-loadgen \
-            --requests 8 \
-            --concurrency 4 \
-            --max-tokens 4 \
-            --warmup 2 \
-            --timeout-seconds 30 \
-            --output /tmp/fission-loadgen.json
+          pwsh ./eng/run-serving-suite.ps1 \
+            -Label fission-ci \
+            -BaseUrl http://127.0.0.1:18000 \
+            -Model container-loadgen \
+            -Manifest benchmarks/serving/workloads.ci.json \
+            -OutputDirectory /tmp/fission-suite \
+            -Configuration Release
 
-          cat /tmp/fission-loadgen.json
+          dotnet run \
+            --project benchmarks/Fission.Serving.Reporter/Fission.Serving.Reporter.csproj \
+            -c Release -- \
+            --input /tmp/fission-suite \
+            --markdown /tmp/fission-suite/report.md \
+            --csv /tmp/fission-suite/report.csv
+
+          cat /tmp/fission-suite/report.md
+          cat /tmp/fission-suite/report.csv
