@@ -18,6 +18,7 @@ on:
       - eng/run-serving-suite.ps1
       - eng/run-nvidia-smoke.ps1
       - eng/run-nvidia-serving-benchmark.ps1
+      - eng/add-greedy-argmax-output.py
       - .github/workflows/container.yml
   pull_request:
     branches: [ develop ]
@@ -36,6 +37,7 @@ on:
       - eng/run-serving-suite.ps1
       - eng/run-nvidia-smoke.ps1
       - eng/run-nvidia-serving-benchmark.ps1
+      - eng/add-greedy-argmax-output.py
       - .github/workflows/container.yml
 
 concurrency:
@@ -76,6 +78,9 @@ jobs:
               exit 1
             }
           }
+
+      - name: Validate ONNX graph rewrite syntax
+        run: python3 -m py_compile ./eng/add-greedy-argmax-output.py
 
       - name: Validate GPU serving smoke manifest
         shell: pwsh
