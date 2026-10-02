@@ -58,6 +58,7 @@ type DeferredReason =
     | BatchSequenceBudget
     | DeviceSequenceBudget
 
+[<Struct>]
 type ScheduledSequence =
     { Sequence: ReadySequence
       TokenGrant: int
