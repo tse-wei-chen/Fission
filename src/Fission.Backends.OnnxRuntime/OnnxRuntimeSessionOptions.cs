@@ -9,9 +9,18 @@ namespace Fission.Backends.OnnxRuntime;
 /// </summary>
 public static class OnnxRuntimeSessionOptions
 {
-    public static Func<SessionOptions> Cuda(int deviceId)
+    public static Func<SessionOptions> Cuda(
+        int deviceId,
+        string? profileOutputPathPrefix = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(deviceId);
+        if (profileOutputPathPrefix is not null &&
+            string.IsNullOrWhiteSpace(profileOutputPathPrefix))
+        {
+            throw new ArgumentException(
+                "ONNX Runtime profile path prefix must be non-empty when specified.",
+                nameof(profileOutputPathPrefix));
+        }
 
         return () =>
         {
@@ -19,6 +28,12 @@ public static class OnnxRuntimeSessionOptions
             try
             {
                 options.AppendExecutionProvider_CUDA(deviceId);
+                if (profileOutputPathPrefix is not null)
+                {
+                    options.ProfileOutputPathPrefix = profileOutputPathPrefix;
+                    options.EnableProfiling = true;
+                }
+
                 return options;
             }
             catch
