@@ -4,10 +4,11 @@ open System
 
 [<RequireQualifiedAccess>]
 module Scheduler =
+    [<Struct>]
     type private AdmissionResult =
-        | Admitted of ReadySequence
-        | DeferredAdmission of DeferredSequence
-        | RejectedAdmission of RejectedSequence
+        | Admitted of candidate: ReadySequence
+        | DeferredAdmission of deferredItem: DeferredSequence
+        | RejectedAdmission of rejectedItem: RejectedSequence
 
     [<Struct>]
     type private DeviceUsage =
