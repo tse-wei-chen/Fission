@@ -4,6 +4,7 @@ using Fission.Abstractions.Execution;
 using Fission.Backends.OnnxRuntime;
 using Fission.Runtime.Backends;
 using Microsoft.Extensions.Configuration;
+using Microsoft.ML.OnnxRuntime;
 
 namespace Fission.Server;
 
@@ -47,25 +48,120 @@ public static class ServerBackendFactory
             numKvHeads: ReadPositiveInt(configuration, "Fission:NumKvHeads"),
             headDim: ReadPositiveInt(configuration, "Fission:HeadDim"),
             vocabularySize: ReadPositiveInt(configuration, "Fission:VocabularySize"));
+        var eosTokenIds = ReadTokenIds(configuration, "Fission:EosTokenIds");
+        var executionProvider =
+            (configuration["Fission:OnnxExecutionProvider"] ?? "cpu").Trim();
 
+        return executionProvider.ToLowerInvariant() switch
+        {
+            "" or "cpu" => CreateCpuOnnxRuntime(
+                modelPath,
+                modelId,
+                device,
+                profile,
+                eosTokenIds),
+            "cuda" => CreateCudaOnnxRuntime(
+                configuration,
+                modelPath,
+                modelId,
+                device,
+                profile,
+                eosTokenIds),
+            _ => throw new InvalidOperationException(
+                $"Unsupported ONNX Runtime execution provider '{executionProvider}'. " +
+                "Expected 'cpu' or 'cuda'.")
+        };
+    }
+
+    private static IInferenceBackend CreateCpuOnnxRuntime(
+        string modelPath,
+        string modelId,
+        DeviceId device,
+        OptimumLegacyDecoderProfile profile,
+        IReadOnlyCollection<int> eosTokenIds)
+    {
         var binding = new OptimumLegacyFloatDecoderBinding(
             profile,
-            ReadTokenIds(configuration, "Fission:EosTokenIds"));
+            eosTokenIds);
         var adapter = new DecoderOnlyOnnxExecutionAdapter(binding);
 
         try
         {
             return new OnnxRuntimeBackend(
-                new OnnxRuntimeBackendOptions(
-                    new ModelId(modelId),
-                    device,
-                    OnnxRuntimeModelSource.FromFile(modelPath),
-                    SessionContract: profile.SessionContract),
+                CreateBackendOptions(modelPath, modelId, device, profile),
                 adapter);
         }
         catch
         {
             adapter.Dispose();
+            throw;
+        }
+    }
+
+    private static IInferenceBackend CreateCudaOnnxRuntime(
+        IConfiguration configuration,
+        string modelPath,
+        string modelId,
+        DeviceId device,
+        OptimumLegacyDecoderProfile profile,
+        IReadOnlyCollection<int> eosTokenIds)
+    {
+        var cudaDeviceId = ReadNonNegativeInt(
+            configuration,
+            "Fission:CudaDeviceId",
+            fallback: 0);
+        var runtimeLibraryPath = ReadOptional(
+            configuration,
+            "Fission:CudaRuntimeLibraryPath");
+
+        var allocator = new CudaDeviceMemoryAllocator(
+            new CudaDeviceMemoryAllocatorOptions
+            {
+                DeviceId = cudaDeviceId,
+                RuntimeLibraryPath = runtimeLibraryPath
+            });
+        var binding = new OptimumLegacyCudaFloatDecoderBinding(
+            profile,
+            allocator,
+            eosTokenIds);
+        var adapter = new DecoderOnlyOnnxExecutionAdapter(binding);
+
+        try
+        {
+            return new OnnxRuntimeBackend(
+                CreateBackendOptions(modelPath, modelId, device, profile),
+                adapter,
+                sessionOptionsFactory: () => CreateCudaSessionOptions(cudaDeviceId));
+        }
+        catch
+        {
+            adapter.Dispose();
+            throw;
+        }
+    }
+
+    private static OnnxRuntimeBackendOptions CreateBackendOptions(
+        string modelPath,
+        string modelId,
+        DeviceId device,
+        OptimumLegacyDecoderProfile profile) =>
+        new(
+            new ModelId(modelId),
+            device,
+            OnnxRuntimeModelSource.FromFile(modelPath),
+            SessionContract: profile.SessionContract);
+
+    private static SessionOptions CreateCudaSessionOptions(int deviceId)
+    {
+        var options = new SessionOptions();
+        try
+        {
+            options.AppendExecutionProvider_CUDA(deviceId);
+            return options;
+        }
+        catch
+        {
+            options.Dispose();
             throw;
         }
     }
@@ -84,6 +180,16 @@ public static class ServerBackendFactory
         return value.Trim();
     }
 
+    private static string? ReadOptional(
+        IConfiguration configuration,
+        string key)
+    {
+        var value = configuration[key];
+        return string.IsNullOrWhiteSpace(value)
+            ? null
+            : value.Trim();
+    }
+
     private static int ReadPositiveInt(
         IConfiguration configuration,
         string key)
@@ -98,6 +204,31 @@ public static class ServerBackendFactory
         {
             throw new InvalidOperationException(
                 $"Configuration value '{key}' must be a positive integer.");
+        }
+
+        return parsed;
+    }
+
+    private static int ReadNonNegativeInt(
+        IConfiguration configuration,
+        string key,
+        int fallback)
+    {
+        var value = configuration[key];
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        if (!int.TryParse(
+                value,
+                NumberStyles.Integer,
+                CultureInfo.InvariantCulture,
+                out var parsed) ||
+            parsed < 0)
+        {
+            throw new InvalidOperationException(
+                $"Configuration value '{key}' must be a non-negative integer.");
         }
 
         return parsed;
