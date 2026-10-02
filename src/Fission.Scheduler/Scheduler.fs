@@ -530,9 +530,14 @@ module Scheduler =
         let struct (afterReserve, remainingDecodes) =
             reserveDecodeTokens budget policy orderedDecodes initialState
 
-        let orderedPrefills = List.toArray prefills
-        if orderedPrefills.Length > 1 then
-            Array.sortInPlaceWith compareCandidates orderedPrefills
+        let orderedPrefills =
+            match prefills with
+            | [] -> Array.empty
+            | _ ->
+                let items = List.toArray prefills
+                if items.Length > 1 then
+                    Array.sortInPlaceWith compareCandidates items
+                items
 
         let finalState =
             selectMergedCandidates
