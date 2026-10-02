@@ -41,14 +41,9 @@ module Scheduler =
         sequence.Phase = Prefilling || sequence.Phase = Decoding
 
     let private deadlineTicks (sequence: ReadySequence) =
-        sequence.Deadline
-        |> Option.map _.UtcTicks
-        |> Option.defaultValue Int64.MaxValue
-
-    let private isUrgent (now: DateTimeOffset) (policy: SchedulingPolicy) (sequence: ReadySequence) =
         match sequence.Deadline with
-        | Some deadline -> deadline <= now.Add(policy.DeadlineUrgencyWindow)
-        | None -> false
+        | Some deadline -> deadline.UtcTicks
+        | None -> Int64.MaxValue
 
     let private compareReady
         (now: DateTimeOffset)
@@ -56,8 +51,16 @@ module Scheduler =
         (left: ReadySequence)
         (right: ReadySequence)
         =
-        let urgentLeft = isUrgent now policy left
-        let urgentRight = isUrgent now policy right
+        let urgentLeft, urgentRight =
+            match left.Deadline, right.Deadline with
+            | None, None -> false, false
+            | leftDeadline, rightDeadline ->
+                let urgencyCutoff = now.Add(policy.DeadlineUrgencyWindow)
+                let isUrgent deadline =
+                    match deadline with
+                    | Some value -> value <= urgencyCutoff
+                    | None -> false
+                isUrgent leftDeadline, isUrgent rightDeadline
 
         let first = compare (if urgentLeft then 0 else 1) (if urgentRight then 0 else 1)
         if first <> 0 then
