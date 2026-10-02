@@ -55,12 +55,10 @@ module Scheduler =
             Int64.MaxValue
 
     let private compareReady
-        (now: DateTimeOffset)
-        (policy: SchedulingPolicy)
+        (urgencyCutoffTicks: int64)
         (left: ReadySequence)
         (right: ReadySequence)
         =
-        let urgencyCutoffTicks = now.Add(policy.DeadlineUrgencyWindow).UtcTicks
         let urgentLeft =
             left.DeadlineUtcTicks >= 0L
             && left.DeadlineUtcTicks <= urgencyCutoffTicks
@@ -472,7 +470,9 @@ module Scheduler =
         initiallyDeferred
         rejected
         =
-        let orderedDecodes = decodes |> List.sortWith (compareReady now policy)
+        let urgencyCutoffTicks = now.Add(policy.DeadlineUrgencyWindow).UtcTicks
+        let compareCandidates = compareReady urgencyCutoffTicks
+        let orderedDecodes = decodes |> List.sortWith compareCandidates
 
         let initialState =
             { SelectedRev = []
@@ -490,7 +490,7 @@ module Scheduler =
 
         let remainingCandidates =
             remainingDecodes @ prefills
-            |> List.sortWith (compareReady now policy)
+            |> List.sortWith compareCandidates
 
         let finalState =
             remainingCandidates
