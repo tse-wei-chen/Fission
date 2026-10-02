@@ -393,11 +393,9 @@ module Scheduler =
 
         loop state orderedDecodes
 
-    let scheduleAt
-        (now: DateTimeOffset)
+    let private validateScheduleInputs
         (budget: ResourceBudget)
         (policy: SchedulingPolicy)
-        (sequences: ReadySequence list)
         =
         if budget.MaxBatchTokens < 0 then invalidArg "MaxBatchTokens" "MaxBatchTokens cannot be negative."
         if budget.AvailableKvPages < 0 then invalidArg "AvailableKvPages" "AvailableKvPages cannot be negative."
@@ -415,20 +413,48 @@ module Scheduler =
         if policy.MaxPrefillChunkTokens <= 0 then invalidArg "MaxPrefillChunkTokens" "MaxPrefillChunkTokens must be positive."
         if policy.DeadlineUrgencyWindow < TimeSpan.Zero then invalidArg "DeadlineUrgencyWindow" "DeadlineUrgencyWindow cannot be negative."
 
-        let struct (decodesRev, prefillsRev, deferredRev, rejectedRev) =
-            sequences
-            |> List.fold (fun struct (decodes, prefills, deferred, rejected) sequence ->
-                match classifyAdmission sequence with
-                | Admitted candidate when candidate.Phase = Decoding ->
-                    struct (candidate :: decodes, prefills, deferred, rejected)
-                | Admitted candidate ->
-                    struct (decodes, candidate :: prefills, deferred, rejected)
-                | DeferredAdmission deferredItem ->
-                    struct (decodes, prefills, deferredItem :: deferred, rejected)
-                | RejectedAdmission rejectedItem ->
-                    struct (decodes, prefills, deferred, rejectedItem :: rejected))
-                (struct ([], [], [], []))
+    let private classifyList (sequences: ReadySequence list) =
+        sequences
+        |> List.fold (fun struct (decodes, prefills, deferred, rejected) sequence ->
+            match classifyAdmission sequence with
+            | Admitted candidate when candidate.Phase = Decoding ->
+                struct (candidate :: decodes, prefills, deferred, rejected)
+            | Admitted candidate ->
+                struct (decodes, candidate :: prefills, deferred, rejected)
+            | DeferredAdmission deferredItem ->
+                struct (decodes, prefills, deferredItem :: deferred, rejected)
+            | RejectedAdmission rejectedItem ->
+                struct (decodes, prefills, deferred, rejectedItem :: rejected))
+            (struct ([], [], [], []))
 
+    let private classifyArray (sequences: ReadySequence array) =
+        let mutable decodesRev = []
+        let mutable prefillsRev = []
+        let mutable deferredRev = []
+        let mutable rejectedRev = []
+
+        for index = 0 to sequences.Length - 1 do
+            match classifyAdmission sequences[index] with
+            | Admitted candidate when candidate.Phase = Decoding ->
+                decodesRev <- candidate :: decodesRev
+            | Admitted candidate ->
+                prefillsRev <- candidate :: prefillsRev
+            | DeferredAdmission deferredItem ->
+                deferredRev <- deferredItem :: deferredRev
+            | RejectedAdmission rejectedItem ->
+                rejectedRev <- rejectedItem :: rejectedRev
+
+        struct (decodesRev, prefillsRev, deferredRev, rejectedRev)
+
+    let private scheduleClassifiedAt
+        (now: DateTimeOffset)
+        (budget: ResourceBudget)
+        (policy: SchedulingPolicy)
+        decodesRev
+        prefillsRev
+        deferredRev
+        rejectedRev
+        =
         let decodes = List.rev decodesRev
         let prefills = List.rev prefillsRev
         let initiallyDeferred = List.rev deferredRev
@@ -465,6 +491,44 @@ module Scheduler =
           ConsumedKvPages = finalState.UsedKvPages
           ConsumedKvBytes = finalState.UsedKvBytes
           ConsumedTransientKvBytes = finalState.UsedTransientKvBytes }
+
+    let scheduleAt
+        (now: DateTimeOffset)
+        (budget: ResourceBudget)
+        (policy: SchedulingPolicy)
+        (sequences: ReadySequence list)
+        =
+        validateScheduleInputs budget policy
+        let struct (decodesRev, prefillsRev, deferredRev, rejectedRev) =
+            classifyList sequences
+
+        scheduleClassifiedAt
+            now
+            budget
+            policy
+            decodesRev
+            prefillsRev
+            deferredRev
+            rejectedRev
+
+    let scheduleArrayAt
+        (now: DateTimeOffset)
+        (budget: ResourceBudget)
+        (policy: SchedulingPolicy)
+        (sequences: ReadySequence array)
+        =
+        validateScheduleInputs budget policy
+        let struct (decodesRev, prefillsRev, deferredRev, rejectedRev) =
+            classifyArray sequences
+
+        scheduleClassifiedAt
+            now
+            budget
+            policy
+            decodesRev
+            prefillsRev
+            deferredRev
+            rejectedRev
 
     let schedule (budget: ResourceBudget) (policy: SchedulingPolicy) (sequences: ReadySequence list) =
         scheduleAt DateTimeOffset.UtcNow budget policy sequences
