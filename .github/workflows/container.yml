@@ -6,7 +6,6 @@ on:
     paths:
       - Dockerfile
       - Dockerfile.cuda
-      - Dockerfile.cuda
       - compose.yaml
       - .dockerignore
       - .env.example
@@ -26,6 +25,7 @@ on:
     branches: [ develop ]
     paths:
       - Dockerfile
+      - Dockerfile.cuda
       - compose.yaml
       - .dockerignore
       - .env.example
