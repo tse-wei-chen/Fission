@@ -66,6 +66,7 @@ type ScheduledSequence =
       KvByteGrant: int64
       TransientKvByteGrant: int64 }
 
+[<Struct>]
 type DeferredSequence =
     { Sequence: ReadySequence
       Reason: DeferredReason }
