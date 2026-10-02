@@ -108,11 +108,31 @@ static async Task ValidateBackendCompositionAsync()
         await using var backend = ServerBackendFactory.Create(onnx, device);
         Require(
             backend.Name == "onnxruntime/decoder/optimum-legacy-fp32-greedy",
-            "ONNX composition must build the Optimum legacy decoder backend.");
+            "CPU ONNX composition must build the host-KV Optimum legacy decoder backend.");
         Require(
             backend.Device == device,
-            "ONNX backend composition must preserve the configured device.");
+            "ONNX backend composition must preserve the configured logical device.");
 
+        onnx["Fission:OnnxExecutionProvider"] = "not-an-ep";
+        RequireThrows<InvalidOperationException>(
+            () => ServerBackendFactory.Create(onnx, device),
+            "Unknown ONNX execution providers must fail during composition.");
+
+        onnx["Fission:OnnxExecutionProvider"] = "cuda";
+        onnx["Fission:CudaDeviceId"] = "-1";
+        RequireThrows<InvalidOperationException>(
+            () => ServerBackendFactory.Create(onnx, device),
+            "CUDA device ids must be validated before loading the CUDA runtime.");
+
+        onnx["Fission:CudaDeviceId"] = "0";
+        onnx["Fission:CudaRuntimeLibraryPath"] = Path.Combine(
+            Path.GetTempPath(),
+            $"missing-cudart-{Guid.NewGuid():N}");
+        RequireThrows<DllNotFoundException>(
+            () => ServerBackendFactory.Create(onnx, device),
+            "Explicit CUDA composition must fail fast when its configured CUDA Runtime library cannot be loaded.");
+
+        onnx["Fission:OnnxExecutionProvider"] = "cpu";
         onnx["Fission:VocabularySize"] = "0";
         RequireThrows<InvalidOperationException>(
             () => ServerBackendFactory.Create(onnx, device),
