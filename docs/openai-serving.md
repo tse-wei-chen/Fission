@@ -136,6 +136,10 @@ CUDA mode accepts:
 
 - `Fission:CudaDeviceId`: non-negative CUDA ordinal; defaults to `0`.
 - `Fission:CudaRuntimeLibraryPath`: optional explicit CUDA Runtime library.
+- `Fission:CudaPageLockedDecodeLogits`: experimental opt-in decode hot path.
+  When `true`, decode logits are written into reusable CUDA page-locked host
+  buffers before CPU greedy sampling. Prefill logits remain on the existing
+  pageable scratch path. Defaults to `false`.
 - `Fission:CudaPoolMaxRetainedBytes`: maximum idle KV/device-buffer bytes
   retained for exact-size reuse; defaults to 256 MiB. Set `0` to disable idle
   retention.

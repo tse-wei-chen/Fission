@@ -125,6 +125,31 @@ After this gate is stable, use
 `-Manifest benchmarks/serving/workloads.json -Repetitions 3` for the larger
 concurrency matrix.
 
+### A/B page-locked decode logits
+
+The CUDA binding can optionally use reusable CUDA page-locked host memory for
+**decode logits only**. The model still produces the same FP32 logits and CPU
+greedy sampling is unchanged; the experiment isolates the host destination used
+for the CUDA-to-host logits transfer.
+
+Run a baseline and an experimental pass with identical hardware, manifest and
+repetition count. Use different labels:
+
+```powershell
+# Baseline
+pwsh ./eng/run-nvidia-serving-benchmark.ps1 ... `
+  -Label fission-cuda
+
+# Experimental
+pwsh ./eng/run-nvidia-serving-benchmark.ps1 ... `
+  -Label fission-cuda-pinned `
+  -PageLockedDecodeLogits
+```
+
+Compare TPOT first, especially at concurrency 4 and 8, then output-token
+throughput and TTFT. Treat a single run as directional only; use at least three
+repetitions before changing the production default.
+
 ## Aggregate reports
 
 Create Markdown and CSV summaries:

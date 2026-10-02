@@ -32,7 +32,11 @@ var allocator = new CudaDeviceMemoryAllocator(
 var logitsPool = new ScriptedFloatPool(
     new[]
     {
-        new[] { 0f, 10f, 0f, 0f, 0f, 0f, 10f, 0f },
+        new[] { 0f, 10f, 0f, 0f, 0f, 0f, 10f, 0f }
+    });
+var decodeLogitsAllocator = new ScriptedHostStagingAllocator(
+    new[]
+    {
         new[] { 0f, 0f, 10f, 0f, 0f, 0f, 0f, 10f },
         new[] { 10f, 0f, 0f, 0f }
     });
@@ -139,11 +143,14 @@ using var binding = new OptimumLegacyCudaFloatDecoderBinding(
     profile,
     allocator,
     FakeRun,
-    scratchFloatPool: logitsPool);
+    scratchFloatPool: logitsPool,
+    decodeLogitsHostAllocator: decodeLogitsAllocator);
 
 Require(binding.DeviceId == deviceId, "CUDA binding must expose its allocator device ordinal.");
 Require(binding.CudaResidentStateFormatId.Contains("l1:h1:d1", StringComparison.Ordinal),
     "CUDA resident-state format must encode physical KV geometry.");
+Require(binding.PageLockedDecodeLogitsEnabled,
+    "Configured decode logits host staging must enable the page-locked decode path.");
 
 var modelId = new ModelId("cuda-binding-spec");
 var firstId = SequenceId.New();
@@ -242,8 +249,16 @@ Require(cuda.OperationDevices.All(static current => current == deviceId),
     "CUDA binding allocations and frees must execute under the configured device ordinal.");
 Require(cuda.CurrentDevice == 7,
     "CUDA binding allocation/free operations must restore the ambient device.");
-Require(logitsPool.RentCount == 3 && logitsPool.ReturnCount == 3,
-    "Every ORT run must return its host logits scratch lease.");
+Require(logitsPool.RentCount == 1 && logitsPool.ReturnCount == 1,
+    "Prefill must keep using ordinary host logits scratch.");
+Require(binding.PageLockedDecodeLogitsRentCount == 2,
+    "Dense and singleton decode must each rent page-locked host logits staging.");
+Require(decodeLogitsAllocator.AllocateCount == 2,
+    "Distinct dense and singleton decode shapes must allocate exact-length host staging buffers.");
+
+binding.Dispose();
+Require(decodeLogitsAllocator.DisposeCount == 2,
+    "Disposing the CUDA binding must release retained decode logits staging buffers.");
 
 Console.WriteLine(
     $"Fission CUDA Optimum binding specs passed: runs={binding.OrtRunCount}, " +
@@ -286,6 +301,58 @@ sealed class ScriptedFloatPool : ArrayPool<float>
         _ = array;
         _ = clearArray;
         Interlocked.Increment(ref _returnCount);
+    }
+}
+
+sealed class ScriptedHostStagingAllocator : IHostStagingFloatBufferAllocator
+{
+    private readonly Queue<float[]> _scripts;
+    private int _allocateCount;
+    private int _disposeCount;
+
+    public ScriptedHostStagingAllocator(IEnumerable<float[]> scripts)
+    {
+        _scripts = new Queue<float[]>(scripts.Select(static values => values.ToArray()));
+    }
+
+    public int AllocateCount => Volatile.Read(ref _allocateCount);
+    public int DisposeCount => Volatile.Read(ref _disposeCount);
+
+    public IHostStagingFloatBuffer Allocate(int length)
+    {
+        Interlocked.Increment(ref _allocateCount);
+        if (_scripts.Count == 0)
+        {
+            throw new InvalidOperationException("No scripted decode logits remain.");
+        }
+
+        var values = _scripts.Dequeue();
+        if (values.Length != length)
+        {
+            throw new InvalidOperationException(
+                $"Scripted decode logits length {values.Length} does not match requested {length}.");
+        }
+
+        return new ScriptedHostStagingBuffer(values, this);
+    }
+
+    private sealed class ScriptedHostStagingBuffer(
+        float[] values,
+        ScriptedHostStagingAllocator owner) : IHostStagingFloatBuffer
+    {
+        private float[]? _values = values;
+
+        public Memory<float> Memory =>
+            _values ??
+            throw new ObjectDisposedException(nameof(ScriptedHostStagingBuffer));
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _values, null) is not null)
+            {
+                Interlocked.Increment(ref owner._disposeCount);
+            }
+        }
     }
 }
 

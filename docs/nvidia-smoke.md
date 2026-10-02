@@ -152,3 +152,32 @@ reports.
 
 Use `-Manifest benchmarks/serving/workloads.json` to move from the small gate
 to the full concurrency suite.
+
+
+## First serving baseline
+
+The first RTX 3060 serving benchmark on 2026-10-02 used
+`workloads.gpu-smoke.json` with one repetition and established this baseline:
+
+| Workload | C | Output tok/s | TTFT p50 ms | TPOT p50 ms | E2E p95 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| gpu-short | 1 | 55.55 | 35.98 | 17.16 | 672.90 |
+| gpu-short | 4 | 94.96 | 100.70 | 39.97 | 1429.17 |
+| gpu-short | 8 | 173.06 | 121.16 | 43.52 | 1522.96 |
+| gpu-decode | 1 | 47.46 | 46.65 | 20.83 | 2800.20 |
+| gpu-decode | 4 | 78.32 | 136.73 | 50.30 | 6608.85 |
+| gpu-decode | 8 | 123.50 | 211.14 | 63.63 | 8319.86 |
+
+All requests succeeded and usage accounting was exact. Output throughput still
+increased through concurrency 8, while TPOT rose by roughly 2.5x for
+`gpu-short` and 3.1x for `gpu-decode` versus concurrency 1. That makes the
+batched CUDA step itself, including host/device transfer and logits handling, the
+next optimization target rather than the scheduler's ability to form a batch.
+
+The CUDA binding currently keeps KV device-resident but leaves decode logits
+host-backed. For vocabulary 49,152, an 8-row FP32 decode batch writes about
+1.5 MiB of logits to host memory per token step. The
+`Fission:CudaPageLockedDecodeLogits` experiment and
+`-PageLockedDecodeLogits` benchmark switch exist to measure whether replacing
+the pageable decode-logits destination with reusable CUDA page-locked memory
+improves TPOT on this host.

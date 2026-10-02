@@ -136,6 +136,10 @@ public static class ServerBackendFactory
     {
         var cudaDeviceId = ReadCudaDeviceId(configuration);
         var runtimeLibraryPath = ReadOptional(configuration, "Fission:CudaRuntimeLibraryPath");
+        var pageLockedDecodeLogits = ReadBoolean(
+            configuration,
+            "Fission:CudaPageLockedDecodeLogits",
+            fallback: false);
         var pool = new CudaPooledDeviceMemoryAllocator(
             new CudaDeviceMemoryPoolOptions
             {
@@ -166,10 +170,22 @@ public static class ServerBackendFactory
                 },
                 poolController);
 
+            IHostStagingFloatBufferAllocator? decodeLogitsHostAllocator = null;
+            if (pageLockedDecodeLogits)
+            {
+                decodeLogitsHostAllocator =
+                    new CudaPageLockedHostStagingFloatBufferAllocator(
+                        new CudaPageLockedHostStagingAllocatorOptions
+                        {
+                            RuntimeLibraryPath = runtimeLibraryPath
+                        });
+            }
+
             var binding = new OptimumLegacyCudaFloatDecoderBinding(
                 profile,
                 pool,
-                eosTokenIds);
+                eosTokenIds,
+                decodeLogitsHostAllocator: decodeLogitsHostAllocator);
             adapter = new DecoderOnlyOnnxExecutionAdapter(binding);
 
             return new OnnxRuntimeBackend(
@@ -213,6 +229,26 @@ public static class ServerBackendFactory
 
     private static int ReadCudaDeviceId(IConfiguration configuration) =>
         ReadNonNegativeInt(configuration, "Fission:CudaDeviceId", fallback: 0);
+
+    private static bool ReadBoolean(
+        IConfiguration configuration,
+        string key,
+        bool fallback)
+    {
+        var value = configuration[key];
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        if (bool.TryParse(value, out var parsed))
+        {
+            return parsed;
+        }
+
+        throw new InvalidOperationException(
+            $"Configuration value '{key}' must be 'true' or 'false'.");
+    }
 
     private static string ReadRequired(
         IConfiguration configuration,

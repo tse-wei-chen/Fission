@@ -152,6 +152,12 @@ static async Task ValidateBackendCompositionAsync()
             "CUDA composition must validate the device ordinal before loading CUDA Runtime.");
 
         onnx["Fission:CudaDeviceId"] = "0";
+        onnx["Fission:CudaPageLockedDecodeLogits"] = "not-a-bool";
+        RequireThrows<InvalidOperationException>(
+            () => ServerBackendFactory.Create(onnx, new DeviceId("cuda:0")),
+            "CUDA page-locked decode logits configuration must validate before loading CUDA Runtime.");
+
+        onnx["Fission:CudaPageLockedDecodeLogits"] = null;
         onnx["Fission:CudaPoolMaxRetainedBytes"] = "-1";
         RequireThrows<InvalidOperationException>(
             () => ServerBackendFactory.Create(onnx, new DeviceId("cuda:0")),
