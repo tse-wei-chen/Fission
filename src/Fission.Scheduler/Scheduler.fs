@@ -51,9 +51,9 @@ module Scheduler =
         (left: ReadySequence)
         (right: ReadySequence)
         =
-        let urgentLeft, urgentRight =
+        let struct (urgentLeft, urgentRight) =
             match left.Deadline, right.Deadline with
-            | None, None -> false, false
+            | None, None -> struct (false, false)
             | leftDeadline, rightDeadline ->
                 let urgencyCutoff = now.Add(policy.DeadlineUrgencyWindow)
                 let urgentLeft =
@@ -64,7 +64,7 @@ module Scheduler =
                     match rightDeadline with
                     | Some value -> value <= urgencyCutoff
                     | None -> false
-                urgentLeft, urgentRight
+                struct (urgentLeft, urgentRight)
 
         let first = compare (if urgentLeft then 0 else 1) (if urgentRight then 0 else 1)
         if first <> 0 then
@@ -330,10 +330,10 @@ module Scheduler =
 
         let rec loop current remaining =
             if current.UsedTokens >= reserveTarget then
-                current, remaining
+                struct (current, remaining)
             else
                 match remaining with
-                | [] -> current, []
+                | [] -> struct (current, [])
                 | sequence :: tail ->
                     let next = trySelect budget policy current sequence
                     loop next tail
@@ -394,7 +394,7 @@ module Scheduler =
               UsedDeviceTransientBytes = []
               UsedDeviceSequences = [] }
 
-        let afterReserve, remainingDecodes =
+        let struct (afterReserve, remainingDecodes) =
             reserveDecodeTokens budget policy orderedDecodes initialState
 
         let remainingCandidates =
