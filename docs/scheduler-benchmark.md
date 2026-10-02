@@ -21,3 +21,10 @@ Reported columns:
 Current scenarios cover a single decode, a 32-sequence mixed single-device batch, and a 128-sequence mixed four-device batch.
 
 These numbers are primarily for local before/after comparisons. CI also runs a short reporting sample so allocation changes are visible in build logs, but there is no timing or allocation threshold: hosted-runner timing is noisy. Allocation deltas are generally more stable than wall-clock deltas, but should still be compared on the same runtime and machine.
+
+
+## Comparing scheduler changes
+
+For a scheduler hot-path change, compare the same scenario and iteration count before and after the code change. Prefer `bytes/op` as the first signal because hosted-runner timing can vary between jobs.
+
+When using CI for an A/B check, capture a benchmark-neutral baseline run from the current `develop` state, then run the changed branch with the same benchmark source and iteration count. Treat `ns/op` as supporting evidence rather than a merge threshold.
