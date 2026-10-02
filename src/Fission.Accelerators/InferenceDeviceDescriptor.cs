@@ -27,6 +27,13 @@ public sealed record InferenceDeviceDescriptor
             throw new ArgumentException("Device id cannot be empty.", nameof(device));
         }
 
+        if (string.IsNullOrWhiteSpace(provider.Value))
+        {
+            throw new ArgumentException(
+                "Execution provider id cannot be empty.",
+                nameof(provider));
+        }
+
         if (ordinal is < 0)
         {
             throw new ArgumentOutOfRangeException(nameof(ordinal), "Device ordinal cannot be negative.");
