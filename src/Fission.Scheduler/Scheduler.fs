@@ -56,11 +56,15 @@ module Scheduler =
             | None, None -> false, false
             | leftDeadline, rightDeadline ->
                 let urgencyCutoff = now.Add(policy.DeadlineUrgencyWindow)
-                let isUrgent deadline =
-                    match deadline with
+                let urgentLeft =
+                    match leftDeadline with
                     | Some value -> value <= urgencyCutoff
                     | None -> false
-                isUrgent leftDeadline, isUrgent rightDeadline
+                let urgentRight =
+                    match rightDeadline with
+                    | Some value -> value <= urgencyCutoff
+                    | None -> false
+                urgentLeft, urgentRight
 
         let first = compare (if urgentLeft then 0 else 1) (if urgentRight then 0 else 1)
         if first <> 0 then
