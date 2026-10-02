@@ -26,7 +26,7 @@ The current transport supports the common subset used by:
 
 The server does not own model tokenization semantics. `ITextTokenCodec` owns prompt encoding, chat-template encoding, and creation of a request-scoped `ITextTokenDecoder`. `DeterministicTextTokenCodec` exists only for the zero-model deterministic backend and transport specifications. Real model integrations must replace it with the tokenizer/chat template that matches the loaded model.
 
-Generated text is decoded with request-local state rather than by decoding each token id independently. `ITextTokenDecoder.Append` may return an empty string when a tokenizer needs later ids to complete a stable text fragment; streaming endpoints suppress those empty fragments. `Complete` flushes any remaining stable text before the terminal OpenAI chunk. This boundary is required by byte-level/fallback tokenizers where one Unicode fragment may span multiple generated token ids.
+Generated text is decoded with request-local state rather than by decoding each token id independently. `ITextTokenDecoder.Append` may return an empty string when a tokenizer needs later ids to complete a stable text fragment; streaming endpoints suppress those empty fragments. `Complete` flushes any remaining stable text before the terminal OpenAI chunk. The decoder is request-scoped and disposable so production codecs may lease native tokenizer state without globally serializing concurrent requests. This boundary is required by byte-level/fallback tokenizers where one Unicode fragment may span multiple generated token ids.
 
 ## Cancellation ownership
 
