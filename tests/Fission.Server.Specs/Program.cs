@@ -126,6 +126,12 @@ static async Task ValidateBackendCompositionAsync()
 
 await ValidateBackendCompositionAsync();
 
+var deterministicDecoder = new DeterministicTextTokenCodec().CreateDecoder();
+Require(
+    deterministicDecoder.Append(7) == "<7>" &&
+    deterministicDecoder.Complete() == string.Empty,
+    "Deterministic text decoding must preserve the existing token rendering contract.");
+
 var device = new DeviceId("cpu:server-spec");
 var kvPool = new KvPagePool(capacity: 1024, tokensPerPage: 4);
 await using var deviceExecutor = await ContinuousBatchExecutor.CreateAsync(
@@ -150,7 +156,7 @@ await using var worker = new InferenceWorker(
 var builder = WebApplication.CreateBuilder();
 builder.WebHost.UseUrls("http://127.0.0.1:0");
 var app = builder.Build();
-OpenAiEndpoints.Map(app, worker, new DeterministicTextTokenCodec());
+OpenAiEndpoints.Map(app, worker, new BufferedSpecTextTokenCodec());
 await app.StartAsync();
 
 var server = app.Services.GetRequiredService<IServer>();
@@ -178,6 +184,9 @@ using (var completionJson = JsonDocument.Parse(await completionResponse.Content.
     Require(root.GetProperty("object").GetString() == "text_completion", "Completion object type must match OpenAI transport shape.");
     Require(root.GetProperty("choices")[0].GetProperty("finish_reason").GetString() == "length", "max_tokens completion must finish with length.");
     Require(root.GetProperty("usage").GetProperty("completion_tokens").GetInt32() == 3, "Completion usage must report generated token count.");
+    Require(
+        root.GetProperty("choices")[0].GetProperty("text").GetString()?.EndsWith("[done]", StringComparison.Ordinal) == true,
+        "Non-stream completion must include text flushed by the request-scoped decoder.");
 }
 Require(runtime.SequenceCount == 0 && kvPool.AllocatedPages == 0, "Non-stream completion must release sequence and KV ownership.");
 
@@ -221,8 +230,40 @@ using (var reader = new StreamReader(chatBody))
         }
     }
 }
-Require(chatData.Count >= 5, "Chat SSE must include role, token chunks, terminal chunk, and [DONE].");
+Require(chatData.Count >= 5, "Chat SSE must include role, decoded text chunks, terminal chunk, and [DONE].");
 Require(chatData[^1] == "[DONE]", "Chat SSE must terminate with [DONE].");
+
+var chatContentChunks = chatData
+    .Where(static payload => payload != "[DONE]")
+    .Select(static payload => JsonDocument.Parse(payload))
+    .Where(static document =>
+    {
+        var delta = document.RootElement.GetProperty("choices")[0].GetProperty("delta");
+        return delta.TryGetProperty("content", out _);
+    })
+    .ToArray();
+try
+{
+    Require(
+        chatContentChunks.Length == 2,
+        "Contextual chat decoding must suppress empty intermediate chunks and emit one buffered chunk plus final decoder flush.");
+    Require(
+        chatContentChunks.All(static document =>
+            !string.IsNullOrEmpty(
+                document.RootElement.GetProperty("choices")[0]
+                    .GetProperty("delta")
+                    .GetProperty("content")
+                    .GetString())),
+        "Streaming transport must not emit empty decoded text chunks.");
+}
+finally
+{
+    foreach (var document in chatContentChunks)
+    {
+        document.Dispose();
+    }
+}
+
 var terminalChat = chatData[^2];
 using (var terminalJson = JsonDocument.Parse(terminalChat))
 {
@@ -274,6 +315,45 @@ await app.StopAsync();
 
 Console.WriteLine(
     $"Fission server specs passed: chatEvents={chatData.Count}, sequences={runtime.SequenceCount}, kv={kvPool.AllocatedPages}/{kvPool.Capacity}.");
+
+sealed class BufferedSpecTextTokenCodec : ITextTokenCodec
+{
+    private readonly DeterministicTextTokenCodec _promptCodec = new();
+
+    public int[] EncodePrompt(string prompt) => _promptCodec.EncodePrompt(prompt);
+
+    public int[] EncodeChat(IReadOnlyList<OpenAiChatMessage> messages) =>
+        _promptCodec.EncodeChat(messages);
+
+    public ITextTokenDecoder CreateDecoder() => new Decoder();
+
+    private sealed class Decoder : ITextTokenDecoder
+    {
+        private int? _pending;
+
+        public string Append(int tokenId)
+        {
+            if (_pending is null)
+            {
+                _pending = tokenId;
+                return string.Empty;
+            }
+
+            var text = $"[{_pending.Value},{tokenId}]";
+            _pending = null;
+            return text;
+        }
+
+        public string Complete()
+        {
+            var trailing = _pending is { } tokenId
+                ? $"[{tokenId}]"
+                : string.Empty;
+            _pending = null;
+            return trailing + "[done]";
+        }
+    }
+}
 
 sealed class SlowBackend : IInferenceBackend
 {
