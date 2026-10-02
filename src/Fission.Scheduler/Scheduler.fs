@@ -9,6 +9,12 @@ module Scheduler =
         | DeferredAdmission of DeferredSequence
         | RejectedAdmission of RejectedSequence
 
+    [<Struct>]
+    type private DeviceUsage =
+        { Device: Fission.Abstractions.DeviceId
+          TransientBytes: int64
+          Sequences: int }
+
     type private SelectionState =
         { SelectedRev: ScheduledSequence list
           DeferredRev: DeferredSequence list
@@ -17,8 +23,7 @@ module Scheduler =
           UsedKvPages: int
           UsedKvBytes: int64
           UsedTransientKvBytes: int64
-          UsedDeviceTransientBytes: struct (Fission.Abstractions.DeviceId * int64) list
-          UsedDeviceSequences: struct (Fission.Abstractions.DeviceId * int) list }
+          UsedDevices: DeviceUsage list }
 
     let rec private containsDevice
         (device: Fission.Abstractions.DeviceId)
@@ -161,58 +166,52 @@ module Scheduler =
     let private tryFindDeviceSequenceBudget (budget: ResourceBudget) device =
         tryFindDeviceValue device budget.MaxDeviceSequences
 
-    let rec private tryFindUsedDeviceValue
+    let rec private tryFindDeviceUsage
         (device: Fission.Abstractions.DeviceId)
-        (values: struct (Fission.Abstractions.DeviceId * 'T) list)
+        (usages: DeviceUsage list)
         =
-        match values with
+        match usages with
         | [] -> ValueNone
-        | struct (candidate, value) :: tail ->
-            if candidate = device then
-                ValueSome value
+        | usage :: tail ->
+            if usage.Device = device then
+                ValueSome usage
             else
-                tryFindUsedDeviceValue device tail
+                tryFindDeviceUsage device tail
 
-    let private usedDeviceBytes (state: SelectionState) device =
-        match tryFindUsedDeviceValue device state.UsedDeviceTransientBytes with
-        | ValueSome usedBytes -> usedBytes
+    let private usedDeviceBytes usage =
+        match usage with
+        | ValueSome current -> current.TransientBytes
         | ValueNone -> 0L
 
-    let private usedDeviceSequences (state: SelectionState) device =
-        match tryFindUsedDeviceValue device state.UsedDeviceSequences with
-        | ValueSome usedSequences -> usedSequences
+    let private usedDeviceSequences usage =
+        match usage with
+        | ValueSome current -> current.Sequences
         | ValueNone -> 0
 
-    let rec private removeUsedDeviceValue
+    let rec private removeDeviceUsage
         (device: Fission.Abstractions.DeviceId)
-        (values: struct (Fission.Abstractions.DeviceId * 'T) list)
+        (usages: DeviceUsage list)
         =
-        match values with
+        match usages with
         | [] -> struct (ValueNone, [])
-        | struct (candidate, value) :: tail when candidate = device ->
-            struct (ValueSome value, tail)
+        | current :: tail when current.Device = device ->
+            struct (ValueSome current, tail)
         | head :: tail ->
             let struct (current, withoutDevice) =
-                removeUsedDeviceValue device tail
+                removeDeviceUsage device tail
             struct (current, head :: withoutDevice)
 
-    let private addDeviceBytes device byteGrant used =
+    let private addDeviceUsage device byteGrant sequenceGrant used =
         let struct (current, withoutDevice) =
-            removeUsedDeviceValue device used
-        let currentBytes =
+            removeDeviceUsage device used
+        let struct (currentBytes, currentSequences) =
             match current with
-            | ValueSome usedBytes -> usedBytes
-            | ValueNone -> 0L
-        struct (device, currentBytes + byteGrant) :: withoutDevice
-
-    let private addDeviceSequence device used =
-        let struct (current, withoutDevice) =
-            removeUsedDeviceValue device used
-        let currentSequences =
-            match current with
-            | ValueSome usedSequences -> usedSequences
-            | ValueNone -> 0
-        struct (device, currentSequences + 1) :: withoutDevice
+            | ValueSome usage -> struct (usage.TransientBytes, usage.Sequences)
+            | ValueNone -> struct (0L, 0)
+        { Device = device
+          TransientBytes = currentBytes + byteGrant
+          Sequences = currentSequences + sequenceGrant }
+        :: withoutDevice
 
     let private classifyAdmission (sequence: ReadySequence) =
         if not (isRunnable sequence) then
@@ -244,12 +243,29 @@ module Scheduler =
                 match sequence.ExecutionDevice with
                 | Some device -> tryFindDeviceSequenceBudget budget device
                 | None -> ValueNone
+            let deviceMemoryBudget =
+                match sequence.ExecutionDevice with
+                | Some device -> tryFindDeviceBudget budget device
+                | None -> ValueNone
+            let tracksDeviceMemory =
+                match deviceMemoryBudget with
+                | ValueSome _ -> true
+                | ValueNone -> false
+            let tracksDeviceSequences =
+                match deviceSequenceBudget with
+                | ValueSome _ -> true
+                | ValueNone -> false
+            let currentDeviceUsage =
+                match sequence.ExecutionDevice with
+                | Some device when tracksDeviceMemory || tracksDeviceSequences ->
+                    tryFindDeviceUsage device state.UsedDevices
+                | _ -> ValueNone
 
             let deviceSequenceCapacityReached =
-                match sequence.ExecutionDevice, deviceSequenceBudget with
-                | Some device, ValueSome maxSequences ->
-                    usedDeviceSequences state device >= maxSequences
-                | _ -> false
+                match deviceSequenceBudget with
+                | ValueSome maxSequences ->
+                    usedDeviceSequences currentDeviceUsage >= maxSequences
+                | ValueNone -> false
 
             if deviceSequenceCapacityReached then
                 { state with
@@ -273,17 +289,12 @@ module Scheduler =
                     let availableTransientKvBytes = budget.AvailableKvBytes - state.UsedTransientKvBytes
                     let transientKvByteTokenCapacity =
                         tokensWritableWithTransientKvBytes sequence availableTransientKvBytes
-                    let deviceMemoryBudget =
-                        match sequence.ExecutionDevice with
-                        | Some device -> tryFindDeviceBudget budget device
-                        | None -> ValueNone
-
                     let deviceMemoryTokenCapacity =
-                        match sequence.ExecutionDevice, deviceMemoryBudget with
-                        | Some device, ValueSome availableBytes ->
-                            let remainingBytes = availableBytes - usedDeviceBytes state device
+                        match deviceMemoryBudget with
+                        | ValueSome availableBytes ->
+                            let remainingBytes = availableBytes - usedDeviceBytes currentDeviceUsage
                             tokensWritableWithTransientKvBytes sequence remainingBytes
-                        | _ -> Int32.MaxValue
+                        | ValueNone -> Int32.MaxValue
                     let tokenGrant =
                         min
                             desiredTokens
@@ -307,15 +318,14 @@ module Scheduler =
                         let kvByteGrant = int64 tokenGrant * sequence.KvBytesPerToken
                         let transientKvByteGrant = transientKvBytesForGrant sequence tokenGrant
                         let nextDeviceUsage =
-                            match sequence.ExecutionDevice, deviceMemoryBudget with
-                            | Some device, ValueSome _ ->
-                                addDeviceBytes device transientKvByteGrant state.UsedDeviceTransientBytes
-                            | _ -> state.UsedDeviceTransientBytes
-                        let nextDeviceSequenceUsage =
-                            match sequence.ExecutionDevice, deviceSequenceBudget with
-                            | Some device, ValueSome _ ->
-                                addDeviceSequence device state.UsedDeviceSequences
-                            | _ -> state.UsedDeviceSequences
+                            match sequence.ExecutionDevice with
+                            | Some device when tracksDeviceMemory || tracksDeviceSequences ->
+                                addDeviceUsage
+                                    device
+                                    (if tracksDeviceMemory then transientKvByteGrant else 0L)
+                                    (if tracksDeviceSequences then 1 else 0)
+                                    state.UsedDevices
+                            | _ -> state.UsedDevices
                         { state with
                             SelectedRev =
                                 { Sequence = sequence
@@ -329,8 +339,7 @@ module Scheduler =
                             UsedKvPages = state.UsedKvPages + kvPageGrant
                             UsedKvBytes = state.UsedKvBytes + kvByteGrant
                             UsedTransientKvBytes = state.UsedTransientKvBytes + transientKvByteGrant
-                            UsedDeviceTransientBytes = nextDeviceUsage
-                            UsedDeviceSequences = nextDeviceSequenceUsage }
+                            UsedDevices = nextDeviceUsage }
 
     let private reserveDecodeTokens
         (budget: ResourceBudget)
@@ -403,8 +412,7 @@ module Scheduler =
               UsedKvPages = 0
               UsedKvBytes = 0L
               UsedTransientKvBytes = 0L
-              UsedDeviceTransientBytes = []
-              UsedDeviceSequences = [] }
+              UsedDevices = [] }
 
         let struct (afterReserve, remainingDecodes) =
             reserveDecodeTokens budget policy orderedDecodes initialState
