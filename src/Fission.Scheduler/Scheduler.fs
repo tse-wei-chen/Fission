@@ -46,7 +46,7 @@ module Scheduler =
             containsDevice device tail || hasDuplicateDevice tail
 
     let private isRunnable (sequence: ReadySequence) =
-        sequence.Phase = Prefilling || sequence.Phase = Decoding
+        sequence.Phase = Fission.Abstractions.Scheduling.SchedulingPhase.Prefilling || sequence.Phase = Fission.Abstractions.Scheduling.SchedulingPhase.Decoding
 
     let private deadlineTicks (sequence: ReadySequence) =
         if sequence.DeadlineUtcTicks >= 0L then
@@ -267,7 +267,7 @@ module Scheduler =
             RejectedAdmission { Sequence = sequence; Reason = InvalidKvPageSize }
         elif sequence.KvBytesPerToken < 0L then
             RejectedAdmission { Sequence = sequence; Reason = InvalidKvBytesPerToken }
-        elif sequence.Phase = Decoding && sequence.TokenDemand <> 1 then
+        elif sequence.Phase = Fission.Abstractions.Scheduling.SchedulingPhase.Decoding && sequence.TokenDemand <> 1 then
             RejectedAdmission { Sequence = sequence; Reason = InvalidDecodeQuantum }
         else
             Admitted sequence
@@ -320,7 +320,7 @@ module Scheduler =
                         DeferredRev = { Sequence = sequence; Reason = TokenBudget } :: state.DeferredRev }
                 else
                     let desiredTokens =
-                        if sequence.Phase = Decoding then
+                        if sequence.Phase = Fission.Abstractions.Scheduling.SchedulingPhase.Decoding then
                             1
                         else
                             min sequence.TokenDemand policy.MaxPrefillChunkTokens
@@ -618,7 +618,7 @@ module Scheduler =
         sequences
         |> List.fold (fun struct (decodes, prefills, deferred, rejected) sequence ->
             match classifyAdmission sequence with
-            | Admitted candidate when candidate.Phase = Decoding ->
+            | Admitted candidate when candidate.Phase = Fission.Abstractions.Scheduling.SchedulingPhase.Decoding ->
                 struct (candidate :: decodes, prefills, deferred, rejected)
             | Admitted candidate ->
                 struct (decodes, candidate :: prefills, deferred, rejected)
@@ -636,7 +636,7 @@ module Scheduler =
 
         for index = sequences.Length - 1 downto 0 do
             match classifyAdmission sequences[index] with
-            | Admitted candidate when candidate.Phase = Decoding ->
+            | Admitted candidate when candidate.Phase = Fission.Abstractions.Scheduling.SchedulingPhase.Decoding ->
                 decodes <- candidate :: decodes
             | Admitted candidate ->
                 prefills <- candidate :: prefills
@@ -659,7 +659,7 @@ module Scheduler =
         for index = sequences.Count - 1 downto 0 do
             let sequence = mapping sequences[index]
             match classifyAdmission sequence with
-            | Admitted candidate when candidate.Phase = Decoding ->
+            | Admitted candidate when candidate.Phase = Fission.Abstractions.Scheduling.SchedulingPhase.Decoding ->
                 decodes <- candidate :: decodes
             | Admitted candidate ->
                 prefills <- candidate :: prefills
@@ -683,7 +683,7 @@ module Scheduler =
         for index = sequences.Count - 1 downto 0 do
             let sequence = mapping sequences[index]
             match classifyAdmission sequence with
-            | Admitted candidate when candidate.Phase = Decoding ->
+            | Admitted candidate when candidate.Phase = Fission.Abstractions.Scheduling.SchedulingPhase.Decoding ->
                 workspace[decodeCount] <- candidate
                 decodeCount <- decodeCount + 1
             | Admitted candidate ->
