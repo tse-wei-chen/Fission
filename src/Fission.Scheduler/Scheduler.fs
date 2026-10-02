@@ -15,6 +15,7 @@ module Scheduler =
           TransientBytes: int64
           Sequences: int }
 
+    [<Struct>]
     type private SelectionState =
         { SelectedRev: ScheduledSequence list
           DeferredRev: DeferredSequence list
