@@ -20,4 +20,4 @@ Reported columns:
 
 Current scenarios cover a single decode, a 32-sequence mixed single-device batch, and a 128-sequence mixed four-device batch.
 
-These numbers are for local before/after comparisons. They are not a CI performance gate because hosted-runner timing is noisy. Allocation deltas are generally more stable than wall-clock deltas, but should still be compared on the same runtime and machine.
+These numbers are primarily for local before/after comparisons. CI also runs a short reporting sample so allocation changes are visible in build logs, but there is no timing or allocation threshold: hosted-runner timing is noisy. Allocation deltas are generally more stable than wall-clock deltas, but should still be compared on the same runtime and machine.
