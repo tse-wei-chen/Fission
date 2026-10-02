@@ -96,6 +96,20 @@ catch (ArgumentOutOfRangeException)
 }
 Require(invalidOrdinalRejected, "Negative ordinals must be rejected.");
 
+var defaultProviderRejected = false;
+try
+{
+    _ = new InferenceDeviceDescriptor(
+        new DeviceId("invalid-provider:0"),
+        AcceleratorKind.Custom,
+        default);
+}
+catch (ArgumentException)
+{
+    defaultProviderRejected = true;
+}
+Require(defaultProviderRejected, "Default/empty execution-provider ids must be rejected.");
+
 var discovered = await InferenceDeviceCatalog.DiscoverAsync(new IInferenceDeviceDiscovery[]
 {
     new StaticDiscovery(
@@ -132,16 +146,24 @@ Require(discovered.FindByProvider(KnownExecutionProviders.Qnn).Single().Kind == 
 Console.WriteLine(
     $"Fission accelerator catalog specs passed: registered={catalog.Count}, discovered={discovered.Count}.");
 
-sealed class StaticDiscovery(
-    string name,
-    params InferenceDeviceDescriptor[] devices) : IInferenceDeviceDiscovery
+sealed class StaticDiscovery : IInferenceDeviceDiscovery
 {
-    public string Name { get; } = name;
+    private readonly InferenceDeviceDescriptor[] _devices;
+
+    public StaticDiscovery(
+        string name,
+        params InferenceDeviceDescriptor[] devices)
+    {
+        Name = name;
+        _devices = devices;
+    }
+
+    public string Name { get; }
 
     public ValueTask<IReadOnlyList<InferenceDeviceDescriptor>> DiscoverAsync(
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return ValueTask.FromResult<IReadOnlyList<InferenceDeviceDescriptor>>(devices);
+        return ValueTask.FromResult<IReadOnlyList<InferenceDeviceDescriptor>>(_devices);
     }
 }
