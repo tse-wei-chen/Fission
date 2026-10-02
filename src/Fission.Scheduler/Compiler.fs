@@ -5,28 +5,38 @@ open Fission.Abstractions.Scheduling
 
 [<RequireQualifiedAccess>]
 module ScheduleCompiler =
-    let compile (scheduleId: Guid) (decision: SchedulingDecision) =
-        let items =
-            decision.Selected
-            |> List.map (fun selected ->
+    let private compileItems (selected: ScheduledSequence list) =
+        let items = Array.zeroCreate<ScheduledWorkItem> (List.length selected)
+
+        let rec fill index remaining =
+            match remaining with
+            | [] -> items
+            | selectedItem :: tail ->
                 let kind, completesPrefill =
-                    match selected.Sequence.Phase with
+                    match selectedItem.Sequence.Phase with
                     | Prefilling ->
                         ScheduledWorkKind.Prefill,
-                        selected.TokenGrant >= selected.Sequence.TokenDemand
+                        selectedItem.TokenGrant >= selectedItem.Sequence.TokenDemand
                     | Decoding -> ScheduledWorkKind.Decode, false
                     | phase -> invalidOp $"Cannot compile non-runnable phase {phase}."
 
-                ScheduledWorkItem(
-                    selected.Sequence.SequenceId,
-                    kind,
-                    selected.TokenGrant,
-                    selected.KvPageGrant,
-                    selected.Sequence.Priority,
-                    completesPrefill,
-                    selected.KvByteGrant,
-                    selected.TransientKvByteGrant))
-            |> List.toArray
+                items[index] <-
+                    ScheduledWorkItem(
+                        selectedItem.Sequence.SequenceId,
+                        kind,
+                        selectedItem.TokenGrant,
+                        selectedItem.KvPageGrant,
+                        selectedItem.Sequence.Priority,
+                        completesPrefill,
+                        selectedItem.KvByteGrant,
+                        selectedItem.TransientKvByteGrant)
+
+                fill (index + 1) tail
+
+        fill 0 selected
+
+    let compile (scheduleId: Guid) (decision: SchedulingDecision) =
+        let items = compileItems decision.Selected
 
         ScheduledBatch(
             scheduleId,
