@@ -10,7 +10,7 @@ using Fission.Server;
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
-var device = new DeviceId(builder.Configuration["Fission:Device"] ?? "cpu:0");
+var device = ServerBackendFactory.ResolveDevice(builder.Configuration);
 var kvPages = ReadPositiveInt(builder.Configuration["Fission:KvPages"], 16_384);
 var tokensPerPage = ReadPositiveInt(builder.Configuration["Fission:TokensPerKvPage"], 16);
 var maxBatchTokens = ReadPositiveInt(builder.Configuration["Fission:MaxBatchTokens"], 2_048);

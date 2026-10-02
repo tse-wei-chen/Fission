@@ -30,6 +30,7 @@ public sealed class OnnxRuntimeBackend :
     private readonly OnnxRuntimeBackendOptions _options;
     private readonly IOnnxRuntimeExecutionAdapter _adapter;
     private readonly Func<SessionOptions>? _sessionOptionsFactory;
+    private readonly IDisposable? _ownedResource;
     private readonly IInferenceDeviceMemoryPressureSource? _deviceMemoryPressureSource;
     private readonly IInferenceDeviceMemoryReclaimer? _deviceMemoryReclaimer;
     private InferenceSession? _session;
@@ -38,7 +39,8 @@ public sealed class OnnxRuntimeBackend :
     public OnnxRuntimeBackend(
         OnnxRuntimeBackendOptions options,
         IOnnxRuntimeExecutionAdapter adapter,
-        Func<SessionOptions>? sessionOptionsFactory = null)
+        Func<SessionOptions>? sessionOptionsFactory = null,
+        IDisposable? ownedResource = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(options.Model);
@@ -61,6 +63,7 @@ public sealed class OnnxRuntimeBackend :
         _options = options;
         _adapter = adapter;
         _sessionOptionsFactory = sessionOptionsFactory;
+        _ownedResource = ownedResource;
         _deviceMemoryPressureSource =
             options.DeviceMemoryPressureSource ??
             adapter as IInferenceDeviceMemoryPressureSource;
@@ -256,8 +259,42 @@ public sealed class OnnxRuntimeBackend :
             return ValueTask.CompletedTask;
         }
 
-        _adapter.Dispose();
-        Interlocked.Exchange(ref _session, null)?.Dispose();
+        List<Exception>? failures = null;
+        TryDispose(_adapter, ref failures);
+        TryDispose(Interlocked.Exchange(ref _session, null), ref failures);
+        TryDispose(_ownedResource, ref failures);
+
+        if (failures is { Count: 1 })
+        {
+            throw failures[0];
+        }
+
+        if (failures is { Count: > 1 })
+        {
+            throw new AggregateException(
+                "One or more ONNX Runtime backend resources failed to dispose.",
+                failures);
+        }
+
         return ValueTask.CompletedTask;
+    }
+
+    private static void TryDispose(
+        IDisposable? resource,
+        ref List<Exception>? failures)
+    {
+        if (resource is null)
+        {
+            return;
+        }
+
+        try
+        {
+            resource.Dispose();
+        }
+        catch (Exception exception)
+        {
+            (failures ??= []).Add(exception);
+        }
     }
 }
