@@ -13,29 +13,38 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-$projectRoot = Join-Path $repositoryRoot $Root
+$solutionPath = Join-Path $repositoryRoot "Fission.slnx"
 
-if (-not (Test-Path -LiteralPath $projectRoot -PathType Container)) {
-    throw "Project root '$projectRoot' does not exist."
+if (-not (Test-Path -LiteralPath $solutionPath -PathType Leaf)) {
+    throw "Solution manifest '$solutionPath' does not exist."
 }
 
-$projects = @(
-    Get-ChildItem -LiteralPath $projectRoot -Recurse -File |
+[xml] $solution = Get-Content -LiteralPath $solutionPath -Raw
+$prefix = "$Root/"
+
+$projectPaths = @(
+    $solution.Solution.Project |
+        ForEach-Object { [string] $_.Path } |
         Where-Object {
-            ($_.Extension -eq ".csproj" -or $_.Extension -eq ".fsproj") -and
-            $_.FullName -notmatch "[\\/](bin|obj)[\\/]"
+            $_.StartsWith($prefix, [StringComparison]::Ordinal) -and
+            ($_.EndsWith(".csproj", [StringComparison]::OrdinalIgnoreCase) -or
+             $_.EndsWith(".fsproj", [StringComparison]::OrdinalIgnoreCase))
         } |
-        Sort-Object FullName
+        Sort-Object
 )
 
-if ($projects.Count -eq 0) {
-    throw "No .csproj or .fsproj files found under '$Root'."
+if ($projectPaths.Count -eq 0) {
+    throw "No solution projects found under '$Root'."
 }
 
-Write-Host "Running $($projects.Count) project(s) under '$Root' in $Configuration configuration."
+Write-Host "Running $($projectPaths.Count) solution project(s) under '$Root' in $Configuration configuration."
 
-foreach ($project in $projects) {
-    $relativePath = [System.IO.Path]::GetRelativePath($repositoryRoot, $project.FullName)
+foreach ($relativePath in $projectPaths) {
+    $projectPath = Join-Path $repositoryRoot $relativePath
+    if (-not (Test-Path -LiteralPath $projectPath -PathType Leaf)) {
+        throw "Solution project '$relativePath' does not exist on disk."
+    }
+
     Write-Host ""
     Write-Host "==> $relativePath"
 
@@ -56,4 +65,4 @@ foreach ($project in $projects) {
 }
 
 Write-Host ""
-Write-Host "Completed $($projects.Count) project(s) under '$Root'."
+Write-Host "Completed $($projectPaths.Count) solution project(s) under '$Root'."
