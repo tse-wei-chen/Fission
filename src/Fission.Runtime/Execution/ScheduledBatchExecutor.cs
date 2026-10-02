@@ -490,7 +490,9 @@ public sealed class ScheduledBatchExecutor
         var prepared = ArrayPool<PreparedItem>.Shared.Rent(itemCount);
         try
         {
-            var sequences = new HashSet<SequenceId>();
+            HashSet<SequenceId>? sequences = null;
+            SequenceId firstSequence = default;
+            SequenceId secondSequence = default;
             var consumedTokens = 0;
             var consumedKvPages = 0;
             var consumedKvBytes = 0L;
@@ -504,10 +506,36 @@ public sealed class ScheduledBatchExecutor
                 ArgumentOutOfRangeException.ThrowIfNegative(item.KvByteGrant);
                 ArgumentOutOfRangeException.ThrowIfNegative(item.TransientKvByteGrant);
 
-                if (!sequences.Add(item.SequenceId))
+                if (index == 0)
                 {
-                    throw new InvalidOperationException(
-                        $"Scheduled batch {batch.ScheduleId} contains sequence {item.SequenceId} more than once.");
+                    firstSequence = item.SequenceId;
+                }
+                else if (index == 1)
+                {
+                    if (firstSequence.Equals(item.SequenceId))
+                    {
+                        throw new InvalidOperationException(
+                            $"Scheduled batch {batch.ScheduleId} contains sequence {item.SequenceId} more than once.");
+                    }
+
+                    secondSequence = item.SequenceId;
+                }
+                else
+                {
+                    if (sequences is null)
+                    {
+                        sequences = new HashSet<SequenceId>(itemCount)
+                        {
+                            firstSequence,
+                            secondSequence
+                        };
+                    }
+
+                    if (!sequences.Add(item.SequenceId))
+                    {
+                        throw new InvalidOperationException(
+                            $"Scheduled batch {batch.ScheduleId} contains sequence {item.SequenceId} more than once.");
+                    }
                 }
 
                 var hasExistingSequence = _runtime.TryGetSequence(item.SequenceId, out var existingSequence);
