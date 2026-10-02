@@ -469,7 +469,11 @@ public sealed partial class InferenceEngine : IDisposable
             return EmptyExecutionBindings;
         }
 
-        var prefillBindings = new Dictionary<SequenceId, ScheduledPrefillBinding>(prefillCount);
+        Dictionary<SequenceId, ScheduledPrefillBinding>? prefillBindings =
+            prefillCount > 1
+                ? new Dictionary<SequenceId, ScheduledPrefillBinding>(prefillCount)
+                : null;
+
         lock (_gate)
         {
             foreach (var item in batch.Items)
@@ -485,13 +489,21 @@ public sealed partial class InferenceEngine : IDisposable
                         $"Scheduler selected unknown or inactive request {item.SequenceId}.");
                 }
 
-                prefillBindings.Add(
-                    item.SequenceId,
-                    new ScheduledPrefillBinding(request.ModelId, request.PromptTokens));
+                var binding = new ScheduledPrefillBinding(
+                    request.ModelId,
+                    request.PromptTokens);
+                if (prefillBindings is null)
+                {
+                    return ScheduledExecutionBindings.CreateSinglePrefill(
+                        item.SequenceId,
+                        binding);
+                }
+
+                prefillBindings.Add(item.SequenceId, binding);
             }
         }
 
-        return new ScheduledExecutionBindings(prefillBindings);
+        return new ScheduledExecutionBindings(prefillBindings!);
     }
 
     private void AddRequest(RequestState request)
