@@ -174,3 +174,41 @@ profile. CPU and deterministic serving remain the hardware-independent CI paths.
 CUDA composition is now wired, while the next milestone is a real NVIDIA
 hardware smoke using an exported decoder-with-past model before CUDA mode is
 treated as production-validated.
+
+
+## Startup inference probe
+
+Real-model hosts can opt into a full-stack startup inference before Kestrel begins
+accepting traffic:
+
+- `Fission:StartupProbeEnabled=true`
+- `Fission:StartupProbePrompt=<non-empty prompt>`
+- `Fission:StartupProbeModelId=<model id>` (optional; falls back to `Fission:ModelId`)
+- `Fission:StartupProbeMaxTokens=<positive integer>` (default `1`)
+- `Fission:StartupProbeTimeoutSeconds=<positive integer>` (default `60`)
+
+The probe deliberately uses the same configured `ITextTokenCodec`,
+`InferenceWorker`, scheduler/runtime, backend, KV lifecycle, and request-scoped
+decoder as normal serving:
+
+```text
+configured prompt
+  -> production tokenizer
+  -> InferenceWorker
+  -> scheduler / runtime / KV
+  -> ONNX Runtime CPU or CUDA backend
+  -> generated token history
+  -> production streaming decoder
+```
+
+Startup succeeds only after the request reaches a terminal inference reason and
+produces at least one generated token. The server logs model id, token counts,
+finish reason, and elapsed time, but not the generated text. A model/tokenizer
+mismatch, invalid ONNX graph, CUDA/provider failure, runtime scheduling failure,
+or decode error therefore fails process startup instead of leaving an HTTP server
+that becomes unhealthy on its first real request.
+
+The probe is disabled by default so deterministic CI/container smoke paths do not
+perform extra inference. For NVIDIA real-model validation, enable it together
+with `Backend=onnx`, `ExecutionProvider=cuda`, and
+`Tokenizer=huggingface`.
