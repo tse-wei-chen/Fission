@@ -553,6 +553,7 @@ module Scheduler =
         (decodeStartIndex: int)
         (decodeCount: int)
         (prefillStartIndex: int)
+        (candidateCount: int)
         =
         let mutable state = initialState
         let mutable decodeIndex = decodeStartIndex
@@ -560,12 +561,12 @@ module Scheduler =
 
         while
             decodeIndex < decodeCount
-            || prefillIndex < orderedCandidates.Length
+            || prefillIndex < candidateCount
             do
             let useDecode =
                 if decodeIndex >= decodeCount then
                     false
-                elif prefillIndex >= orderedCandidates.Length then
+                elif prefillIndex >= candidateCount then
                     true
                 else
                     compareReady
@@ -672,8 +673,8 @@ module Scheduler =
     let private classifyMappedReadOnlyWorkspace
         (mapping: 'T -> ReadySequence)
         (sequences: System.Collections.Generic.IReadOnlyList<'T>)
+        (workspace: ReadySequence array)
         =
-        let workspace = Array.zeroCreate<ReadySequence> sequences.Count
         let mutable decodeCount = 0
         let mutable prefillStartIndex = sequences.Count
         let mutable deferred = []
@@ -694,7 +695,6 @@ module Scheduler =
                 rejected <- rejectedItem :: rejected
 
         struct (
-            workspace,
             decodeCount,
             prefillStartIndex,
             deferred,
@@ -856,67 +856,77 @@ module Scheduler =
                 deferred
                 rejected
         else
-            let struct (
-                workspace,
-                decodeCount,
-                prefillStartIndex,
-                deferred,
-                rejected) =
-                classifyMappedReadOnlyWorkspace mapping sequences
+            let candidateCount = sequences.Count
+            let pool = System.Buffers.ArrayPool<ReadySequence>.Shared
+            let workspace = pool.Rent(candidateCount)
 
-            let urgencyCutoffTicks =
-                now.Add(policy.DeadlineUrgencyWindow).UtcTicks
-            let comparer = ReadySequenceComparer urgencyCutoffTicks
+            try
+                let struct (
+                    decodeCount,
+                    prefillStartIndex,
+                    deferred,
+                    rejected) =
+                    classifyMappedReadOnlyWorkspace
+                        mapping
+                        sequences
+                        workspace
 
-            if decodeCount > 1 then
-                System.MemoryExtensions.Sort<ReadySequence, ReadySequenceComparer>(
-                    workspace.AsSpan(0, decodeCount),
-                    comparer)
+                let urgencyCutoffTicks =
+                    now.Add(policy.DeadlineUrgencyWindow).UtcTicks
+                let comparer = ReadySequenceComparer urgencyCutoffTicks
 
-            let prefillCount = workspace.Length - prefillStartIndex
-            if prefillCount > 1 then
-                System.MemoryExtensions.Sort<ReadySequence, ReadySequenceComparer>(
-                    workspace.AsSpan(prefillStartIndex, prefillCount),
-                    comparer)
+                if decodeCount > 1 then
+                    System.MemoryExtensions.Sort<ReadySequence, ReadySequenceComparer>(
+                        workspace.AsSpan(0, decodeCount),
+                        comparer)
 
-            let initialState =
-                { SelectedRev = []
-                  DeferredRev = []
-                  SelectedCount = 0
-                  UsedTokens = 0
-                  UsedKvPages = 0
-                  UsedKvBytes = 0L
-                  UsedTransientKvBytes = 0L
-                  FirstUsedDevice = ValueNone
-                  AdditionalUsedDevices = [] }
+                let prefillCount = candidateCount - prefillStartIndex
+                if prefillCount > 1 then
+                    System.MemoryExtensions.Sort<ReadySequence, ReadySequenceComparer>(
+                        workspace.AsSpan(prefillStartIndex, prefillCount),
+                        comparer)
 
-            let struct (afterReserve, decodeStartIndex) =
-                reserveDecodeWorkspaceTokens
-                    budget
-                    policy
-                    workspace
-                    decodeCount
-                    initialState
+                let initialState =
+                    { SelectedRev = []
+                      DeferredRev = []
+                      SelectedCount = 0
+                      UsedTokens = 0
+                      UsedKvPages = 0
+                      UsedKvBytes = 0L
+                      UsedTransientKvBytes = 0L
+                      FirstUsedDevice = ValueNone
+                      AdditionalUsedDevices = [] }
 
-            let finalState =
-                selectMergedCandidateWorkspace
-                    budget
-                    policy
-                    urgencyCutoffTicks
-                    afterReserve
-                    workspace
-                    decodeStartIndex
-                    decodeCount
-                    prefillStartIndex
+                let struct (afterReserve, decodeStartIndex) =
+                    reserveDecodeWorkspaceTokens
+                        budget
+                        policy
+                        workspace
+                        decodeCount
+                        initialState
 
-            { SelectedRev = finalState.SelectedRev
-              InitiallyDeferred = deferred
-              DeferredRev = finalState.DeferredRev
-              Rejected = rejected
-              ConsumedTokens = finalState.UsedTokens
-              ConsumedKvPages = finalState.UsedKvPages
-              ConsumedKvBytes = finalState.UsedKvBytes
-              ConsumedTransientKvBytes = finalState.UsedTransientKvBytes }
+                let finalState =
+                    selectMergedCandidateWorkspace
+                        budget
+                        policy
+                        urgencyCutoffTicks
+                        afterReserve
+                        workspace
+                        decodeStartIndex
+                        decodeCount
+                        prefillStartIndex
+                        candidateCount
+
+                { SelectedRev = finalState.SelectedRev
+                  InitiallyDeferred = deferred
+                  DeferredRev = finalState.DeferredRev
+                  Rejected = rejected
+                  ConsumedTokens = finalState.UsedTokens
+                  ConsumedKvPages = finalState.UsedKvPages
+                  ConsumedKvBytes = finalState.UsedKvBytes
+                  ConsumedTransientKvBytes = finalState.UsedTransientKvBytes }
+            finally
+                pool.Return(workspace, clearArray = true)
 
     let scheduleMappedReadOnlyAt
         (now: DateTimeOffset)
