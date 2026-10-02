@@ -271,12 +271,12 @@ module Scheduler =
         else
             let deviceSequenceBudget =
                 match sequence.ExecutionDevice with
-                | Some device -> tryFindDeviceSequenceBudget budget device
-                | None -> ValueNone
+                | ValueSome device -> tryFindDeviceSequenceBudget budget device
+                | ValueNone -> ValueNone
             let deviceMemoryBudget =
                 match sequence.ExecutionDevice with
-                | Some device -> tryFindDeviceBudget budget device
-                | None -> ValueNone
+                | ValueSome device -> tryFindDeviceBudget budget device
+                | ValueNone -> ValueNone
             let tracksDeviceMemory =
                 match deviceMemoryBudget with
                 | ValueSome _ -> true
@@ -287,7 +287,7 @@ module Scheduler =
                 | ValueNone -> false
             let currentDeviceUsage =
                 match sequence.ExecutionDevice with
-                | Some device when tracksDeviceMemory || tracksDeviceSequences ->
+                | ValueSome device when tracksDeviceMemory || tracksDeviceSequences ->
                     tryFindDeviceUsage device state
                 | _ -> ValueNone
 
@@ -349,7 +349,7 @@ module Scheduler =
                         let transientKvByteGrant = transientKvBytesForGrant sequence tokenGrant
                         let struct (nextFirstUsedDevice, nextAdditionalUsedDevices) =
                             match sequence.ExecutionDevice with
-                            | Some device when tracksDeviceMemory || tracksDeviceSequences ->
+                            | ValueSome device when tracksDeviceMemory || tracksDeviceSequences ->
                                 addDeviceUsage
                                     device
                                     (if tracksDeviceMemory then transientKvByteGrant else 0L)
