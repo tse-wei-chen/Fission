@@ -23,6 +23,7 @@ type ReadySequence =
       KvBytesPerToken: int64
       ExecutionDevice: DeviceId voption }
 
+[<Struct>]
 type ResourceBudget =
     { MaxBatchTokens: int
       AvailableKvPages: int
