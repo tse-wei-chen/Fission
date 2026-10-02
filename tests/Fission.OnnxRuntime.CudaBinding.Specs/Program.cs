@@ -347,15 +347,15 @@ var graphDecoded = graphBinding.ExecuteDecodeBatch(
     session,
     new[]
     {
-        new DecodeItem(graphFirstId, modelId, Position: 1),
-        new DecodeItem(graphSecondId, modelId, Position: 1)
+        new DecodeItem(graphSecondId, modelId, Position: 1),
+        new DecodeItem(graphFirstId, modelId, Position: 1)
     },
-    new[] { graphInitial[0].State, graphInitial[1].State });
+    new[] { graphInitial[1].State, graphInitial[0].State });
 
 Require(
-    graphDecoded[0].TokenId == 3 &&
-    graphDecoded[1].TokenId == 0,
-    "Graph-side decode sampling must consume one model-provided token id per row.");
+    graphDecoded[0].TokenId == 0 &&
+    graphDecoded[1].TokenId == 3,
+    "Graph-side decode sampling must map physical CUDA row token ids back to reversed logical request order.");
 Require(graphBinding.OrtRunCount == 2 && graphRunCount == 2,
     "Graph-side prefill and decode must each execute one ORT run.");
 Require(graphBinding.GraphSampledTokenIdReadCount == 4,
