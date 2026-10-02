@@ -286,14 +286,12 @@ void FakeGraphRun(
     var inputs = graphInputValues.ToArray();
     Require(inputs.Length == 5,
         "FP16 graph-side test must bind three scalar inputs and one key/value past pair.");
-    using (var pastKeyType = inputs[3].GetTensorTypeAndShape())
-    using (var pastValueType = inputs[4].GetTensorTypeAndShape())
-    {
-        Require(
-            pastKeyType.ElementDataType == TensorElementType.Float16 &&
-            pastValueType.ElementDataType == TensorElementType.Float16,
-            "FP16 CUDA graph-side execution must bind Float16 past KV tensors.");
-    }
+    var pastKeyType = inputs[3].GetTensorTypeAndShape();
+    var pastValueType = inputs[4].GetTensorTypeAndShape();
+    Require(
+        pastKeyType.ElementDataType == TensorElementType.Float16 &&
+        pastValueType.ElementDataType == TensorElementType.Float16,
+        "FP16 CUDA graph-side execution must bind Float16 past KV tensors.");
 
     var names = graphOutputNames.ToArray();
     var outputs = graphOutputValues.ToArray();
@@ -310,14 +308,12 @@ void FakeGraphRun(
             "Sampled token ids must return through the small host output.");
     }
 
-    using (var presentKeyType = outputs[1].GetTensorTypeAndShape())
-    using (var presentValueType = outputs[2].GetTensorTypeAndShape())
-    {
-        Require(
-            presentKeyType.ElementDataType == TensorElementType.Float16 &&
-            presentValueType.ElementDataType == TensorElementType.Float16,
-            "FP16 CUDA graph-side execution must bind Float16 present KV tensors.");
-    }
+    var presentKeyType = outputs[1].GetTensorTypeAndShape();
+    var presentValueType = outputs[2].GetTensorTypeAndShape();
+    Require(
+        presentKeyType.ElementDataType == TensorElementType.Float16 &&
+        presentValueType.ElementDataType == TensorElementType.Float16,
+        "FP16 CUDA graph-side execution must bind Float16 present KV tensors.");
 
     var sampled = outputs[0].GetTensorMutableDataAsSpan<long>();
     if (graphRunCount == 1)
