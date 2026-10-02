@@ -126,7 +126,7 @@ static async Task ValidateBackendCompositionAsync()
 
 await ValidateBackendCompositionAsync();
 
-var deterministicDecoder = new DeterministicTextTokenCodec().CreateDecoder();
+using var deterministicDecoder = new DeterministicTextTokenCodec().CreateDecoder();
 Require(
     deterministicDecoder.Append(7) == "<7>" &&
     deterministicDecoder.Complete() == string.Empty,
@@ -352,6 +352,8 @@ sealed class BufferedSpecTextTokenCodec : ITextTokenCodec
             _pending = null;
             return trailing + "[done]";
         }
+
+        public void Dispose() { }
     }
 }
 
