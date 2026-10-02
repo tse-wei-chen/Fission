@@ -1,5 +1,27 @@
 name: fission
 
+x-fission-common-environment: &fission-common-environment
+  ASPNETCORE_URLS: http://+:8000
+  Fission__KvPages: ${FISSION_KV_PAGES:-16384}
+  Fission__TokensPerKvPage: ${FISSION_TOKENS_PER_KV_PAGE:-16}
+  Fission__MaxBatchTokens: ${FISSION_MAX_BATCH_TOKENS:-2048}
+  Fission__MaxBatchSequences: ${FISSION_MAX_BATCH_SEQUENCES:-128}
+  Fission__MaxPrefillChunkTokens: ${FISSION_MAX_PREFILL_CHUNK_TOKENS:-512}
+  Fission__AdmissionCapacity: ${FISSION_ADMISSION_CAPACITY:-1024}
+
+x-fission-model-environment: &fission-model-environment
+  Fission__ModelPath: /models/${FISSION_MODEL_FILE:-decoder_with_past_model.onnx}
+  Fission__ModelId: ${FISSION_MODEL_ID:-model}
+  Fission__NumHiddenLayers: ${FISSION_NUM_HIDDEN_LAYERS:-}
+  Fission__NumKvHeads: ${FISSION_NUM_KV_HEADS:-}
+  Fission__HeadDim: ${FISSION_HEAD_DIM:-}
+  Fission__VocabularySize: ${FISSION_VOCABULARY_SIZE:-}
+  Fission__EosTokenIds: ${FISSION_EOS_TOKEN_IDS:-}
+  Fission__TokenizerPath: /models/${FISSION_TOKENIZER_FILE:-tokenizer.json}
+  Fission__ChatTemplate: ${FISSION_CHAT_TEMPLATE:-none}
+  Fission__AddPromptSpecialTokens: ${FISSION_ADD_PROMPT_SPECIAL_TOKENS:-true}
+  Fission__SkipSpecialTokensOnDecode: ${FISSION_SKIP_SPECIAL_TOKENS_ON_DECODE:-true}
+
 services:
   server:
     image: ${FISSION_IMAGE:-fission:dev}
@@ -12,12 +34,53 @@ services:
     ports:
       - "${FISSION_PORT:-8000}:8000"
     environment:
-      ASPNETCORE_URLS: http://+:8000
+      <<:
+        - *fission-common-environment
+        - *fission-model-environment
+      Fission__Backend: ${FISSION_BACKEND:-deterministic}
+      Fission__ExecutionProvider: ${FISSION_EXECUTION_PROVIDER:-cpu}
       Fission__Device: ${FISSION_DEVICE:-cpu:0}
-      Fission__KvPages: ${FISSION_KV_PAGES:-16384}
-      Fission__TokensPerKvPage: ${FISSION_TOKENS_PER_KV_PAGE:-16}
-      Fission__MaxBatchTokens: ${FISSION_MAX_BATCH_TOKENS:-2048}
-      Fission__MaxBatchSequences: ${FISSION_MAX_BATCH_SEQUENCES:-128}
-      Fission__MaxPrefillChunkTokens: ${FISSION_MAX_PREFILL_CHUNK_TOKENS:-512}
-      Fission__AdmissionCapacity: ${FISSION_ADMISSION_CAPACITY:-1024}
+      Fission__Tokenizer: ${FISSION_TOKENIZER:-deterministic}
+    volumes:
+      - ${FISSION_MODEL_DIR:-./models}:/models:ro
     stop_grace_period: 15s
+
+  server-cuda:
+    profiles: ["cuda"]
+    image: ${FISSION_CUDA_IMAGE:-fission:cuda-dev}
+    build:
+      context: .
+      dockerfile: Dockerfile.cuda
+      args:
+        DOTNET_VERSION: ${DOTNET_VERSION:-10.0}
+        CUDA_RUNTIME_IMAGE: ${FISSION_CUDA_RUNTIME_IMAGE:-nvidia/cuda:13.4.2-cudnn-runtime-ubuntu24.04}
+        APP_UID: ${FISSION_CONTAINER_UID:-1654}
+    init: true
+    gpus: all
+    ports:
+      - "${FISSION_CUDA_PORT:-8001}:8000"
+    environment:
+      <<:
+        - *fission-common-environment
+        - *fission-model-environment
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      Fission__Backend: onnx
+      Fission__ExecutionProvider: cuda
+      Fission__Device: ${FISSION_CUDA_DEVICE:-cuda:0}
+      Fission__CudaDeviceId: ${FISSION_CUDA_DEVICE_ID:-0}
+      Fission__CudaRuntimeLibraryPath: ${FISSION_CUDA_RUNTIME_LIBRARY_PATH:-}
+      Fission__CudaPageLockedDecodeLogits: ${FISSION_CUDA_PAGE_LOCKED_DECODE_LOGITS:-false}
+      Fission__CudaPoolMaxRetainedBytes: ${FISSION_CUDA_POOL_MAX_RETAINED_BYTES:-268435456}
+      Fission__CudaPoolMaxRetainedBuffersPerSize: ${FISSION_CUDA_POOL_MAX_RETAINED_BUFFERS_PER_SIZE:-8}
+      Fission__SampledTokenIdsOutput: ${FISSION_SAMPLED_TOKEN_IDS_OUTPUT:-}
+      Fission__Tokenizer: huggingface
+      Fission__StartupProbeEnabled: ${FISSION_STARTUP_PROBE_ENABLED:-false}
+      Fission__StartupProbeExitAfterSuccess: "false"
+      Fission__StartupProbePrompt: ${FISSION_STARTUP_PROBE_PROMPT:-Hello}
+      Fission__StartupProbeModelId: ${FISSION_STARTUP_PROBE_MODEL_ID:-${FISSION_MODEL_ID:-model}}
+      Fission__StartupProbeMaxTokens: ${FISSION_STARTUP_PROBE_MAX_TOKENS:-1}
+      Fission__StartupProbeTimeoutSeconds: ${FISSION_STARTUP_PROBE_TIMEOUT_SECONDS:-120}
+    volumes:
+      - ${FISSION_MODEL_DIR:-./models}:/models:ro
+    stop_grace_period: 30s
