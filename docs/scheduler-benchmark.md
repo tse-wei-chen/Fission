@@ -28,3 +28,10 @@ These numbers are primarily for local before/after comparisons. CI also runs a s
 For a scheduler hot-path change, compare the same scenario and iteration count before and after the code change. Prefer `bytes/op` as the first signal because hosted-runner timing can vary between jobs.
 
 When using CI for an A/B check, capture a benchmark-neutral baseline run from the current `develop` state, then run the changed branch with the same benchmark source and iteration count. Treat `ns/op` as supporting evidence rather than a merge threshold.
+
+
+## CI evidence
+
+The build workflow writes the short scheduler benchmark sample to `artifacts/benchmarks/scheduler.txt`, mirrors it into the GitHub Actions job summary, and uploads it as a 14-day workflow artifact.
+
+The artifact is evidence, not a performance gate. Hosted-runner timing is noisy; compare allocation and timing only against runs collected under the same environment and benchmark source.
