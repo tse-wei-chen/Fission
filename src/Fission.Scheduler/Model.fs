@@ -29,8 +29,8 @@ type ResourceBudget =
       AvailableKvPages: int
       MaxBatchSequences: int
       AvailableKvBytes: int64
-      AvailableDeviceBytes: struct (DeviceId * int64) list
-      MaxDeviceSequences: struct (DeviceId * int) list }
+      AvailableDeviceBytes: struct (DeviceId * int64) array
+      MaxDeviceSequences: struct (DeviceId * int) array }
 
 [<Struct>]
 type SchedulingPolicy =
