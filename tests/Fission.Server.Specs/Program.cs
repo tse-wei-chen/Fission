@@ -124,7 +124,236 @@ static async Task ValidateBackendCompositionAsync()
     }
 }
 
+static async Task ValidateTokenizerCompositionAsync()
+{
+    var defaults = new ConfigurationManager();
+    using (var codec = ServerTextTokenCodecFactory.Create(defaults))
+    {
+        Require(
+            codec is DeterministicTextTokenCodec,
+            "Server tokenizer composition must default to the deterministic codec.");
+    }
+
+    var unsupported = new ConfigurationManager();
+    unsupported["Fission:Tokenizer"] = "not-a-tokenizer";
+    RequireThrows<InvalidOperationException>(
+        () => ServerTextTokenCodecFactory.Create(unsupported),
+        "Unknown tokenizer composition must fail during startup.");
+
+    var chatTokenizerPath = Path.Combine(
+        Path.GetTempPath(),
+        $"fission-chat-tokenizer-{Guid.NewGuid():N}.json");
+    var byteTokenizerPath = Path.Combine(
+        Path.GetTempPath(),
+        $"fission-byte-tokenizer-{Guid.NewGuid():N}.json");
+
+    await File.WriteAllTextAsync(
+        chatTokenizerPath,
+        """
+        {
+          "version": "1.0",
+          "truncation": null,
+          "padding": null,
+          "added_tokens": [
+            {
+              "id": 6,
+              "content": "<|im_start|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            },
+            {
+              "id": 7,
+              "content": "<|im_end|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            },
+            {
+              "id": 8,
+              "content": "<|begin_of_text|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            },
+            {
+              "id": 9,
+              "content": "<|start_header_id|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            },
+            {
+              "id": 10,
+              "content": "<|end_header_id|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            },
+            {
+              "id": 11,
+              "content": "<|eot_id|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            }
+          ],
+          "normalizer": null,
+          "pre_tokenizer": { "type": "Whitespace" },
+          "post_processor": null,
+          "decoder": null,
+          "model": {
+            "type": "WordLevel",
+            "vocab": {
+              "[UNK]": 0,
+              "system": 1,
+              "user": 2,
+              "assistant": 3,
+              "hello": 4,
+              "world": 5
+            },
+            "unk_token": "[UNK]"
+          }
+        }
+        """);
+
+    await File.WriteAllTextAsync(
+        byteTokenizerPath,
+        """
+        {
+          "version": "1.0",
+          "truncation": null,
+          "padding": null,
+          "added_tokens": [],
+          "normalizer": null,
+          "pre_tokenizer": null,
+          "post_processor": null,
+          "decoder": { "type": "ByteFallback" },
+          "model": {
+            "type": "WordLevel",
+            "vocab": {
+              "[UNK]": 0,
+              "<0xC3>": 1,
+              "<0xA9>": 2
+            },
+            "unk_token": "[UNK]"
+          }
+        }
+        """);
+
+    try
+    {
+        var configured = new ConfigurationManager();
+        configured["Fission:Tokenizer"] = "huggingface";
+        configured["Fission:TokenizerPath"] = chatTokenizerPath;
+        configured["Fission:ChatTemplate"] = "qwen2";
+        configured["Fission:AddPromptSpecialTokens"] = "false";
+
+        using (var codec = ServerTextTokenCodecFactory.Create(configured))
+        {
+            Require(
+                codec.EncodePrompt("hello").SequenceEqual([4]),
+                "Hugging Face prompt encoding must use tokenizer.json vocabulary.");
+
+            var chatTokens = codec.EncodeChat(
+            [
+                new OpenAiChatMessage("user", "hello")
+            ]);
+            Require(
+                chatTokens.SequenceEqual([6, 2, 4, 7, 6, 3]),
+                "Qwen2/ChatML rendering must encode model special tokens and the assistant generation prefix.");
+        }
+
+        var llama = new ConfigurationManager();
+        llama["Fission:Tokenizer"] = "huggingface";
+        llama["Fission:TokenizerPath"] = chatTokenizerPath;
+        llama["Fission:ChatTemplate"] = "llama3";
+        llama["Fission:AddPromptSpecialTokens"] = "false";
+
+        using (var codec = ServerTextTokenCodecFactory.Create(llama))
+        {
+            var chatTokens = codec.EncodeChat(
+            [
+                new OpenAiChatMessage("system", "hello"),
+                new OpenAiChatMessage("user", "world")
+            ]);
+            Require(
+                chatTokens.SequenceEqual(
+                [
+                    8,
+                    9, 1, 10, 4, 11,
+                    9, 2, 10, 5, 11,
+                    9, 3, 10
+                ]),
+                "Llama 3 rendering must encode BOS, header, EOT, and assistant-prefix control tokens.");
+        }
+
+        using (var codec = new HuggingFaceTextTokenCodec(byteTokenizerPath))
+        using (var decoder = codec.CreateDecoder())
+        {
+            Require(
+                decoder.Append(1) == string.Empty,
+                "Byte-fallback streaming decode must buffer an incomplete UTF-8 sequence.");
+            Require(
+                decoder.Append(2) == "é",
+                "Byte-fallback streaming decode must emit the completed UTF-8 fragment.");
+            Require(
+                decoder.Complete() == string.Empty,
+                "A fully emitted byte-fallback stream must not duplicate text at completion.");
+        }
+
+        using (var codec = new HuggingFaceTextTokenCodec(byteTokenizerPath))
+        using (var decoder = codec.CreateDecoder())
+        {
+            Require(
+                decoder.Append(1) == string.Empty &&
+                decoder.Complete() == "�",
+                "Decoder completion must flush a truncated byte-fallback sequence consistently with full decode.");
+        }
+
+        var noChatTemplate = new ConfigurationManager();
+        noChatTemplate["Fission:Tokenizer"] = "huggingface";
+        noChatTemplate["Fission:TokenizerPath"] = chatTokenizerPath;
+
+        using (var codec = ServerTextTokenCodecFactory.Create(noChatTemplate))
+        {
+            RequireThrows<ArgumentException>(
+                () => codec.EncodeChat([new OpenAiChatMessage("user", "hello")]),
+                "Chat encoding must fail explicitly when no model chat template is configured.");
+        }
+
+        var invalidRole = new ConfigurationManager();
+        invalidRole["Fission:Tokenizer"] = "huggingface";
+        invalidRole["Fission:TokenizerPath"] = chatTokenizerPath;
+        invalidRole["Fission:ChatTemplate"] = "qwen2";
+        using (var codec = ServerTextTokenCodecFactory.Create(invalidRole))
+        {
+            RequireThrows<ArgumentException>(
+                () => codec.EncodeChat([new OpenAiChatMessage("not-a-role", "hello")]),
+                "Production chat templates must reject unknown role names rather than embedding arbitrary control roles.");
+        }
+    }
+    finally
+    {
+        File.Delete(chatTokenizerPath);
+        File.Delete(byteTokenizerPath);
+    }
+}
+
 await ValidateBackendCompositionAsync();
+await ValidateTokenizerCompositionAsync();
 
 using var deterministicDecoder = new DeterministicTextTokenCodec().CreateDecoder();
 Require(
@@ -326,6 +555,8 @@ sealed class BufferedSpecTextTokenCodec : ITextTokenCodec
         _promptCodec.EncodeChat(messages);
 
     public ITextTokenDecoder CreateDecoder() => new Decoder();
+
+    public void Dispose() => _promptCodec.Dispose();
 
     private sealed class Decoder : ITextTokenDecoder
     {

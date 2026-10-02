@@ -17,7 +17,7 @@ public interface ITextTokenDecoder : IDisposable
     string Complete();
 }
 
-public interface ITextTokenCodec
+public interface ITextTokenCodec : IDisposable
 {
     int[] EncodePrompt(string prompt);
     int[] EncodeChat(IReadOnlyList<OpenAiChatMessage> messages);
@@ -59,6 +59,7 @@ public sealed class DeterministicTextTokenCodec : ITextTokenCodec
     }
 
     public ITextTokenDecoder CreateDecoder() => new Decoder();
+    public void Dispose() { }
 
     private sealed class Decoder : ITextTokenDecoder
     {
