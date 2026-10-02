@@ -6,4 +6,7 @@
     <ProjectReference Include="../Fission.Runtime/Fission.Runtime.csproj" />
     <ProjectReference Include="../Fission.Scheduler/Fission.Scheduler.fsproj" />
   </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Tokenizers.HuggingFace" Version="3.23.1" />
+  </ItemGroup>
 </Project>
