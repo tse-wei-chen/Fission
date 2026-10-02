@@ -20,6 +20,23 @@ module Scheduler =
           UsedDeviceTransientBytes: (Fission.Abstractions.DeviceId * int64) list
           UsedDeviceSequences: (Fission.Abstractions.DeviceId * int) list }
 
+    let rec private containsDevice
+        (device: Fission.Abstractions.DeviceId)
+        (budgets: (Fission.Abstractions.DeviceId * 'T) list)
+        =
+        match budgets with
+        | [] -> false
+        | (candidate, _) :: tail ->
+            candidate = device || containsDevice device tail
+
+    let rec private hasDuplicateDevice
+        (budgets: (Fission.Abstractions.DeviceId * 'T) list)
+        =
+        match budgets with
+        | [] | [_] -> false
+        | (device, _) :: tail ->
+            containsDevice device tail || hasDuplicateDevice tail
+
     let private isRunnable (sequence: ReadySequence) =
         sequence.Phase = Prefilling || sequence.Phase = Decoding
 
@@ -309,11 +326,11 @@ module Scheduler =
         if budget.AvailableKvBytes < 0L then invalidArg "AvailableKvBytes" "AvailableKvBytes cannot be negative."
         if budget.AvailableDeviceBytes |> List.exists (fun (_, availableBytes) -> availableBytes < 0L) then
             invalidArg "AvailableDeviceBytes" "Available device bytes cannot be negative."
-        if (budget.AvailableDeviceBytes |> List.distinctBy fst |> List.length) <> budget.AvailableDeviceBytes.Length then
+        if hasDuplicateDevice budget.AvailableDeviceBytes then
             invalidArg "AvailableDeviceBytes" "Each execution device may appear only once in the device-memory budget."
         if budget.MaxDeviceSequences |> List.exists (fun (_, maxSequences) -> maxSequences < 0) then
             invalidArg "MaxDeviceSequences" "Per-device sequence capacity cannot be negative."
-        if (budget.MaxDeviceSequences |> List.distinctBy fst |> List.length) <> budget.MaxDeviceSequences.Length then
+        if hasDuplicateDevice budget.MaxDeviceSequences then
             invalidArg "MaxDeviceSequences" "Each execution device may appear only once in the per-device sequence budget."
         if policy.DecodeTokenReserve < 0 then invalidArg "DecodeTokenReserve" "DecodeTokenReserve cannot be negative."
         if policy.MaxPrefillChunkTokens <= 0 then invalidArg "MaxPrefillChunkTokens" "MaxPrefillChunkTokens must be positive."
