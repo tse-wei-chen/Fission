@@ -2,18 +2,11 @@ namespace Fission.Scheduler
 
 open System
 open Fission.Abstractions
-
-type SequencePhase =
-    | Waiting
-    | Prefilling
-    | Decoding
-    | Suspended
-    | Finished
-    | Cancelled
+open Fission.Abstractions.Scheduling
 
 type ReadySequence =
     { SequenceId: SequenceId
-      Phase: SequencePhase
+      Phase: SchedulingPhase
       DeadlineUtcTicks: int64
       EnqueuedUtcTicks: int64
       TokenDemand: int
