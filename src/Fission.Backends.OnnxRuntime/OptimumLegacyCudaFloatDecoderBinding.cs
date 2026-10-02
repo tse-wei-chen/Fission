@@ -36,10 +36,12 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
     private readonly HashSet<int> _eosTokenIds;
     private readonly ArrayPool<float> _scratchFloatPool;
     private readonly ArrayPool<long> _scratchLongPool;
+    private readonly PinnedFloatBufferPool? _decodeLogitsHostPool;
     private int _ortRunCount;
     private int _cudaPastReuseCount;
     private long _scratchFloatRentCount;
     private long _scratchLongRentCount;
+    private long _pageLockedDecodeLogitsRentCount;
     private int _disposed;
 
     public OptimumLegacyCudaFloatDecoderBinding(
@@ -47,14 +49,18 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
         CudaDeviceMemoryAllocator allocator,
         IEnumerable<int>? eosTokenIds = null,
         ArrayPool<float>? scratchFloatPool = null,
-        ArrayPool<long>? scratchLongPool = null)
+        ArrayPool<long>? scratchLongPool = null,
+        IHostStagingFloatBufferAllocator? decodeLogitsHostAllocator = null,
+        PinnedHostStagingPoolOptions? decodeLogitsHostPoolOptions = null)
         : this(
             profile,
             allocator,
             CallerOwnedOrtRun.Execute,
             eosTokenIds,
             scratchFloatPool,
-            scratchLongPool)
+            scratchLongPool,
+            decodeLogitsHostAllocator,
+            decodeLogitsHostPoolOptions)
     {
     }
 
@@ -64,7 +70,9 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
         CallerOwnedOrtRunInvoker runInvoker,
         IEnumerable<int>? eosTokenIds = null,
         ArrayPool<float>? scratchFloatPool = null,
-        ArrayPool<long>? scratchLongPool = null)
+        ArrayPool<long>? scratchLongPool = null,
+        IHostStagingFloatBufferAllocator? decodeLogitsHostAllocator = null,
+        PinnedHostStagingPoolOptions? decodeLogitsHostPoolOptions = null)
     {
         ArgumentNullException.ThrowIfNull(profile);
         ArgumentNullException.ThrowIfNull(allocator);
@@ -109,6 +117,17 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
             : new HashSet<int>(eosTokenIds);
         _scratchFloatPool = scratchFloatPool ?? ArrayPool<float>.Create();
         _scratchLongPool = scratchLongPool ?? ArrayPool<long>.Create();
+        _decodeLogitsHostPool = decodeLogitsHostAllocator is null
+            ? null
+            : new PinnedFloatBufferPool(
+                decodeLogitsHostPoolOptions ??
+                    new PinnedHostStagingPoolOptions
+                    {
+                        MaxRetainedBuffersPerLength = 2,
+                        MaxRetainedBytes = 64L * 1024L * 1024L,
+                        ClearOnReturn = false
+                    },
+                decodeLogitsHostAllocator);
 
         if (_eosTokenIds.Any(static token => token < 0))
         {
@@ -130,6 +149,9 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
     public int CudaPastReuseCount => Volatile.Read(ref _cudaPastReuseCount);
     public long ScratchFloatRentCount => Interlocked.Read(ref _scratchFloatRentCount);
     public long ScratchLongRentCount => Interlocked.Read(ref _scratchLongRentCount);
+    public bool PageLockedDecodeLogitsEnabled => _decodeLogitsHostPool is not null;
+    public long PageLockedDecodeLogitsRentCount =>
+        Interlocked.Read(ref _pageLockedDecodeLogitsRentCount);
 
     public DecoderOrtCudaResidentStateLease AcquireCudaResidentState(
         DecoderOrtState state,
@@ -620,12 +642,26 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
             }
 
             var logitsShape = geometry.GetLogitsShape(batchSize, sequenceLength);
-            var logitsLease = RentFloatScratch(
-                CheckedTensorLength(logitsShape),
-                scratchLeases);
+            var logitsLength = CheckedTensorLength(logitsShape);
+            Memory<float> logitsMemory;
+            if (sequenceLength == 1 && _decodeLogitsHostPool is not null)
+            {
+                var logitsLease = _decodeLogitsHostPool.Rent(logitsLength);
+                scratchLeases.Add(logitsLease);
+                logitsMemory = logitsLease.Memory;
+                Interlocked.Increment(ref _pageLockedDecodeLogitsRentCount);
+            }
+            else
+            {
+                var logitsLease = RentFloatScratch(
+                    logitsLength,
+                    scratchLeases);
+                logitsMemory = logitsLease.Memory;
+            }
+
             var logitsValue = OrtValue.CreateTensorValueFromMemory(
                 OrtMemoryInfo.DefaultInstance,
-                logitsLease.Memory,
+                logitsMemory,
                 logitsShape);
             ownedOutputs.Add(logitsValue);
             outputNames.Add(contract.Logits);
@@ -660,7 +696,7 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
                 cancellationToken.ThrowIfCancellationRequested();
                 var logitsOffset = checked(row * perSequenceLogitsLength);
                 var tokenId = OptimumLegacyFloatDecoderBinding.GreedySampleLastPosition(
-                    logitsLease.Span.Slice(logitsOffset, perSequenceLogitsLength),
+                    logitsMemory.Span.Slice(logitsOffset, perSequenceLogitsLength),
                     sequenceLength,
                     geometry.VocabularySize);
                 var state = present.CreateRowState(row, tokenId);
@@ -944,7 +980,12 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
 
     public void Dispose()
     {
-        Interlocked.Exchange(ref _disposed, 1);
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        _decodeLogitsHostPool?.Dispose();
     }
 
     private readonly record struct CohortExecution(
