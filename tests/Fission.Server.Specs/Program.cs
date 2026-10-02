@@ -473,6 +473,7 @@ using (var probeCodec = new DeterministicTextTokenCodec())
     probeConfiguration["Fission:ModelId"] = "server-spec-model";
     probeConfiguration["Fission:StartupProbeMaxTokens"] = "2";
     probeConfiguration["Fission:StartupProbeTimeoutSeconds"] = "5";
+    probeConfiguration["Fission:StartupProbeExitAfterSuccess"] = "true";
 
     var probe = await ServerStartupProbe.RunAsync(
         probeConfiguration,
@@ -488,6 +489,9 @@ using (var probeCodec = new DeterministicTextTokenCodec())
     Require(
         !string.IsNullOrWhiteSpace(probe.DecodedText),
         "Startup probe must exercise request-scoped generated-text decoding.");
+    Require(
+        probe.ExitAfterSuccess,
+        "Startup probe result must preserve one-shot exit intent for the composition root.");
     Require(
         runtime.SequenceCount == 0 &&
         kvPool.AllocatedPages == 0 &&

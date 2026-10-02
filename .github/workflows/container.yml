@@ -57,6 +57,13 @@ jobs:
       - name: Build image
         run: docker build --tag fission:ci .
 
+      - name: Smoke test one-shot startup probe
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          timeout 30s docker run --rm             --env Fission__StartupProbeEnabled=true             --env Fission__StartupProbeExitAfterSuccess=true             --env Fission__StartupProbePrompt=probe             --env Fission__StartupProbeMaxTokens=1             --env Fission__ModelId=container-probe             fission:ci
+
       - name: Smoke test server image
         shell: bash
         run: |

@@ -2,7 +2,12 @@
 
 Fission ships a reproducible container entry point for `Fission.Server`.
 
-The current server executable still uses `DeterministicBackend` and `DeterministicTextTokenCodec`. The container therefore validates serving/runtime integration and deployment mechanics; it is not yet a production GPU model-serving image. A CUDA/ONNX Runtime image should be added when backend selection and real-model configuration are exposed by `Fission.Server`.
+The default container still uses `DeterministicBackend` and
+`DeterministicTextTokenCodec` so CI remains self-contained. The server
+composition root can now select ONNX Runtime CPU or CUDA plus a Hugging Face
+tokenizer, but the default `Dockerfile` intentionally does not install NVIDIA
+CUDA/cuDNN user-space libraries. Real-model CUDA validation is therefore run on
+an NVIDIA host before a dedicated GPU image is treated as supported.
 
 ## Build the image
 
@@ -83,9 +88,24 @@ ASP.NET Core converts double underscores in environment names such as `Fission__
 
 See [releases and container publication](releases.md) for tag rules, `master` promotion, and GHCR behavior.
 
+## NVIDIA host smoke before a GPU image
+
+Before packaging a CUDA image, validate the exact ONNX model, tokenizer, CUDA
+runtime, and driver on the target NVIDIA host:
+
+```powershell
+pwsh ./eng/run-nvidia-smoke.ps1 -ModelPath <decoder-with-past.onnx> -TokenizerPath <tokenizer.json> -ModelId <model> -NumHiddenLayers <n> -NumKvHeads <n> -HeadDim <n> -VocabularySize <n>
+```
+
+The script uses the startup probe's one-shot mode, so success means the same
+production tokenizer/backend/runtime path completed inference and the process
+exited cleanly without starting Kestrel. See [NVIDIA real-model smoke](nvidia-smoke.md).
+
 ## Planned GPU image
 
-Do not simply add CUDA libraries to the current image and call it GPU serving. The server currently constructs `DeterministicBackend` directly. The next GPU-container milestone should first make the backend/model selectable at the serving composition root, then add a separate image such as:
+Do not simply add CUDA libraries to the default image and call it GPU serving.
+Once the NVIDIA host smoke is green for a known model/runtime matrix, add a
+separate image such as:
 
 ```text
 Dockerfile.cuda

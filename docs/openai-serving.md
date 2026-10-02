@@ -186,6 +186,7 @@ accepting traffic:
 - `Fission:StartupProbeModelId=<model id>` (optional; falls back to `Fission:ModelId`)
 - `Fission:StartupProbeMaxTokens=<positive integer>` (default `1`)
 - `Fission:StartupProbeTimeoutSeconds=<positive integer>` (default `60`)
+- `Fission:StartupProbeExitAfterSuccess=true` (optional one-shot mode)
 
 The probe deliberately uses the same configured `ITextTokenCodec`,
 `InferenceWorker`, scheduler/runtime, backend, KV lifecycle, and request-scoped
@@ -212,3 +213,9 @@ The probe is disabled by default so deterministic CI/container smoke paths do no
 perform extra inference. For NVIDIA real-model validation, enable it together
 with `Backend=onnx`, `ExecutionProvider=cuda`, and
 `Tokenizer=huggingface`.
+
+With `StartupProbeExitAfterSuccess=true`, the server becomes a one-shot
+validation executable: a successful full-stack probe logs its summary and exits
+with code 0 before Kestrel begins listening. Composition, CUDA/provider, model
+contract, tokenizer, scheduling, KV, timeout, or decode failures still fail the
+process. This mode is used by [the NVIDIA real-model smoke runner](nvidia-smoke.md).

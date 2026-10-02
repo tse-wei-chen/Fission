@@ -12,7 +12,8 @@ public sealed record StartupInferenceProbeResult(
     int GeneratedTokenCount,
     InferenceFinishReason FinishReason,
     TimeSpan Elapsed,
-    string DecodedText);
+    string DecodedText,
+    bool ExitAfterSuccess);
 
 /// <summary>
 /// Optional startup inference probe that exercises the configured tokenizer,
@@ -37,6 +38,10 @@ public static class ServerStartupProbe
         }
 
         var prompt = ReadRequired(configuration, "Fission:StartupProbePrompt");
+        var exitAfterSuccess = ReadBoolean(
+            configuration,
+            "Fission:StartupProbeExitAfterSuccess",
+            fallback: false);
         var modelId = ReadOptional(configuration, "Fission:StartupProbeModelId")
             ?? ReadRequired(configuration, "Fission:ModelId");
         var maxNewTokens = ReadPositiveInt(
@@ -100,7 +105,8 @@ public static class ServerStartupProbe
                 snapshot.GeneratedTokens.Count,
                 finishReason,
                 Stopwatch.GetElapsedTime(started),
-                decoded.ToString());
+                decoded.ToString(),
+                exitAfterSuccess);
         }
         catch (OperationCanceledException exception)
             when (!cancellationToken.IsCancellationRequested && timeout.IsCancellationRequested)
