@@ -336,22 +336,24 @@ module Scheduler =
         if policy.MaxPrefillChunkTokens <= 0 then invalidArg "MaxPrefillChunkTokens" "MaxPrefillChunkTokens must be positive."
         if policy.DeadlineUrgencyWindow < TimeSpan.Zero then invalidArg "DeadlineUrgencyWindow" "DeadlineUrgencyWindow cannot be negative."
 
-        let admittedRev, deferredRev, rejectedRev =
+        let decodesRev, prefillsRev, deferredRev, rejectedRev =
             sequences
-            |> List.fold (fun (admitted, deferred, rejected) sequence ->
+            |> List.fold (fun (decodes, prefills, deferred, rejected) sequence ->
                 match classifyAdmission sequence with
-                | Admitted candidate -> candidate :: admitted, deferred, rejected
-                | DeferredAdmission deferredItem -> admitted, deferredItem :: deferred, rejected
-                | RejectedAdmission rejectedItem -> admitted, deferred, rejectedItem :: rejected)
-                ([], [], [])
+                | Admitted candidate when candidate.Phase = Decoding ->
+                    candidate :: decodes, prefills, deferred, rejected
+                | Admitted candidate ->
+                    decodes, candidate :: prefills, deferred, rejected
+                | DeferredAdmission deferredItem ->
+                    decodes, prefills, deferredItem :: deferred, rejected
+                | RejectedAdmission rejectedItem ->
+                    decodes, prefills, deferred, rejectedItem :: rejected)
+                ([], [], [], [])
 
-        let admitted = List.rev admittedRev
+        let decodes = List.rev decodesRev
+        let prefills = List.rev prefillsRev
         let initiallyDeferred = List.rev deferredRev
         let rejected = List.rev rejectedRev
-
-        let decodes, prefills =
-            admitted
-            |> List.partition (fun sequence -> sequence.Phase = Decoding)
 
         let orderedDecodes = decodes |> List.sortWith (compareReady now policy)
 
