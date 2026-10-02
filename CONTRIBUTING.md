@@ -22,19 +22,21 @@ dotnet restore Fission.slnx
 dotnet build Fission.slnx -c Release --no-restore
 ```
 
-Run all sample executables:
+Run all sample executables that are registered in `Fission.slnx`:
 
 ```powershell
 pwsh ./eng/run-projects.ps1 -Root samples -Configuration Release -NoBuild
 ```
 
-Run every executable spec project under `tests/`:
+Run every executable spec project under `tests/` that is registered in `Fission.slnx`:
 
 ```powershell
 pwsh ./eng/run-projects.ps1 -Root tests -Configuration Release -NoBuild
 ```
 
-The project runner discovers `.csproj` and `.fsproj` files recursively. Adding a new spec project under `tests/` therefore automatically adds it to the main CI run; do not maintain a second hard-coded project list in the workflow.
+The solution file is the project manifest used by CI. Adding a new spec means adding its project to `Fission.slnx`; the main workflow then discovers and executes it automatically. Do not maintain a second hard-coded test-project list in GitHub Actions.
+
+Projects intentionally not registered in `Fission.slnx` are not treated as CI specs.
 
 ## Benchmarks
 
