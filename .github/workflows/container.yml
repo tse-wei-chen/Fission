@@ -21,6 +21,7 @@ on:
       - eng/run-nvidia-serving-benchmark.ps1
       - eng/summarize-ort-profile.ps1
       - eng/add-greedy-argmax-output.py
+      - eng/convert-onnx-fp16.py
       - .github/workflows/container.yml
   pull_request:
     branches: [ develop ]
@@ -42,6 +43,7 @@ on:
       - eng/run-nvidia-serving-benchmark.ps1
       - eng/summarize-ort-profile.ps1
       - eng/add-greedy-argmax-output.py
+      - eng/convert-onnx-fp16.py
       - .github/workflows/container.yml
 
 concurrency:
@@ -138,7 +140,9 @@ jobs:
           }
 
       - name: Validate ONNX graph rewrite syntax
-        run: python3 -m py_compile ./eng/add-greedy-argmax-output.py
+        run: |
+          python3 -m py_compile ./eng/add-greedy-argmax-output.py
+          python3 -m py_compile ./eng/convert-onnx-fp16.py
 
       - name: Validate GPU serving smoke manifest
         shell: pwsh

@@ -37,13 +37,6 @@ internal sealed class OptimumLegacyCudaPastKvBatch : IDisposable
 
         var geometry = profile.Geometry;
         var contract = profile.Contract;
-        if (geometry.KvElementType != TensorElementType.Float)
-        {
-            throw new ArgumentException(
-                "CUDA past-KV input binding currently supports FP32 KV tensors only.",
-                nameof(profile));
-        }
-
         if (string.IsNullOrWhiteSpace(contract.PastKeyNames) ||
             string.IsNullOrWhiteSpace(contract.PastValueNames))
         {
@@ -92,6 +85,12 @@ internal sealed class OptimumLegacyCudaPastKvBatch : IDisposable
             throw new InvalidOperationException(
                 $"CUDA cohort arena contains {_arena.LayerCount} layer(s), but the profile requires " +
                 $"{geometry.NumHiddenLayers}.");
+        }
+
+        if (_arena.ElementType != geometry.KvElementType)
+        {
+            throw new InvalidOperationException(
+                $"CUDA cohort arena element type {_arena.ElementType} does not match profile KV type {geometry.KvElementType}.");
         }
 
         var expectedPerSequenceShape = geometry.GetPastKvShape(

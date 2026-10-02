@@ -140,6 +140,10 @@ CUDA mode accepts:
   When `true`, decode logits are written into reusable CUDA page-locked host
   buffers before CPU greedy sampling. Prefill logits remain on the existing
   pageable scratch path. Defaults to `false`.
+- `Fission:ModelPrecision`: decoder floating-point precision. Defaults to
+  `fp32`. The current `fp16` path is CUDA-only and requires
+  `Fission:SampledTokenIdsOutput`; it keeps FP16 KV resident on CUDA and does
+  not use the page-locked full-logits path.
 - `Fission:SampledTokenIdsOutput`: optional CUDA-only rank-2 int64 graph
   output containing one greedy token id per batch row. When configured, the
   CUDA binding fetches this small output instead of the full logits tensor for

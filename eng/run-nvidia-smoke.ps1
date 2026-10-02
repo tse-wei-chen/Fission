@@ -11,6 +11,9 @@ param(
     [ValidateNotNullOrEmpty()]
     [string] $ModelId,
 
+    [ValidateSet("fp32", "fp16")]
+    [string] $ModelPrecision = "fp32",
+
     [Parameter(Mandatory = $true)]
     [ValidateRange(1, 2147483647)]
     [int] $NumHiddenLayers,
@@ -86,6 +89,9 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $serverProject = Join-Path $repositoryRoot "src/Fission.Server/Fission.Server.csproj"
 $model = Resolve-RequiredFile -Path $ModelPath -Label "ONNX model"
 $tokenizer = Resolve-RequiredFile -Path $TokenizerPath -Label "Tokenizer"
+if ($ModelPrecision -eq "fp16" -and [string]::IsNullOrWhiteSpace($SampledTokenIdsOutput)) {
+    throw "FP16 CUDA smoke currently requires -SampledTokenIdsOutput."
+}
 $cudaRuntimeLibrary = if ([string]::IsNullOrWhiteSpace($CudaRuntimeLibraryPath)) {
     ""
 } else {
@@ -122,6 +128,7 @@ $settings = [ordered]@{
     "Fission__CudaDeviceId" = "$CudaDeviceId"
     "Fission__CudaRuntimeLibraryPath" = $cudaRuntimeLibrary
     "Fission__SampledTokenIdsOutput" = $SampledTokenIdsOutput
+    "Fission__ModelPrecision" = $ModelPrecision
     "Fission__ModelPath" = $model
     "Fission__ModelId" = $ModelId
     "Fission__NumHiddenLayers" = "$NumHiddenLayers"
@@ -169,6 +176,7 @@ try {
     Write-Host ""
     Write-Host "Fission NVIDIA real-model smoke"
     Write-Host "  model:       $ModelId"
+    Write-Host "  precision:   $ModelPrecision"
     Write-Host "  model path:  $model"
     Write-Host "  tokenizer:   $tokenizer"
     Write-Host "  device:      cuda:$CudaDeviceId"

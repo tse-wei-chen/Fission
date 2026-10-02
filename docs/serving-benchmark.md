@@ -319,3 +319,71 @@ and operator and reports Memcpy execution-event count and summed duration.
 Summed trace durations are diagnostic event time, not wall-clock request
 latency. Use them to answer whether the CUDA/CPU partition and Memcpy nodes are
 actually expensive before changing graph placement or provider options.
+
+
+### FP16 CUDA GQA gate
+
+ORT profiling of the validated FP32 path showed that
+`GroupQueryAttention` executes on the CPU while the surrounding graph remains
+mostly CUDA-resident. ONNX Runtime 1.30's CUDA GQA registration is FP16/BF16,
+not FP32, so the next hardware gate is a FP16 graph.
+
+Create an FP16 model, then append the sampled-token output:
+
+```powershell
+python -m pip install onnx onnxconverter-common
+
+python ./eng/convert-onnx-fp16.py `
+  --input artifacts/models/SmolLM2-135M-Instruct/onnx/model.onnx `
+  --output artifacts/models/SmolLM2-135M-Instruct/onnx/model.fp16.onnx `
+  --skip-check
+
+python ./eng/add-greedy-argmax-output.py `
+  --input artifacts/models/SmolLM2-135M-Instruct/onnx/model.fp16.onnx `
+  --output artifacts/models/SmolLM2-135M-Instruct/onnx/model.fp16.fission-greedy.onnx `
+  --sampled-output fission_sampled_token_ids `
+  --skip-check
+```
+
+Both `--skip-check` switches remain opt-in. They are intended for graphs whose
+ORT contrib operators are accepted by the target runtime but rejected by the
+generic ONNX checker.
+
+Run the one-shot hardware gate before benchmarking:
+
+```powershell
+pwsh ./eng/run-nvidia-smoke.ps1 `
+  -ModelPath artifacts/models/SmolLM2-135M-Instruct/onnx/model.fp16.fission-greedy.onnx `
+  -TokenizerPath artifacts/models/SmolLM2-135M-Instruct/tokenizer.json `
+  -ModelId SmolLM2-135M-Instruct `
+  -ModelPrecision fp16 `
+  -NumHiddenLayers 30 `
+  -NumKvHeads 3 `
+  -HeadDim 64 `
+  -VocabularySize 49152 `
+  -EosTokenIds 2 `
+  -SampledTokenIdsOutput fission_sampled_token_ids
+```
+
+Then benchmark without ORT profiling first:
+
+```powershell
+pwsh ./eng/run-nvidia-serving-benchmark.ps1 `
+  -ModelPath artifacts/models/SmolLM2-135M-Instruct/onnx/model.fp16.fission-greedy.onnx `
+  -TokenizerPath artifacts/models/SmolLM2-135M-Instruct/tokenizer.json `
+  -ModelId SmolLM2-135M-Instruct `
+  -ModelPrecision fp16 `
+  -NumHiddenLayers 30 `
+  -NumKvHeads 3 `
+  -HeadDim 64 `
+  -VocabularySize 49152 `
+  -EosTokenIds 2 `
+  -SampledTokenIdsOutput fission_sampled_token_ids `
+  -Label fission-cuda-fp16-gqa `
+  -Repetitions 3
+```
+
+The first success criterion is structural: a follow-up `-OrtProfile` run should
+show `GroupQueryAttention` on `CUDAExecutionProvider` instead of
+`CPUExecutionProvider`, with the associated host Memcpy share dropping
+materially. Throughput/TPOT are the second gate.

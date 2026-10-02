@@ -15,9 +15,12 @@ internal delegate void CallerOwnedOrtRunInvoker(
     IReadOnlyCollection<OrtValue> outputValues);
 
 /// <summary>
-/// CUDA-resident FP32 Optimum legacy decoder-with-past binding.
+/// CUDA-resident Optimum legacy decoder-with-past binding.
 ///
-/// Scalar token/position/mask inputs and logits remain host-backed. Past and
+/// The established FP32 path keeps scalar token/position/mask inputs and logits
+/// host-backed. An experimental FP16 path is also supported when the model exposes
+/// graph-side sampled token ids, allowing FP16 KV state and model execution to stay
+/// CUDA-resident without adding an FP16 host-logits sampler yet. Past and
 /// present KV stay CUDA-resident: complete multi-row CUDA cohorts are reused
 /// zero-copy, while singleton CUDA states (including migration imports) are
 /// retained through the generic resident-state capability and rebound directly.
@@ -79,17 +82,47 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
         ArgumentNullException.ThrowIfNull(allocator);
         ArgumentNullException.ThrowIfNull(runInvoker);
 
-        if (profile.Geometry.KvElementType != TensorElementType.Float)
-        {
-            throw new ArgumentException(
-                "The CUDA FP32 decoder binding requires Float KV tensors.",
-                nameof(profile));
-        }
+        var sampledOutputConfigured =
+            !string.IsNullOrWhiteSpace(profile.SampledTokenIdsOutput);
+        var kvElementType = profile.Geometry.KvElementType;
+        var logitsElementType = profile.Contract.LogitsElementType;
 
-        if (profile.Contract.LogitsElementType != TensorElementType.Float)
+        if (kvElementType == TensorElementType.Float)
+        {
+            if (logitsElementType != TensorElementType.Float)
+            {
+                throw new ArgumentException(
+                    "The CUDA FP32 decoder path requires Float logits.",
+                    nameof(profile));
+            }
+        }
+        else if (kvElementType == TensorElementType.Float16)
+        {
+            if (logitsElementType != TensorElementType.Float16)
+            {
+                throw new ArgumentException(
+                    "The CUDA FP16 decoder path requires Float16 logits.",
+                    nameof(profile));
+            }
+
+            if (!sampledOutputConfigured)
+            {
+                throw new ArgumentException(
+                    "The CUDA FP16 decoder path currently requires a graph-side sampled token id output.",
+                    nameof(profile));
+            }
+
+            if (decodeLogitsHostAllocator is not null)
+            {
+                throw new ArgumentException(
+                    "Page-locked host logits are not used by the graph-sampled CUDA FP16 path.",
+                    nameof(decodeLogitsHostAllocator));
+            }
+        }
+        else
         {
             throw new ArgumentException(
-                "The CUDA FP32 decoder binding requires Float logits.",
+                "The CUDA decoder binding currently supports Float or Float16 KV tensors.",
                 nameof(profile));
         }
 
@@ -98,12 +131,11 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
             !profile.Contract.UsesPastKeyValues)
         {
             throw new ArgumentException(
-                "The CUDA Optimum FP32 binding requires attention_mask, position_ids, and past/present KV tensors.",
+                "The CUDA Optimum binding requires attention_mask, position_ids, and past/present KV tensors.",
                 nameof(profile));
         }
 
         var additionalOutputCount = profile.Contract.AdditionalOutputs?.Count ?? 0;
-        var sampledOutputConfigured = !string.IsNullOrWhiteSpace(profile.SampledTokenIdsOutput);
         var sampledOutputMatchesContract =
             sampledOutputConfigured &&
             additionalOutputCount == 1 &&
@@ -122,7 +154,7 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
                 : additionalOutputCount != 0))
         {
             throw new ArgumentException(
-                "The CUDA Optimum FP32 binding only supports the optional sampled_token_ids int64 rank-2 output in addition to the standard decoder tensors.",
+                "The CUDA Optimum binding only supports the optional sampled_token_ids int64 rank-2 output in addition to the standard decoder tensors.",
                 nameof(profile));
         }
 
@@ -153,11 +185,17 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
                 "EOS token ids cannot be negative.");
         }
 
+        var precisionTag = Geometry.KvElementType == TensorElementType.Float16
+            ? "fp16"
+            : "fp32";
         CudaResidentStateFormatId =
-            $"optimum-legacy:fp32:kv4d:l{Geometry.NumHiddenLayers}:h{Geometry.NumKvHeads}:d{Geometry.HeadDim}:cuda-v1";
+            $"optimum-legacy:{precisionTag}:kv4d:l{Geometry.NumHiddenLayers}:h{Geometry.NumKvHeads}:d{Geometry.HeadDim}:cuda-v1";
     }
 
-    public string Name => "optimum-legacy-cuda-fp32-greedy";
+    public string Name =>
+        Geometry.KvElementType == TensorElementType.Float16
+            ? "optimum-legacy-cuda-fp16-graph-greedy"
+            : "optimum-legacy-cuda-fp32-greedy";
     public OnnxSessionContract SessionContract => _profile.SessionContract;
     public DecoderOrtGeometry Geometry => _profile.Geometry;
     public int DeviceId => _allocator.DeviceId;
@@ -614,11 +652,11 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
                         contract.PastValueNames!,
                         layer));
 
-                    var key = OrtValue.CreateTensorValueFromMemory(
-                        Array.Empty<float>(),
+                    var key = CreateEmptyKvTensor(
+                        geometry.KvElementType,
                         batchedPastShape);
-                    var value = OrtValue.CreateTensorValueFromMemory(
-                        Array.Empty<float>(),
+                    var value = CreateEmptyKvTensor(
+                        geometry.KvElementType,
                         batchedPastShape);
                     ownedInputs.Add(key);
                     ownedInputs.Add(value);
@@ -1017,6 +1055,23 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
         }
     }
 
+    private static OrtValue CreateEmptyKvTensor(
+        TensorElementType elementType,
+        long[] shape) =>
+        elementType switch
+        {
+            TensorElementType.Float =>
+                OrtValue.CreateTensorValueFromMemory(
+                    Array.Empty<float>(),
+                    shape),
+            TensorElementType.Float16 =>
+                OrtValue.CreateTensorValueFromMemory(
+                    Array.Empty<Float16>(),
+                    shape),
+            _ => throw new InvalidOperationException(
+                $"Unsupported CUDA decoder KV element type {elementType}.")
+        };
+
     private static int CheckedTensorLength(IReadOnlyList<long> shape)
     {
         long count = 1;
@@ -1108,8 +1163,20 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
                 for (var layer = 0; layer < geometry.NumHiddenLayers; layer++)
                 {
                     var resident = _lease.GetLayer(layer);
-                    ValidateResidentTensor(resident.Key, expectedShape, expectedDeviceId, layer, "key");
-                    ValidateResidentTensor(resident.Value, expectedShape, expectedDeviceId, layer, "value");
+                    ValidateResidentTensor(
+                        resident.Key,
+                        expectedShape,
+                        expectedDeviceId,
+                        geometry.KvElementType,
+                        layer,
+                        "key");
+                    ValidateResidentTensor(
+                        resident.Value,
+                        expectedShape,
+                        expectedDeviceId,
+                        geometry.KvElementType,
+                        layer,
+                        "value");
                     var offset = checked(layer * 2);
                     inputNames[offset] = DecoderOnlyOnnxContract.ExpandLayerName(
                         profile.Contract.PastKeyNames!,
@@ -1120,14 +1187,14 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
 
                     _inputValues[offset] = OrtValue.CreateTensorValueWithData(
                         memoryInfo,
-                        TensorElementType.Float,
+                        geometry.KvElementType,
                         expectedShape,
                         resident.Key.DevicePointer,
                         resident.Key.ByteLength);
                     produced++;
                     _inputValues[offset + 1] = OrtValue.CreateTensorValueWithData(
                         memoryInfo,
-                        TensorElementType.Float,
+                        geometry.KvElementType,
                         expectedShape,
                         resident.Value.DevicePointer,
                         resident.Value.ByteLength);
@@ -1186,15 +1253,16 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
             CudaDeviceTensorView tensor,
             IReadOnlyList<long> expectedShape,
             int expectedDeviceId,
+            TensorElementType expectedElementType,
             int layer,
             string slot)
         {
             if (tensor.DeviceId != expectedDeviceId ||
-                tensor.ElementType != TensorElementType.Float ||
+                tensor.ElementType != expectedElementType ||
                 !tensor.Shape.SequenceEqual(expectedShape))
             {
                 throw new InvalidOperationException(
-                    $"CUDA singleton past layer {layer} {slot} does not match the expected FP32 device tensor geometry.");
+                    $"CUDA singleton past layer {layer} {slot} does not match the expected {expectedElementType} device tensor geometry.");
             }
         }
     }

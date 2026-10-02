@@ -151,6 +151,32 @@ static async Task ValidateBackendCompositionAsync()
             "Graph-side sampled token output must fail fast on the CPU provider.");
         onnx["Fission:SampledTokenIdsOutput"] = null;
 
+        onnx["Fission:ModelPrecision"] = "fp16";
+        RequireThrows<InvalidOperationException>(
+            () => ServerBackendFactory.Create(onnx, device),
+            "FP16 model composition must fail fast on the CPU provider.");
+
+        onnx["Fission:ModelPrecision"] = "not-a-precision";
+        RequireThrows<InvalidOperationException>(
+            () => ServerBackendFactory.Create(onnx, device),
+            "Unknown model precision must fail during composition.");
+
+        onnx["Fission:ModelPrecision"] = "fp16";
+        onnx["Fission:ExecutionProvider"] = "cuda";
+        RequireThrows<InvalidOperationException>(
+            () => ServerBackendFactory.Create(onnx, new DeviceId("cuda:0")),
+            "CUDA FP16 composition must require graph-side sampled token ids before native CUDA load.");
+
+        onnx["Fission:SampledTokenIdsOutput"] = "fission_sampled_token_ids";
+        onnx["Fission:CudaPageLockedDecodeLogits"] = "true";
+        RequireThrows<InvalidOperationException>(
+            () => ServerBackendFactory.Create(onnx, new DeviceId("cuda:0")),
+            "CUDA FP16 graph sampling must reject the unused page-locked full-logits path.");
+
+        onnx["Fission:ModelPrecision"] = "fp32";
+        onnx["Fission:SampledTokenIdsOutput"] = null;
+        onnx["Fission:CudaPageLockedDecodeLogits"] = null;
+
         onnx["Fission:ExecutionProvider"] = "cuda";
         onnx["Fission:CudaDeviceId"] = "-1";
         RequireThrows<InvalidOperationException>(

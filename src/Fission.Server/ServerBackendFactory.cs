@@ -4,6 +4,7 @@ using Fission.Abstractions.Execution;
 using Fission.Backends.OnnxRuntime;
 using Fission.Runtime.Backends;
 using Microsoft.Extensions.Configuration;
+using Microsoft.ML.OnnxRuntime.Tensors;
 
 namespace Fission.Server;
 
@@ -71,6 +72,7 @@ public static class ServerBackendFactory
 
         var modelId = ReadRequired(configuration, "Fission:ModelId");
         var provider = ReadExecutionProvider(configuration);
+        var modelElementType = ReadModelElementType(configuration);
         var sampledTokenIdsOutput = ReadOptional(
             configuration,
             "Fission:SampledTokenIdsOutput");
@@ -81,11 +83,37 @@ public static class ServerBackendFactory
                 "Fission:SampledTokenIdsOutput is currently supported only with the CUDA execution provider.");
         }
 
+        if (modelElementType == TensorElementType.Float16)
+        {
+            if (provider != OnnxExecutionProvider.Cuda)
+            {
+                throw new InvalidOperationException(
+                    "Fission:ModelPrecision=fp16 is currently supported only with the CUDA execution provider.");
+            }
+
+            if (sampledTokenIdsOutput is null)
+            {
+                throw new InvalidOperationException(
+                    "Fission:ModelPrecision=fp16 currently requires Fission:SampledTokenIdsOutput.");
+            }
+
+            if (ReadBoolean(
+                    configuration,
+                    "Fission:CudaPageLockedDecodeLogits",
+                    fallback: false))
+            {
+                throw new InvalidOperationException(
+                    "Fission:CudaPageLockedDecodeLogits is not used by the graph-sampled FP16 CUDA path.");
+            }
+        }
+
         var profile = OptimumLegacyDecoderProfile.CreateLlamaLike(
             numHiddenLayers: ReadPositiveInt(configuration, "Fission:NumHiddenLayers"),
             numKvHeads: ReadPositiveInt(configuration, "Fission:NumKvHeads"),
             headDim: ReadPositiveInt(configuration, "Fission:HeadDim"),
             vocabularySize: ReadPositiveInt(configuration, "Fission:VocabularySize"),
+            kvElementType: modelElementType,
+            logitsElementType: modelElementType,
             sampledTokenIdsOutput: sampledTokenIdsOutput);
         var eosTokenIds = ReadTokenIds(configuration, "Fission:EosTokenIds");
 
@@ -246,6 +274,21 @@ public static class ServerBackendFactory
 
     private static int ReadCudaDeviceId(IConfiguration configuration) =>
         ReadNonNegativeInt(configuration, "Fission:CudaDeviceId", fallback: 0);
+
+    private static TensorElementType ReadModelElementType(
+        IConfiguration configuration)
+    {
+        var value = (configuration["Fission:ModelPrecision"] ?? "fp32")
+            .Trim()
+            .ToLowerInvariant();
+        return value switch
+        {
+            "" or "fp32" or "float" or "float32" => TensorElementType.Float,
+            "fp16" or "half" or "float16" => TensorElementType.Float16,
+            _ => throw new InvalidOperationException(
+                $"Unsupported Fission model precision '{value}'. Expected 'fp32' or 'fp16'.")
+        };
+    }
 
     private static bool ReadBoolean(
         IConfiguration configuration,

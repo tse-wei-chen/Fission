@@ -38,13 +38,6 @@ internal sealed class OptimumLegacyCudaPresentKvBatch : IDisposable
 
         var geometry = profile.Geometry;
         var contract = profile.Contract;
-        if (geometry.KvElementType != TensorElementType.Float)
-        {
-            throw new ArgumentException(
-                "CUDA present-KV output binding currently supports FP32 KV tensors only.",
-                nameof(profile));
-        }
-
         if (string.IsNullOrWhiteSpace(contract.PresentKeyNames) ||
             string.IsNullOrWhiteSpace(contract.PresentValueNames))
         {
@@ -65,7 +58,8 @@ internal sealed class OptimumLegacyCudaPresentKvBatch : IDisposable
             batchSize,
             geometry.NumHiddenLayers,
             perSequenceShape,
-            allocator);
+            allocator,
+            geometry.KvElementType);
 
         var outputNames = new string[checked(geometry.NumHiddenLayers * 2)];
         _outputValues = new OrtValue[outputNames.Length];
