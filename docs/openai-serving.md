@@ -97,18 +97,26 @@ Admission remains bounded at `InferenceWorker`. Per-request output channels rema
 
 `Fission.Server` defaults to the deterministic backend so CI, transport specs,
 and zero-model smoke runs remain self-contained. Set `Fission:Backend=onnx` to
-compose the existing stateful Optimum legacy decoder stack:
+compose the existing stateful Optimum legacy decoder stack. The execution
+provider is selected independently with
+`Fission:OnnxExecutionProvider=cpu|cuda` and defaults to `cpu`.
 
 ```text
+CPU:
 OnnxRuntimeModelSource
   -> OptimumLegacyFloatDecoderBinding
   -> DecoderOnlyOnnxExecutionAdapter
-  -> OnnxRuntimeBackend
-  -> ContinuousBatchExecutor
-  -> InferenceEngine
+  -> OnnxRuntimeBackend (CPU EP)
+
+CUDA:
+OnnxRuntimeModelSource
+  -> CudaDeviceMemoryAllocator
+  -> OptimumLegacyCudaFloatDecoderBinding
+  -> DecoderOnlyOnnxExecutionAdapter
+  -> OnnxRuntimeBackend (CUDA EP)
 ```
 
-The initial real-model composition requires:
+The real-model composition requires:
 
 - `Fission:ModelPath`: local decoder-with-past ONNX file.
 - `Fission:ModelId`: model id expected by serving requests.
@@ -117,15 +125,29 @@ The initial real-model composition requires:
 - `Fission:HeadDim`: positive attention head dimension.
 - `Fission:VocabularySize`: positive vocabulary size.
 - `Fission:EosTokenIds`: optional comma/semicolon/space-separated EOS token ids.
+- `Fission:OnnxExecutionProvider`: `cpu` or `cuda` (default `cpu`).
+
+CUDA mode additionally supports:
+
+- `Fission:CudaDeviceId`: non-negative CUDA ordinal (default `0`).
+- `Fission:CudaRuntimeLibraryPath`: optional explicit CUDA Runtime library path.
+
+The CUDA path uses the ONNX Runtime GPU package, appends the CUDA Execution
+Provider to the session, allocates KV state on the same CUDA device through the
+existing CUDA-resident binding, and fails startup if the configured CUDA Runtime
+cannot be loaded. The logical Fission device id remains independently
+configurable through `Fission:Device`; deployments should keep it aligned with
+the selected CUDA ordinal for clear scheduling/trace identity.
 
 The server validates configuration and model-file existence before runtime
 construction. `ContinuousBatchExecutor.CreateAsync` initializes the backend
-before Kestrel starts serving, so an invalid ONNX graph/session contract fails
-startup rather than the first inference request.
+before Kestrel starts serving, so an unavailable CUDA provider, invalid ONNX
+graph, or session-contract mismatch fails startup rather than the first inference
+request.
 
-This composition currently uses the CPU FP32 Optimum legacy binding. Tokenizer
-composition is independently selectable, so an ONNX model can be paired with a
-matching Hugging Face `tokenizer.json` and explicit chat-template profile.
-CUDA Execution Provider composition remains a separate hardware-tested
-milestone. The deterministic backend and tokenizer both remain defaults for CI
-and zero-model smoke paths.
+Tokenizer composition is independently selectable, so the ONNX backend can be
+paired with a matching Hugging Face `tokenizer.json` and explicit chat-template
+profile. The initial CUDA server path intentionally uses the direct device
+allocator; pooled CUDA allocation plus device-wide pressure/reclaim composition
+is the next memory-policy milestone. Deterministic backend/tokenizer and the CPU
+ONNX provider remain available for CI and zero-GPU validation.
