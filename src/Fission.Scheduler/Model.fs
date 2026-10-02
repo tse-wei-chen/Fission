@@ -82,3 +82,14 @@ type SchedulingDecision =
       ConsumedKvPages: int
       ConsumedKvBytes: int64
       ConsumedTransientKvBytes: int64 }
+
+[<Struct>]
+type internal RawSchedulingDecision =
+    { SelectedRev: ScheduledSequence list
+      InitiallyDeferred: DeferredSequence list
+      DeferredRev: DeferredSequence list
+      Rejected: RejectedSequence list
+      ConsumedTokens: int
+      ConsumedKvPages: int
+      ConsumedKvBytes: int64
+      ConsumedTransientKvBytes: int64 }
