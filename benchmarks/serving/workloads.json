@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "workloads": [
+    {
+      "name": "short-interactive",
+      "endpoint": "completions",
+      "prompt_file": "prompts/short.txt",
+      "requests": 100,
+      "concurrency": [1, 8, 32],
+      "max_tokens": 64,
+      "warmup": 4,
+      "timeout_seconds": 300
+    },
+    {
+      "name": "chat",
+      "endpoint": "chat",
+      "prompt_file": "prompts/chat.txt",
+      "requests": 100,
+      "concurrency": [8, 32, 128],
+      "max_tokens": 256,
+      "warmup": 8,
+      "timeout_seconds": 300
+    },
+    {
+      "name": "rag-like",
+      "endpoint": "completions",
+      "prompt_file": "prompts/rag-like.txt",
+      "requests": 60,
+      "concurrency": [8, 32],
+      "max_tokens": 256,
+      "warmup": 4,
+      "timeout_seconds": 300
+    },
+    {
+      "name": "decode-heavy",
+      "endpoint": "completions",
+      "prompt_file": "prompts/decode-heavy.txt",
+      "requests": 40,
+      "concurrency": [8, 32],
+      "max_tokens": 1024,
+      "warmup": 4,
+      "timeout_seconds": 600
+    }
+  ]
+}
