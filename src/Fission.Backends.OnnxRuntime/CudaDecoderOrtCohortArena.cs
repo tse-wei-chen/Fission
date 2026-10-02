@@ -5,7 +5,7 @@ using Microsoft.ML.OnnxRuntime.Tensors;
 namespace Fission.Backends.OnnxRuntime;
 
 /// <summary>
-/// Ref-counted FP32 CUDA backing storage for one dense decoder cohort frontier.
+/// Ref-counted CUDA backing storage for one dense decoder cohort frontier.
 ///
 /// The arena owns one batched key/value CUDA allocation per layer. Its initial
 /// builder reference keeps those allocations alive while ORT output views are in
@@ -30,13 +30,25 @@ internal sealed class CudaDecoderOrtCohortArena
         int batchSize,
         int layerCount,
         IReadOnlyList<long> perSequenceShape,
-        CudaDeviceMemoryAllocator allocator)
+        CudaDeviceMemoryAllocator allocator,
+        TensorElementType elementType = TensorElementType.Float)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(position);
         ArgumentOutOfRangeException.ThrowIfLessThan(batchSize, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(layerCount, 1);
         ArgumentNullException.ThrowIfNull(perSequenceShape);
         ArgumentNullException.ThrowIfNull(allocator);
+        if (elementType is not (
+            TensorElementType.Float or
+            TensorElementType.Float16 or
+            TensorElementType.BFloat16))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(elementType),
+                elementType,
+                "CUDA decoder cohort element type must be Float, Float16, or BFloat16.");
+        }
+
         if (perSequenceShape.Count == 0)
         {
             throw new ArgumentException(
@@ -70,7 +82,16 @@ internal sealed class CudaDecoderOrtCohortArena
         _batchedShape[0] = batchSize;
         _perSequenceShapeView = Array.AsReadOnly(_perSequenceShape);
         _batchedShapeView = Array.AsReadOnly(_batchedShape);
-        PerSequenceByteLength = checked(elementCount * sizeof(float));
+        ElementType = elementType;
+        var elementSizeBytes = elementType switch
+        {
+            TensorElementType.Float => sizeof(float),
+            TensorElementType.Float16 => sizeof(ushort),
+            TensorElementType.BFloat16 => sizeof(ushort),
+            _ => throw new InvalidOperationException(
+                $"Unsupported CUDA decoder cohort element type {elementType}.")
+        };
+        PerSequenceByteLength = checked(elementCount * elementSizeBytes);
         BatchedByteLength = checked(PerSequenceByteLength * batchSize);
         Position = position;
         BatchSize = batchSize;
@@ -116,6 +137,7 @@ internal sealed class CudaDecoderOrtCohortArena
     public int BatchSize { get; }
     public int LayerCount => _keyAllocations.Length;
     public int DeviceId { get; }
+    public TensorElementType ElementType { get; }
     public long PerSequenceByteLength { get; }
     public long BatchedByteLength { get; }
     public bool IsReleased => Volatile.Read(ref _released) != 0;
@@ -138,13 +160,13 @@ internal sealed class CudaDecoderOrtCohortArena
         {
             key = OrtValue.CreateTensorValueWithData(
                 memoryInfo,
-                TensorElementType.Float,
+                ElementType,
                 _batchedShape,
                 _keyAllocations[layer].Pointer,
                 BatchedByteLength);
             var value = OrtValue.CreateTensorValueWithData(
                 memoryInfo,
-                TensorElementType.Float,
+                ElementType,
                 _batchedShape,
                 _valueAllocations[layer].Pointer,
                 BatchedByteLength);
@@ -177,14 +199,14 @@ internal sealed class CudaDecoderOrtCohortArena
             {
                 var key = OrtValue.CreateTensorValueWithData(
                     memoryInfo,
-                    TensorElementType.Float,
+                    ElementType,
                     _perSequenceShape,
                     GetRowPointer(_keyAllocations[layer], row),
                     PerSequenceByteLength);
                 owned.Add(key);
                 var value = OrtValue.CreateTensorValueWithData(
                     memoryInfo,
-                    TensorElementType.Float,
+                    ElementType,
                     _perSequenceShape,
                     GetRowPointer(_valueAllocations[layer], row),
                     PerSequenceByteLength);
@@ -262,13 +284,13 @@ internal sealed class CudaDecoderOrtCohortArena
                 new CudaDeviceTensorView(
                     GetRowPointer(_keyAllocations[layer], row),
                     PerSequenceByteLength,
-                    TensorElementType.Float,
+                    ElementType,
                     _perSequenceShape,
                     DeviceId),
                 new CudaDeviceTensorView(
                     GetRowPointer(_valueAllocations[layer], row),
                     PerSequenceByteLength,
-                    TensorElementType.Float,
+                    ElementType,
                     _perSequenceShape,
                     DeviceId));
         }
