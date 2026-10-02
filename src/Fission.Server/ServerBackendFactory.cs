@@ -195,7 +195,13 @@ public static class ServerBackendFactory
     private static OnnxExecutionProvider ReadExecutionProvider(
         IConfiguration configuration)
     {
-        var value = (configuration["Fission:ExecutionProvider"] ?? "cpu").Trim();
+        var configured = configuration["Fission:ExecutionProvider"];
+        if (string.IsNullOrWhiteSpace(configured))
+        {
+            configured = configuration["Fission:OnnxExecutionProvider"];
+        }
+
+        var value = (configured ?? "cpu").Trim();
         return value.ToLowerInvariant() switch
         {
             "" or "cpu" => OnnxExecutionProvider.Cpu,
