@@ -171,6 +171,7 @@ jobs:
           docker run --detach \
             --name fission-container-ci \
             --publish 18000:8000 \
+            --env Fission__ControlToken=ci-control-token \
             fission:ci
 
           cleanup() {
