@@ -1,0 +1,5 @@
+Context:
+A production inference service receives requests with widely varying prompt lengths. The scheduler can interleave decode work with chunked prefill work, and it tracks token budgets, KV-cache page usage, physical KV bytes, device-memory pressure, and per-device sequence capacity. Requests may carry priorities and deadlines. Long prompts can be divided into prefill chunks so that one request does not monopolize the device. Decode work is latency-sensitive because every generated token is visible to a waiting client. The runtime owns sequence state and releases backend and KV resources at terminal completion or cancellation. Multi-device systems add migration costs and require explicit transfer planning.
+
+Question:
+Using only the context above, summarize an operational policy for maintaining throughput while avoiding starvation and memory overcommit. Explain which signals should affect admission and scheduling, how chunked prefill helps, and what should happen when memory pressure increases.
