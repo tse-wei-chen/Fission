@@ -14,18 +14,6 @@ type SchedulingKernel() =
             mapped <- mapping items[index] :: mapped
         mapped
 
-    let mapReadOnlyListToArray
-        (mapping: 'T -> 'U)
-        (items: System.Collections.Generic.IReadOnlyList<'T>)
-        =
-        if items.Count = 0 then
-            Array.empty<'U>
-        else
-            let mapped = Array.zeroCreate<'U> items.Count
-            for index = 0 to items.Count - 1 do
-                mapped[index] <- mapping items[index]
-            mapped
-
     let mapListToArray
         (mapping: 'T -> 'U)
         (items: 'T list)
@@ -130,9 +118,12 @@ type SchedulingKernel() =
                   DeadlineUrgencyWindow = policy.DeadlineUrgencyWindow }
 
             let decision =
-                candidates
-                |> mapReadOnlyListToArray toCandidate
-                |> Scheduler.scheduleArrayAt now resourceBudget schedulingPolicy
+                Scheduler.scheduleMappedReadOnlyAt
+                    now
+                    resourceBudget
+                    schedulingPolicy
+                    toCandidate
+                    candidates
 
             let batch = ScheduleCompiler.compile scheduleId decision
 
