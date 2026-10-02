@@ -67,7 +67,7 @@ Optional controls include:
 - `-MaxTokens` (default `1`)
 - `-TimeoutSeconds` (default `120`)
 - `-ChatTemplate none|chatml|qwen2|llama3`
-- `-CudaRuntimeLibraryPath` when the CUDA Runtime cannot be resolved normally
+- `-CudaRuntimeLibraryPath` when the CUDA Runtime cannot be resolved normally. When supplied, its parent directory is also prepended to the child process library search path (`PATH` on Windows, `LD_LIBRARY_PATH` elsewhere).
 - `-NoBuild` when `Fission.Server` is already built
 
 The script never logs generated text. `Fission.Server` logs model id, prompt and
