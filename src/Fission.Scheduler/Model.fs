@@ -31,6 +31,7 @@ type ResourceBudget =
       AvailableDeviceBytes: struct (DeviceId * int64) list
       MaxDeviceSequences: struct (DeviceId * int) list }
 
+[<Struct>]
 type SchedulingPolicy =
     { DecodeTokenReserve: int
       MaxPrefillChunkTokens: int
