@@ -1,5 +1,6 @@
 <Solution>
   <Project Path="src/Fission.Abstractions/Fission.Abstractions.csproj" />
+  <Project Path="src/Fission.Accelerators/Fission.Accelerators.csproj" />
   <Project Path="src/Fission.Plan/Fission.Plan.fsproj" />
   <Project Path="src/Fission.Runtime/Fission.Runtime.csproj" />
   <Project Path="src/Fission.Scheduler/Fission.Scheduler.fsproj" />
@@ -11,6 +12,7 @@
   <Project Path="benchmarks/Fission.Serving.Reporter/Fission.Serving.Reporter.csproj" />
   <Project Path="samples/Fission.Demo/Fission.Demo.csproj" />
   <Project Path="samples/Fission.PlanDemo/Fission.PlanDemo.fsproj" />
+  <Project Path="tests/Fission.Accelerators.Specs/Fission.Accelerators.Specs.csproj" />
   <Project Path="tests/Fission.Runtime.Specs/Fission.Runtime.Specs.csproj" />
   <Project Path="tests/Fission.DeviceActor.Specs/Fission.DeviceActor.Specs.csproj" />
   <Project Path="tests/Fission.DeviceActor.Identity.Specs/Fission.DeviceActor.Identity.Specs.csproj" />
