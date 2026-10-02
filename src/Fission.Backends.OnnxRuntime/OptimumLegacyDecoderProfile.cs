@@ -25,11 +25,11 @@ public sealed record OptimumLegacyDecoderProfile(
         string attentionMask = "attention_mask",
         string positionIds = "position_ids",
         string logits = "logits",
-        string? sampledTokenIdsOutput = null,
         string pastKeyNames = "past_key_values.{0}.key",
         string pastValueNames = "past_key_values.{0}.value",
         string presentKeyNames = "present.{0}.key",
-        string presentValueNames = "present.{0}.value")
+        string presentValueNames = "present.{0}.value",
+        string? sampledTokenIdsOutput = null)
     {
         var geometry = new DecoderOrtGeometry(
             numHiddenLayers,
