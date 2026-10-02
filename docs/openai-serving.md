@@ -41,11 +41,11 @@ Required:
 
 Optional:
 
-- `Fission:AddSpecialTokens`: whether completion prompts use the tokenizer
+- `Fission:AddPromptSpecialTokens`: whether completion prompts use the tokenizer
   post-processor; defaults to `true`.
-- `Fission:SkipSpecialTokens`: whether generated-text decoding suppresses
+- `Fission:SkipSpecialTokensOnDecode`: whether generated-text decoding suppresses
   tokenizer special tokens; defaults to `true`.
-- `Fission:ChatTemplate`: `chatml`, `llama3`, or `none`. It defaults to
+- `Fission:ChatTemplate`: `chatml`/`qwen2`, `llama3`, or `none`. It defaults to
   `none`.
 
 Chat serving deliberately requires an explicit model template. With
@@ -54,14 +54,21 @@ with a request error instead of silently applying the wrong prompt format.
 
 The built-in templates currently cover:
 
-- `chatml`: Qwen/ChatML-style `<|im_start|>role ... <|im_end|>` framing.
+- `chatml` / `qwen2`: Qwen/ChatML-style `<|im_start|>role ... <|im_end|>` framing.
 - `llama3`: Llama-3-style begin/header/eot framing.
 
 The production codec shares one initialized tokenizer across concurrent requests
-and keeps only streaming decode state per request. Its incremental decoder ports
-the Hugging Face `DecodeStream` state machine: it retains the minimum token
-context needed for decoder continuity, buffers incomplete byte-fallback UTF-8,
-and never re-decodes the complete generation history on every token.
+and keeps only streaming decode state per request. Added special-token extraction
+is explicitly enabled by leaving Hugging Face `encode_special_tokens=false`;
+control strings such as `<|im_start|>` therefore map directly to their configured
+added-token ids instead of being split by the normal tokenizer model.
+
+Its incremental decoder ports the Hugging Face `DecodeStream` state machine:
+it retains the minimum token context needed for decoder continuity, buffers
+incomplete byte-fallback UTF-8, and never re-decodes the complete generation
+history on every token. Chat roles are restricted to the supported OpenAI-style
+role set (`system`, `developer`, `user`, `assistant`, `tool`) so arbitrary
+role strings cannot silently become control-role text.
 
 ## Cancellation ownership
 
