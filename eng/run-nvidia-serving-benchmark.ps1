@@ -69,6 +69,8 @@ param(
     [ValidateNotNullOrEmpty()]
     [string] $Configuration = "Release",
 
+    [switch] $PageLockedDecodeLogits,
+
     [switch] $NoBuild
 )
 
@@ -265,6 +267,7 @@ $metadata = [ordered]@{
         onnxruntime_gpu = $onnxRuntimeVersion
         cuda_runtime_library = if ([string]::IsNullOrWhiteSpace($cudaRuntimeLibrary)) { $null } else { $cudaRuntimeLibrary }
         cuda_library_search_directory = $cudaLibraryDirectory
+        page_locked_decode_logits = [bool] $PageLockedDecodeLogits
     }
     model = [ordered]@{
         id = $ModelId
@@ -298,6 +301,7 @@ $settings = [ordered]@{
     "Fission__Device" = "cuda:$CudaDeviceId"
     "Fission__CudaDeviceId" = "$CudaDeviceId"
     "Fission__CudaRuntimeLibraryPath" = $cudaRuntimeLibrary
+    "Fission__CudaPageLockedDecodeLogits" = if ($PageLockedDecodeLogits) { "true" } else { "false" }
     "Fission__ModelPath" = $model
     "Fission__ModelId" = $ModelId
     "Fission__NumHiddenLayers" = "$NumHiddenLayers"
@@ -365,6 +369,7 @@ try {
     Write-Host "  model:       $ModelId"
     Write-Host "  device:      cuda:$CudaDeviceId ($($selectedGpu.name))"
     Write-Host "  driver:      $($selectedGpu.driver_version)"
+    Write-Host "  pinned logits: $([bool] $PageLockedDecodeLogits)"
     Write-Host "  target:      $baseUrl"
     Write-Host "  manifest:    $manifestPath"
     Write-Host "  output:      $runRoot"
