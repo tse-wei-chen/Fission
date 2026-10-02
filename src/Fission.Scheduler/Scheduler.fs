@@ -354,7 +354,6 @@ module Scheduler =
             |> List.partition (fun sequence -> sequence.Phase = Decoding)
 
         let orderedDecodes = decodes |> List.sortWith (compareReady now policy)
-        let orderedPrefills = prefills |> List.sortWith (compareReady now policy)
 
         let initialState =
             { SelectedRev = []
@@ -371,7 +370,7 @@ module Scheduler =
             reserveDecodeTokens budget policy orderedDecodes initialState
 
         let remainingCandidates =
-            remainingDecodes @ orderedPrefills
+            remainingDecodes @ prefills
             |> List.sortWith (compareReady now policy)
 
         let finalState =
