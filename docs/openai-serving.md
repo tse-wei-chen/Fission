@@ -24,9 +24,17 @@ The current transport supports the common subset used by:
 
 ## Tokenizer boundary
 
-The server does not own model tokenization semantics. `ITextTokenCodec` owns prompt encoding, chat-template encoding, and creation of a request-scoped `ITextTokenDecoder`. `DeterministicTextTokenCodec` exists only for the zero-model deterministic backend and transport specifications. Real model integrations must replace it with the tokenizer/chat template that matches the loaded model.
+The server does not own model tokenization semantics. `ITextTokenCodec` owns prompt encoding, chat-template encoding, and creation of a request-scoped `ITextTokenDecoder`. `DeterministicTextTokenCodec` exists only for the zero-model deterministic backend and transport specifications.
 
-Generated text is decoded with request-local state rather than by decoding each token id independently. `ITextTokenDecoder.Append` may return an empty string when a tokenizer needs later ids to complete a stable text fragment; streaming endpoints suppress those empty fragments. `Complete` flushes any remaining stable text before the terminal OpenAI chunk. The decoder is request-scoped and disposable so production codecs may lease native tokenizer state without globally serializing concurrent requests. This boundary is required by byte-level/fallback tokenizers where one Unicode fragment may span multiple generated token ids.
+Set `Fission:Tokenizer=huggingface` to load a local Hugging Face `tokenizer.json` through the Rust-backed `Tokenizers.HuggingFace` binding. The tokenizer is loaded once at server startup and shared read-only across requests; each response still owns independent managed decode-stream state. The required setting is `Fission:TokenizerPath`. Optional settings are:
+
+- `Fission:ChatTemplate=none|qwen2|llama3` (default `none`).
+- `Fission:AddPromptSpecialTokens=true|false` (default `true`).
+- `Fission:SkipSpecialTokensOnDecode=true|false` (default `true`).
+
+Qwen2 chat rendering emits the standard `<|im_start|>...<|im_end|>` turn structure and an assistant generation prefix. Llama 3 rendering emits `<|begin_of_text|>`, header tokens, `<|eot_id|>` turn terminators, and the assistant header prefix. These control strings must exist as added special tokens in the loaded tokenizer. They are extracted to their configured ids rather than re-tokenized as ordinary text. `none` keeps completion tokenization available but makes chat requests fail clearly until a model-appropriate template is selected.
+
+Generated text is decoded with request-local state rather than by decoding each token id independently. The Hugging Face codec reproduces the prefix/context algorithm used by tokenizers 0.23 `DecodeStream`: pending ids are retained when byte-fallback or contextual decoding has not produced stable Unicode yet, stable prefixes are emitted once, and already-stable decode context is discarded. `ITextTokenDecoder.Append` may therefore return an empty string; streaming endpoints suppress those empty fragments. `Complete` flushes any remaining text before the terminal OpenAI chunk. This avoids the classic byte-level/metaspace error where independently decoding token ids loses cross-token Unicode or whitespace context.
 
 ## Cancellation ownership
 
@@ -81,8 +89,8 @@ construction. `ContinuousBatchExecutor.CreateAsync` initializes the backend
 before Kestrel starts serving, so an invalid ONNX graph/session contract fails
 startup rather than the first inference request.
 
-This composition currently uses the CPU FP32 Optimum legacy binding and still
-uses `DeterministicTextTokenCodec` at the HTTP boundary. Production tokenizer,
-chat-template, and CUDA Execution Provider composition are separate follow-up
-milestones; the deterministic backend remains the default until those layers are
-wired and hardware-tested.
+This composition currently uses the CPU FP32 Optimum legacy binding. A
+production Hugging Face tokenizer and Qwen2/Llama3 chat-template path are
+available independently through `Fission:Tokenizer=huggingface`; deterministic
+tokenization remains the default for zero-model smoke runs. CUDA Execution
+Provider composition is still a separate hardware-tested milestone.
