@@ -21,7 +21,7 @@ docker compose up --build -d
 curl --fail http://localhost:8000/healthz
 ```
 
-The current server executable uses the deterministic backend/token codec, so this image is intended for deployment and serving integration validation rather than production GPU model serving.
+The default container uses the deterministic backend/token codec so CI remains self-contained. The server composition root can also select ONNX Runtime CPU or CUDA plus a Hugging Face tokenizer; real GPU serving remains a separate hardware-controlled path.
 
 See [`docs/container.md`](docs/container.md) for configuration, smoke tests, and the planned GPU-container boundary.
 
@@ -56,3 +56,19 @@ pwsh ./eng/run-nvidia-smoke.ps1 -ModelPath <decoder-with-past.onnx> -TokenizerPa
 
 See [`docs/nvidia-smoke.md`](docs/nvidia-smoke.md) for the model contract,
 CUDA/ONNX Runtime prerequisites, and expected success criteria.
+
+## NVIDIA serving benchmark gate
+
+After the one-shot CUDA smoke passes, run the controlled GPU serving gate to
+start the real model server, wait for the startup inference probe, execute a
+small concurrency matrix, capture environment metadata, and generate
+Markdown/CSV results:
+
+```powershell
+pwsh ./eng/run-nvidia-serving-benchmark.ps1 -ModelPath <model.onnx> -TokenizerPath <tokenizer.json> -ModelId <model> -NumHiddenLayers <n> -NumKvHeads <n> -HeadDim <n> -VocabularySize <n>
+```
+
+The checked-in GPU smoke manifest is deliberately small. Pass the full
+`benchmarks/serving/workloads.json` manifest only after this hardware gate is
+stable.
+

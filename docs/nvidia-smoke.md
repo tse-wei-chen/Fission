@@ -67,7 +67,7 @@ Optional controls include:
 - `-MaxTokens` (default `1`)
 - `-TimeoutSeconds` (default `120`)
 - `-ChatTemplate none|chatml|qwen2|llama3`
-- `-CudaRuntimeLibraryPath` when the CUDA Runtime cannot be resolved normally
+- `-CudaRuntimeLibraryPath` when the CUDA Runtime cannot be resolved normally. When supplied, its parent directory is also prepended to the child process library search path (`PATH` on Windows, `LD_LIBRARY_PATH` elsewhere).
 - `-NoBuild` when `Fission.Server` is already built
 
 The script never logs generated text. `Fission.Server` logs model id, prompt and
@@ -94,3 +94,61 @@ Hosted CI does not claim NVIDIA hardware validation. The container workflow runs
 the same one-shot exit path with the deterministic backend so the control-flow
 contract cannot silently regress. Real CUDA validation evidence must come from an
 NVIDIA host using the command above.
+
+## Recorded hardware validation
+
+The first real NVIDIA validation was recorded on 2026-10-02 with this exact
+functional matrix:
+
+| Component | Observed value |
+| --- | --- |
+| GPU | NVIDIA GeForce RTX 3060 |
+| Device memory | 12288 MiB |
+| NVIDIA driver | 610.74 |
+| CUDA toolkit/runtime | CUDA 13.4 with explicit `cudart64_13.dll` |
+| ONNX Runtime GPU package | 1.30.0 |
+| Model | `SmolLM2-135M-Instruct` |
+| ONNX graph | `artifacts/models/SmolLM2-135M-Instruct/onnx/model.onnx` |
+| Tokenizer | matching Hugging Face `tokenizer.json` |
+| Geometry | 30 layers, 3 KV heads, head dim 64, vocabulary 49152 |
+| EOS token ids | `2` |
+| Probe result | promptTokens=1, generatedTokens=1, finishReason=Length |
+| Probe elapsed | 335.1 ms |
+
+This establishes a **functionally validated** CUDA path for that exact
+model/runtime combination. It is not yet a performance qualification.
+
+The same run reported two ONNX Runtime optimization warnings:
+
+- 121 `Memcpy` nodes were inserted for the CUDA execution provider;
+- some graph nodes were assigned outside the preferred execution provider.
+
+Those warnings did not prevent correct inference, but they are performance
+signals. Do not suppress them as noise. First record TTFT, TPOT, throughput, and
+concurrency behavior with the serving benchmark gate; use that evidence to decide
+whether node placement or transfer reduction is worth changing.
+
+## Next gate: real serving benchmark
+
+Run the hardware-controlled serving gate after the one-shot probe succeeds:
+
+```powershell
+pwsh ./eng/run-nvidia-serving-benchmark.ps1 `
+  -ModelPath artifacts/models/SmolLM2-135M-Instruct/onnx/model.onnx `
+  -TokenizerPath artifacts/models/SmolLM2-135M-Instruct/tokenizer.json `
+  -ModelId SmolLM2-135M-Instruct `
+  -NumHiddenLayers 30 `
+  -NumKvHeads 3 `
+  -HeadDim 64 `
+  -VocabularySize 49152 `
+  -EosTokenIds 2
+```
+
+The runner starts `Fission.Server` with the same CUDA/model/tokenizer
+configuration, keeps the startup probe enabled as a pre-serving gate, waits for
+`/healthz`, runs `workloads.gpu-smoke.json`, writes environment metadata and
+server logs beside the benchmark artifacts, then produces Markdown and CSV
+reports.
+
+Use `-Manifest benchmarks/serving/workloads.json` to move from the small gate
+to the full concurrency suite.

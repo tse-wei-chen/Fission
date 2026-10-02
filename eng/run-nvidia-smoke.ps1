@@ -83,6 +83,16 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $serverProject = Join-Path $repositoryRoot "src/Fission.Server/Fission.Server.csproj"
 $model = Resolve-RequiredFile -Path $ModelPath -Label "ONNX model"
 $tokenizer = Resolve-RequiredFile -Path $TokenizerPath -Label "Tokenizer"
+$cudaRuntimeLibrary = if ([string]::IsNullOrWhiteSpace($CudaRuntimeLibraryPath)) {
+    ""
+} else {
+    Resolve-RequiredFile -Path $CudaRuntimeLibraryPath -Label "CUDA Runtime library"
+}
+$cudaLibraryDirectory = if ([string]::IsNullOrWhiteSpace($cudaRuntimeLibrary)) {
+    $null
+} else {
+    Split-Path -Parent $cudaRuntimeLibrary
+}
 
 $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 if ($null -eq $nvidiaSmi) {
@@ -107,7 +117,7 @@ $settings = [ordered]@{
     "Fission__ExecutionProvider" = "cuda"
     "Fission__Device" = "cuda:$CudaDeviceId"
     "Fission__CudaDeviceId" = "$CudaDeviceId"
-    "Fission__CudaRuntimeLibraryPath" = $CudaRuntimeLibraryPath
+    "Fission__CudaRuntimeLibraryPath" = $cudaRuntimeLibrary
     "Fission__ModelPath" = $model
     "Fission__ModelId" = $ModelId
     "Fission__NumHiddenLayers" = "$NumHiddenLayers"
@@ -124,6 +134,19 @@ $settings = [ordered]@{
     "Fission__StartupProbeModelId" = $ModelId
     "Fission__StartupProbeMaxTokens" = "$MaxTokens"
     "Fission__StartupProbeTimeoutSeconds" = "$TimeoutSeconds"
+}
+
+if (-not [string]::IsNullOrWhiteSpace($cudaLibraryDirectory)) {
+    $isWindowsPlatform = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+    $librarySearchVariable = if ($isWindowsPlatform) { "PATH" } else { "LD_LIBRARY_PATH" }
+    $currentLibrarySearchPath = [Environment]::GetEnvironmentVariable(
+        $librarySearchVariable,
+        [EnvironmentVariableTarget]::Process)
+    $settings[$librarySearchVariable] = if ([string]::IsNullOrWhiteSpace($currentLibrarySearchPath)) {
+        $cudaLibraryDirectory
+    } else {
+        "$cudaLibraryDirectory$([System.IO.Path]::PathSeparator)$currentLibrarySearchPath"
+    }
 }
 
 $previous = @{}
