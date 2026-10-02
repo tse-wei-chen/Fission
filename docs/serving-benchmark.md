@@ -165,3 +165,10 @@ That CI path validates:
 - Markdown/CSV report generation.
 
 Hosted-runner timing is not treated as a performance threshold.
+
+
+## Workflow artifacts
+
+Container CI writes its tiny suite under `artifacts/serving-ci/`, adds the generated Markdown report to the GitHub Actions job summary, and uploads the JSON/Markdown/CSV directory as a 14-day workflow artifact.
+
+This makes protocol/orchestration benchmark evidence inspectable after a PR run without treating hosted-runner timing as a performance threshold. Real GPU comparison artifacts should be produced on controlled hardware using the full workload manifest.

@@ -109,15 +109,30 @@ jobs:
             -BaseUrl http://127.0.0.1:18000 \
             -Model container-loadgen \
             -Manifest benchmarks/serving/workloads.ci.json \
-            -OutputDirectory /tmp/fission-suite \
+            -OutputDirectory artifacts/serving-ci \
             -Configuration Release
 
           dotnet run \
             --project benchmarks/Fission.Serving.Reporter/Fission.Serving.Reporter.csproj \
             -c Release -- \
-            --input /tmp/fission-suite \
-            --markdown /tmp/fission-suite/report.md \
-            --csv /tmp/fission-suite/report.csv
+            --input artifacts/serving-ci \
+            --markdown artifacts/serving-ci/report.md \
+            --csv artifacts/serving-ci/report.csv
 
-          cat /tmp/fission-suite/report.md
-          cat /tmp/fission-suite/report.csv
+          cat artifacts/serving-ci/report.md
+          cat artifacts/serving-ci/report.csv
+
+          {
+            echo "## Serving benchmark smoke report"
+            echo
+            cat artifacts/serving-ci/report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload serving benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serving-benchmark-${{ github.run_id }}
+          path: artifacts/serving-ci
+          if-no-files-found: ignore
+          retention-days: 14
