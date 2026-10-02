@@ -531,7 +531,8 @@ module Scheduler =
             reserveDecodeTokens budget policy orderedDecodes initialState
 
         let orderedPrefills = List.toArray prefills
-        Array.sortInPlaceWith compareCandidates orderedPrefills
+        if orderedPrefills.Length > 1 then
+            Array.sortInPlaceWith compareCandidates orderedPrefills
 
         let finalState =
             selectMergedCandidates
