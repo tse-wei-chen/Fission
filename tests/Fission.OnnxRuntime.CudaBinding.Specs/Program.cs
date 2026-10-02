@@ -260,9 +260,124 @@ binding.Dispose();
 Require(decodeLogitsAllocator.DisposeCount == 2,
     "Disposing the CUDA binding must release retained decode logits staging buffers.");
 
+var graphProfile = OptimumLegacyDecoderProfile.CreateLlamaLike(
+    numHiddenLayers: 1,
+    numKvHeads: 1,
+    headDim: 1,
+    vocabularySize: 4,
+    sampledTokenIdsOutput: "fission_sampled_token_ids");
+
+var graphRunCount = 0;
+void FakeGraphRun(
+    InferenceSession graphSession,
+    RunOptions graphRunOptions,
+    IReadOnlyCollection<string> graphInputNames,
+    IReadOnlyCollection<OrtValue> graphInputValues,
+    IReadOnlyCollection<string> graphOutputNames,
+    IReadOnlyCollection<OrtValue> graphOutputValues)
+{
+    _ = graphSession;
+    _ = graphRunOptions;
+    _ = graphInputNames;
+    _ = graphInputValues;
+    graphRunCount++;
+
+    var names = graphOutputNames.ToArray();
+    var outputs = graphOutputValues.ToArray();
+    Require(names.SequenceEqual(new[]
+    {
+        "fission_sampled_token_ids",
+        "present.0.key",
+        "present.0.value"
+    }), "Graph-side CUDA sampling must not fetch the logits graph output.");
+
+    using (var sampledMemory = outputs[0].GetTensorMemoryInfo())
+    {
+        Require(sampledMemory.Name != "Cuda",
+            "Sampled token ids must return through the small host output.");
+    }
+
+    var sampled = outputs[0].GetTensorMutableDataAsSpan<long>();
+    if (graphRunCount == 1)
+    {
+        Require(sampled.Length == 2,
+            "Batched prefill sampled-token output must contain one id per row.");
+        sampled[0] = 1;
+        sampled[1] = 2;
+    }
+    else if (graphRunCount == 2)
+    {
+        Require(sampled.Length == 2,
+            "Batched decode sampled-token output must contain one id per row.");
+        sampled[0] = 3;
+        sampled[1] = 0;
+    }
+    else
+    {
+        throw new InvalidOperationException(
+            $"Unexpected graph-side fake ORT run {graphRunCount}.");
+    }
+}
+
+using var graphBinding = new OptimumLegacyCudaFloatDecoderBinding(
+    graphProfile,
+    allocator,
+    FakeGraphRun);
+
+Require(graphBinding.GraphGreedySamplingEnabled,
+    "Sampled-token graph output must enable graph-side greedy sampling.");
+
+var graphFirstId = SequenceId.New();
+var graphSecondId = SequenceId.New();
+var graphInitial = graphBinding.ExecutePrefillBatch(
+    session,
+    new[]
+    {
+        new PrefillItem(graphFirstId, modelId, new ReadOnlyMemory<int>(new[] { 3 }), Position: 0),
+        new PrefillItem(graphSecondId, modelId, new ReadOnlyMemory<int>(new[] { 0 }), Position: 0)
+    },
+    new DecoderOrtState?[] { null, null });
+
+Require(
+    graphInitial[0].TokenId == 1 &&
+    graphInitial[1].TokenId == 2,
+    "Graph-side prefill sampling must consume the model-provided token ids.");
+
+var graphDecoded = graphBinding.ExecuteDecodeBatch(
+    session,
+    new[]
+    {
+        new DecodeItem(graphFirstId, modelId, Position: 1),
+        new DecodeItem(graphSecondId, modelId, Position: 1)
+    },
+    new[] { graphInitial[0].State, graphInitial[1].State });
+
+Require(
+    graphDecoded[0].TokenId == 3 &&
+    graphDecoded[1].TokenId == 0,
+    "Graph-side decode sampling must consume one model-provided token id per row.");
+Require(graphBinding.OrtRunCount == 2 && graphRunCount == 2,
+    "Graph-side prefill and decode must each execute one ORT run.");
+Require(graphBinding.GraphSampledTokenIdReadCount == 4,
+    "Graph-side sampling must read exactly one sampled token id per row and step.");
+Require(graphBinding.ScratchFloatRentCount == 0,
+    "Graph-side sampling must not rent host logits scratch.");
+Require(graphBinding.PageLockedDecodeLogitsRentCount == 0,
+    "Graph-side sampling must bypass page-locked full-logits staging.");
+
+foreach (var result in graphInitial)
+{
+    result.State.Dispose();
+}
+foreach (var result in graphDecoded)
+{
+    result.State.Dispose();
+}
+
 Console.WriteLine(
     $"Fission CUDA Optimum binding specs passed: runs={binding.OrtRunCount}, " +
-    $"cudaPastReuse={binding.CudaPastReuseCount}, mallocs={cuda.MallocCalls}, frees={cuda.FreeCalls}.");
+    $"cudaPastReuse={binding.CudaPastReuseCount}, graphRuns={graphBinding.OrtRunCount}, " +
+    $"mallocs={cuda.MallocCalls}, frees={cuda.FreeCalls}.");
 
 sealed class ScriptedFloatPool : ArrayPool<float>
 {
