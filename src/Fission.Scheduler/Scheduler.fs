@@ -15,6 +15,7 @@ module Scheduler =
           TransientBytes: int64
           Sequences: int }
 
+    [<Struct>]
     type private SelectionState =
         { SelectedRev: ScheduledSequence list
           DeferredRev: DeferredSequence list
@@ -23,7 +24,8 @@ module Scheduler =
           UsedKvPages: int
           UsedKvBytes: int64
           UsedTransientKvBytes: int64
-          UsedDevices: DeviceUsage list }
+          FirstUsedDevice: DeviceUsage voption
+          AdditionalUsedDevices: DeviceUsage list }
 
     let rec private containsDevice
         (device: Fission.Abstractions.DeviceId)
@@ -166,7 +168,7 @@ module Scheduler =
     let private tryFindDeviceSequenceBudget (budget: ResourceBudget) device =
         tryFindDeviceValue device budget.MaxDeviceSequences
 
-    let rec private tryFindDeviceUsage
+    let rec private tryFindAdditionalDeviceUsage
         (device: Fission.Abstractions.DeviceId)
         (usages: DeviceUsage list)
         =
@@ -176,7 +178,15 @@ module Scheduler =
             if usage.Device = device then
                 ValueSome usage
             else
-                tryFindDeviceUsage device tail
+                tryFindAdditionalDeviceUsage device tail
+
+    let private tryFindDeviceUsage
+        (device: Fission.Abstractions.DeviceId)
+        (state: SelectionState)
+        =
+        match state.FirstUsedDevice with
+        | ValueSome usage when usage.Device = device -> ValueSome usage
+        | _ -> tryFindAdditionalDeviceUsage device state.AdditionalUsedDevices
 
     let private usedDeviceBytes usage =
         match usage with
@@ -188,7 +198,7 @@ module Scheduler =
         | ValueSome current -> current.Sequences
         | ValueNone -> 0
 
-    let rec private removeDeviceUsage
+    let rec private removeAdditionalDeviceUsage
         (device: Fission.Abstractions.DeviceId)
         (usages: DeviceUsage list)
         =
@@ -198,12 +208,10 @@ module Scheduler =
             struct (ValueSome current, tail)
         | head :: tail ->
             let struct (current, withoutDevice) =
-                removeDeviceUsage device tail
+                removeAdditionalDeviceUsage device tail
             struct (current, head :: withoutDevice)
 
-    let private addDeviceUsage device byteGrant sequenceGrant used =
-        let struct (current, withoutDevice) =
-            removeDeviceUsage device used
+    let private updatedDeviceUsage device byteGrant sequenceGrant current =
         let struct (currentBytes, currentSequences) =
             match current with
             | ValueSome usage -> struct (usage.TransientBytes, usage.Sequences)
@@ -211,7 +219,28 @@ module Scheduler =
         { Device = device
           TransientBytes = currentBytes + byteGrant
           Sequences = currentSequences + sequenceGrant }
-        :: withoutDevice
+
+    let private addDeviceUsage
+        device
+        byteGrant
+        sequenceGrant
+        (state: SelectionState)
+        =
+        match state.FirstUsedDevice with
+        | ValueNone ->
+            struct (
+                ValueSome (updatedDeviceUsage device byteGrant sequenceGrant ValueNone),
+                state.AdditionalUsedDevices)
+        | ValueSome first when first.Device = device ->
+            struct (
+                ValueSome (updatedDeviceUsage device byteGrant sequenceGrant (ValueSome first)),
+                state.AdditionalUsedDevices)
+        | ValueSome first ->
+            let struct (current, withoutDevice) =
+                removeAdditionalDeviceUsage device state.AdditionalUsedDevices
+            struct (
+                ValueSome (updatedDeviceUsage device byteGrant sequenceGrant current),
+                first :: withoutDevice)
 
     let private classifyAdmission (sequence: ReadySequence) =
         if not (isRunnable sequence) then
@@ -258,7 +287,7 @@ module Scheduler =
             let currentDeviceUsage =
                 match sequence.ExecutionDevice with
                 | Some device when tracksDeviceMemory || tracksDeviceSequences ->
-                    tryFindDeviceUsage device state.UsedDevices
+                    tryFindDeviceUsage device state
                 | _ -> ValueNone
 
             let deviceSequenceCapacityReached =
@@ -317,15 +346,16 @@ module Scheduler =
                         let kvPageGrant = kvPagesForGrant sequence tokenGrant
                         let kvByteGrant = int64 tokenGrant * sequence.KvBytesPerToken
                         let transientKvByteGrant = transientKvBytesForGrant sequence tokenGrant
-                        let nextDeviceUsage =
+                        let struct (nextFirstUsedDevice, nextAdditionalUsedDevices) =
                             match sequence.ExecutionDevice with
                             | Some device when tracksDeviceMemory || tracksDeviceSequences ->
                                 addDeviceUsage
                                     device
                                     (if tracksDeviceMemory then transientKvByteGrant else 0L)
                                     (if tracksDeviceSequences then 1 else 0)
-                                    state.UsedDevices
-                            | _ -> state.UsedDevices
+                                    state
+                            | _ ->
+                                struct (state.FirstUsedDevice, state.AdditionalUsedDevices)
                         { state with
                             SelectedRev =
                                 { Sequence = sequence
@@ -339,7 +369,8 @@ module Scheduler =
                             UsedKvPages = state.UsedKvPages + kvPageGrant
                             UsedKvBytes = state.UsedKvBytes + kvByteGrant
                             UsedTransientKvBytes = state.UsedTransientKvBytes + transientKvByteGrant
-                            UsedDevices = nextDeviceUsage }
+                            FirstUsedDevice = nextFirstUsedDevice
+                            AdditionalUsedDevices = nextAdditionalUsedDevices }
 
     let private reserveDecodeTokens
         (budget: ResourceBudget)
@@ -412,7 +443,8 @@ module Scheduler =
               UsedKvPages = 0
               UsedKvBytes = 0L
               UsedTransientKvBytes = 0L
-              UsedDevices = [] }
+              FirstUsedDevice = ValueNone
+              AdditionalUsedDevices = [] }
 
         let struct (afterReserve, remainingDecodes) =
             reserveDecodeTokens budget policy orderedDecodes initialState
