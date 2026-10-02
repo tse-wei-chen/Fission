@@ -110,28 +110,49 @@ Require(cuda.FreeCalls == 4 && cuda.ActiveAllocationPointers.Count == 0, "Final 
 Require(cuda.OperationDevices.All(static current => current == deviceId), "Present-KV cudaMalloc/cudaFree operations must run under the configured device ordinal.");
 Require(cuda.CurrentDevice == 9, "Present-KV allocation and release must restore the ambient CUDA device.");
 
-var nonFloatProfile = OptimumLegacyDecoderProfile.CreateLlamaLike(
+var fp16Profile = OptimumLegacyDecoderProfile.CreateLlamaLike(
     numHiddenLayers: 1,
     numKvHeads: 1,
     headDim: 2,
     vocabularySize: 16,
-    kvElementType: TensorElementType.Float16);
-var nonFloatRejected = false;
-try
+    kvElementType: TensorElementType.Float16,
+    logitsElementType: TensorElementType.Float16);
+var fp16Present = new OptimumLegacyCudaPresentKvBatch(
+    fp16Profile,
+    batchSize: 1,
+    pastSequenceLength: 0,
+    sequenceLength: 1,
+    allocator);
+Require(
+    fp16Present.OutputValues.All(
+        static value =>
+            value.GetTensorTypeAndShape().ElementDataType ==
+                TensorElementType.Float16),
+    "CUDA present-KV transaction must preserve Float16 output element type.");
+Require(
+    fp16Present.OutputValues.All(
+        static value => value.GetTensorSizeInBytes() == 4),
+    "One [1,1,1,2] Float16 present-KV tensor must occupy four bytes.");
+Require(cuda.MallocCalls == 6,
+    "Float16 present-KV must allocate one key/value CUDA buffer for its layer.");
+
+var fp16Row = fp16Present.CreateRowState(0, nextTokenId: 9);
+using (var fp16Borrow = CudaDecoderOrtCohortArena.AcquireResidentState(
+           "optimum-legacy:fp16:cuda-present-v1",
+           fp16Row))
 {
-    _ = new OptimumLegacyCudaPresentKvBatch(
-        nonFloatProfile,
-        batchSize: 1,
-        pastSequenceLength: 0,
-        sequenceLength: 1,
-        allocator);
+    Require(fp16Borrow.ByteLength == 8,
+        "One Float16 key/value row with two elements per slot must expose eight resident bytes.");
+    Require(
+        fp16Borrow.GetLayer(0).Key.ElementType == TensorElementType.Float16 &&
+        fp16Borrow.GetLayer(0).Value.ElementType == TensorElementType.Float16,
+        "Float16 resident views must preserve their element type.");
 }
-catch (ArgumentException)
-{
-    nonFloatRejected = true;
-}
-Require(nonFloatRejected, "CUDA present-KV transaction must reject non-FP32 KV profiles before allocation.");
-Require(cuda.MallocCalls == 4, "Rejected non-FP32 profile must not allocate CUDA memory.");
+
+fp16Present.Dispose();
+fp16Row.Dispose();
+Require(cuda.FreeCalls == 6 && cuda.ActiveAllocationPointers.Count == 0,
+    "Float16 present-KV allocations must release after their final row owner.");
 
 Console.WriteLine(
     $"Fission Optimum CUDA present-KV specs passed: outputs={appendedNames.Count}, " +
