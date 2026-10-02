@@ -1,0 +1,72 @@
+name: cuda-container
+
+on:
+  pull_request:
+    branches: [ develop ]
+    paths:
+      - Dockerfile.cuda
+      - compose.yaml
+      - .dockerignore
+      - .env.example
+      - Directory.Build.props
+      - global.json
+      - src/Fission.Backends.OnnxRuntime/Fission.Backends.OnnxRuntime.csproj
+      - .github/workflows/cuda-container.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build CUDA image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.cuda
+          load: true
+          push: false
+          tags: fission:cuda-ci
+          cache-from: type=gha,scope=cuda-container
+          cache-to: type=gha,mode=max,scope=cuda-container
+          provenance: false
+          sbom: false
+
+      - name: Validate .NET runtime in CUDA image
+        run: docker run --rm --entrypoint dotnet fission:cuda-ci --info
+
+      - name: Smoke test Fission host without GPU
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          timeout 30s docker run --rm \
+            --env Fission__Backend=deterministic \
+            --env Fission__Tokenizer=deterministic \
+            --env Fission__Device=cpu:0 \
+            --env Fission__ModelId=cuda-image-host-smoke \
+            --env Fission__StartupProbeEnabled=true \
+            --env Fission__StartupProbeExitAfterSuccess=true \
+            --env Fission__StartupProbePrompt=probe \
+            --env Fission__StartupProbeMaxTokens=1 \
+            fission:cuda-ci
+
+      - name: GPU coverage boundary
+        run: |
+          {
+            echo "## CUDA image validation"
+            echo
+            echo "The CUDA image built successfully and the .NET/Fission host started."
+            echo
+            echo "This hosted runner has no NVIDIA GPU; CUDA execution remains covered by the dedicated NVIDIA host smoke and serving benchmark paths."
+          } >> "$GITHUB_STEP_SUMMARY"
