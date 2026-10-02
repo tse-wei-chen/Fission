@@ -13,7 +13,10 @@ public readonly record struct ScheduledPrefillBinding(
 
 public sealed class ScheduledExecutionBindings
 {
-    private readonly IReadOnlyDictionary<SequenceId, ScheduledPrefillBinding> _prefills;
+    private readonly IReadOnlyDictionary<SequenceId, ScheduledPrefillBinding>? _prefills;
+    private readonly SequenceId _singleSequenceId;
+    private readonly ScheduledPrefillBinding _singlePrefill;
+    private readonly bool _hasSinglePrefill;
 
     public ScheduledExecutionBindings(
         IReadOnlyDictionary<SequenceId, ScheduledPrefillBinding> prefills)
@@ -21,13 +24,38 @@ public sealed class ScheduledExecutionBindings
         _prefills = prefills;
     }
 
+    private ScheduledExecutionBindings(
+        SequenceId sequenceId,
+        ScheduledPrefillBinding prefill)
+    {
+        _singleSequenceId = sequenceId;
+        _singlePrefill = prefill;
+        _hasSinglePrefill = true;
+    }
+
+    internal static ScheduledExecutionBindings CreateSinglePrefill(
+        SequenceId sequenceId,
+        ScheduledPrefillBinding prefill) =>
+        new(sequenceId, prefill);
+
     public ScheduledPrefillBinding ResolvePrefill(
         SequenceId sequenceId,
         int position,
         int expectedTokenCount,
         bool completesPrefill)
     {
-        if (!_prefills.TryGetValue(sequenceId, out var binding))
+        ScheduledPrefillBinding binding;
+        if (_hasSinglePrefill)
+        {
+            if (!_singleSequenceId.Equals(sequenceId))
+            {
+                throw new KeyNotFoundException(
+                    $"No scheduled prefill binding exists for sequence {sequenceId}.");
+            }
+
+            binding = _singlePrefill;
+        }
+        else if (_prefills is null || !_prefills.TryGetValue(sequenceId, out binding))
         {
             throw new KeyNotFoundException(
                 $"No scheduled prefill binding exists for sequence {sequenceId}.");
