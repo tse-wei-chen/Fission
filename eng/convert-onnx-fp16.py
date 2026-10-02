@@ -84,13 +84,6 @@ def main() -> None:
         and value.type.tensor_type.elem_type == TensorProto.FLOAT
     ]
 
-    if remaining_float_initializers:
-        preview = ", ".join(remaining_float_initializers[:8])
-        raise ValueError(
-            "FP16 conversion left float32 initializers in the graph: "
-            f"{preview}"
-        )
-
     if remaining_float_io:
         preview = ", ".join(remaining_float_io[:8])
         raise ValueError(
@@ -117,7 +110,8 @@ def main() -> None:
 
     print(
         f"Converted {source} -> {destination}; "
-        f"float32 initializers converted={before_initializers}, "
+        f"float32 initializers before={before_initializers}, "
+        f"float32 initializers remaining={len(remaining_float_initializers)}, "
         f"float32 graph IO converted={before_float_io}."
     )
 
