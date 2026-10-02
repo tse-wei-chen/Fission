@@ -147,6 +147,10 @@ CUDA mode accepts:
   `eng/add-greedy-argmax-output.py` can append the matching
   `Gather(last sequence position) -> ArgMax(vocabulary)` path to a compatible
   decoder graph.
+- `Fission:OrtProfileOutputPathPrefix`: optional CUDA ONNX Runtime profile
+  path prefix. When set, the CUDA session enables ORT profiling and writes a
+  Chrome-trace JSON file when the session shuts down cleanly. Profiling adds
+  overhead and is intended for diagnosis rather than throughput comparison.
 - `Fission:CudaPoolMaxRetainedBytes`: maximum idle KV/device-buffer bytes
   retained for exact-size reuse; defaults to 256 MiB. Set `0` to disable idle
   retention.
@@ -230,3 +234,19 @@ validation executable: a successful full-stack probe logs its summary and exits
 with code 0 before Kestrel begins listening. Composition, CUDA/provider, model
 contract, tokenizer, scheduling, KV, timeout, or decode failures still fail the
 process. This mode is used by [the NVIDIA real-model smoke runner](nvidia-smoke.md).
+
+
+## Opt-in graceful control endpoint
+
+`Fission:ControlToken` is intended for controlled benchmark/process shutdown.
+When it is unset, no control route is mapped. When it is set, the server exposes:
+
+```text
+POST /internal/control/shutdown
+X-Fission-Control-Token: <configured token>
+```
+
+An invalid or missing token returns `401`. A valid token returns `202` and
+requests graceful application shutdown after the response completes. The
+NVIDIA benchmark runner generates an ephemeral random token automatically so
+ONNX Runtime profiling can flush during normal session disposal.
