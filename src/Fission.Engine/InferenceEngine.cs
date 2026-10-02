@@ -736,18 +736,9 @@ public sealed partial class InferenceEngine : IDisposable
         }
     }
 
-    private static Dictionary<SequenceId, SchedulingCandidate> BuildCandidateIndex(
-        IReadOnlyList<SchedulingCandidate> candidates)
-    {
-        var candidateBySequence = new Dictionary<SequenceId, SchedulingCandidate>(candidates.Count);
-        for (var index = 0; index < candidates.Count; index++)
-        {
-            var candidate = candidates[index];
-            candidateBySequence.Add(candidate.SequenceId, candidate);
-        }
-
-        return candidateBySequence;
-    }
+    private static SchedulingCandidateIndex BuildCandidateIndex(
+        IReadOnlyList<SchedulingCandidate> candidates) =>
+        new(candidates);
 
     private SchedulingKernelResult ScheduleOnce(
         Guid scheduleId,
@@ -905,7 +896,7 @@ public sealed partial class InferenceEngine : IDisposable
     private static IReadOnlyList<RuntimeDeviceMemoryReservationVersion>?
         GetDeviceMemoryBackpressureReservations(
             SchedulingKernelResult decision,
-            Dictionary<SequenceId, SchedulingCandidate> candidateBySequence,
+            SchedulingCandidateIndex candidateBySequence,
             RuntimeDeviceMemoryReservationState reservationState)
     {
         if (decision.Batch.Items.Count != 0 ||
@@ -946,7 +937,7 @@ public sealed partial class InferenceEngine : IDisposable
     private static IReadOnlyList<RuntimeDeviceInferenceReservationVersion>?
         GetDeviceInferenceBackpressureReservations(
             SchedulingKernelResult decision,
-            Dictionary<SequenceId, SchedulingCandidate> candidateBySequence,
+            SchedulingCandidateIndex candidateBySequence,
             RuntimeDeviceInferenceReservationState reservationState)
     {
         if (decision.Batch.Items.Count != 0 ||
@@ -987,7 +978,7 @@ public sealed partial class InferenceEngine : IDisposable
     private IReadOnlyList<RuntimeDeviceMemoryReservationRequest>
         BuildDeviceMemoryReservationRequests(
             SchedulingKernelResult decision,
-            Dictionary<SequenceId, SchedulingCandidate> candidateBySequence)
+            SchedulingCandidateIndex candidateBySequence)
     {
         Dictionary<DeviceId, long>? bytesByDevice = null;
         DeviceId singleDevice = default;
@@ -1055,7 +1046,7 @@ public sealed partial class InferenceEngine : IDisposable
     private IReadOnlyList<RuntimeDeviceInferenceReservationRequest>
         BuildDeviceInferenceReservationRequests(
             SchedulingKernelResult decision,
-            Dictionary<SequenceId, SchedulingCandidate> candidateBySequence)
+            SchedulingCandidateIndex candidateBySequence)
     {
         Dictionary<DeviceId, int>? itemsByDevice = null;
         DeviceId singleDevice = default;
@@ -1120,7 +1111,7 @@ public sealed partial class InferenceEngine : IDisposable
 
     private async ValueTask<bool> TryReclaimBlockedDeviceMemoryAsync(
         SchedulingKernelResult decision,
-        Dictionary<SequenceId, SchedulingCandidate> candidateBySequence,
+        SchedulingCandidateIndex candidateBySequence,
         CancellationToken cancellationToken)
     {
         if (_options.MaxDeviceBytes is not { } maxDeviceBytes)
@@ -1354,6 +1345,58 @@ public sealed partial class InferenceEngine : IDisposable
         }
 
         _cycleGate.Dispose();
+    }
+
+    private readonly struct SchedulingCandidateIndex
+    {
+        private readonly IReadOnlyList<SchedulingCandidate> _candidates;
+        private readonly Dictionary<SequenceId, SchedulingCandidate>? _multiple;
+
+        public SchedulingCandidateIndex(
+            IReadOnlyList<SchedulingCandidate> candidates)
+        {
+            ArgumentNullException.ThrowIfNull(candidates);
+            _candidates = candidates;
+
+            if (candidates.Count <= 1)
+            {
+                _multiple = null;
+                return;
+            }
+
+            var multiple =
+                new Dictionary<SequenceId, SchedulingCandidate>(candidates.Count);
+            for (var index = 0; index < candidates.Count; index++)
+            {
+                var candidate = candidates[index];
+                multiple.Add(candidate.SequenceId, candidate);
+            }
+
+            _multiple = multiple;
+        }
+
+        public bool TryGetValue(
+            SequenceId sequenceId,
+            out SchedulingCandidate candidate)
+        {
+            if (_multiple is not null)
+            {
+                return _multiple.TryGetValue(sequenceId, out candidate);
+            }
+
+            if (_candidates.Count == 1)
+            {
+                var single = _candidates[0];
+                if (single.SequenceId.Equals(sequenceId))
+                {
+                    candidate = single;
+                    return true;
+                }
+            }
+
+            candidate = default;
+            return false;
+        }
     }
 
     private sealed record DeviceMemoryBudgetSnapshot(
