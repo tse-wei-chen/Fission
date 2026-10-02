@@ -301,7 +301,7 @@ static string Csv(string value)
         return value;
     }
 
-    return """ + value.Replace(""", """", StringComparison.Ordinal) + """;
+    return "\"" + value.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
 }
 
 static string EscapeMarkdown(string value) =>
