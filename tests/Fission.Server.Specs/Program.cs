@@ -477,10 +477,9 @@ using (var probeCodec = new DeterministicTextTokenCodec())
     var probe = await ServerStartupProbe.RunAsync(
         probeConfiguration,
         worker,
-        probeCodec);
-    Require(
-        probe is not null,
-        "Enabled startup inference probe must return a result.");
+        probeCodec) ??
+        throw new InvalidOperationException(
+            "Enabled startup inference probe must return a result.");
     Require(
         probe.PromptTokenCount == 5 &&
         probe.GeneratedTokenCount == 2 &&
