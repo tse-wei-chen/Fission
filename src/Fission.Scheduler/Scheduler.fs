@@ -446,6 +446,29 @@ module Scheduler =
 
         struct (decodes, prefills, deferred, rejected)
 
+    let private classifyMappedReadOnlyInOrder
+        (mapping: 'T -> ReadySequence)
+        (sequences: System.Collections.Generic.IReadOnlyList<'T>)
+        =
+        let mutable decodes = []
+        let mutable prefills = []
+        let mutable deferred = []
+        let mutable rejected = []
+
+        for index = sequences.Count - 1 downto 0 do
+            let sequence = mapping sequences[index]
+            match classifyAdmission sequence with
+            | Admitted candidate when candidate.Phase = Decoding ->
+                decodes <- candidate :: decodes
+            | Admitted candidate ->
+                prefills <- candidate :: prefills
+            | DeferredAdmission deferredItem ->
+                deferred <- deferredItem :: deferred
+            | RejectedAdmission rejectedItem ->
+                rejected <- rejectedItem :: rejected
+
+        struct (decodes, prefills, deferred, rejected)
+
     let private schedulePartitionedAt
         (now: DateTimeOffset)
         (budget: ResourceBudget)
@@ -515,6 +538,26 @@ module Scheduler =
         validateScheduleInputs budget policy
         let struct (decodes, prefills, deferred, rejected) =
             classifyArrayInOrder sequences
+
+        schedulePartitionedAt
+            now
+            budget
+            policy
+            decodes
+            prefills
+            deferred
+            rejected
+
+    let scheduleMappedReadOnlyAt
+        (now: DateTimeOffset)
+        (budget: ResourceBudget)
+        (policy: SchedulingPolicy)
+        (mapping: 'T -> ReadySequence)
+        (sequences: System.Collections.Generic.IReadOnlyList<'T>)
+        =
+        validateScheduleInputs budget policy
+        let struct (decodes, prefills, deferred, rejected) =
+            classifyMappedReadOnlyInOrder mapping sequences
 
         schedulePartitionedAt
             now
