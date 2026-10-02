@@ -1,3 +1,4 @@
+using System.Buffers;
 using Fission.Abstractions;
 using Fission.Abstractions.Execution;
 using Fission.Abstractions.Scheduling;
@@ -252,11 +253,11 @@ public sealed partial class InferenceEngine : IDisposable
 
         try
         {
-            var active = SnapshotActiveRequests();
+            var active = RentActiveRequestSnapshot(out var activeCount);
             var scheduleId = Guid.NewGuid();
             var kvBefore = _runtime.KvCapacity;
 
-            if (active.Length == 0)
+            if (activeCount == 0)
             {
                 return new InferenceCycleResult(
                     scheduleId,
@@ -267,10 +268,19 @@ public sealed partial class InferenceEngine : IDisposable
                     kvBefore);
             }
 
-            var candidates = new SchedulingCandidate[active.Length];
-            for (var index = 0; index < active.Length; index++)
+            var candidates = new SchedulingCandidate[activeCount];
+            try
             {
-                candidates[index] = BuildCandidate(in active[index], kvBefore.TokensPerPage);
+                for (var index = 0; index < activeCount; index++)
+                {
+                    candidates[index] = BuildCandidate(
+                        in active[index],
+                        kvBefore.TokensPerPage);
+                }
+            }
+            finally
+            {
+                ReturnActiveRequestSnapshot(active, activeCount);
             }
 
             var maxBatchSequences = _options.MaxBatchSequences;
@@ -529,41 +539,59 @@ public sealed partial class InferenceEngine : IDisposable
         _activeRequestCount = checked(_activeRequestCount - 1);
     }
 
-    private RequestView[] SnapshotActiveRequests()
+    private RequestView[] RentActiveRequestSnapshot(out int count)
     {
         lock (_gate)
         {
-            if (_activeRequestCount == 0)
+            count = _activeRequestCount;
+            if (count == 0)
             {
                 return Array.Empty<RequestView>();
             }
 
-            var active = new RequestView[_activeRequestCount];
+            var active = ArrayPool<RequestView>.Shared.Rent(count);
             var index = 0;
-            foreach (var request in _requests.Values)
+            try
             {
-                if (request.IsCompleted)
+                foreach (var request in _requests.Values)
                 {
-                    continue;
+                    if (request.IsCompleted)
+                    {
+                        continue;
+                    }
+
+                    if ((uint)index >= (uint)count)
+                    {
+                        throw new InvalidOperationException(
+                            "Active request count exceeded the tracked active-request index.");
+                    }
+
+                    active[index++] = request.View();
                 }
 
-                if ((uint)index >= (uint)active.Length)
+                if (index != count)
                 {
                     throw new InvalidOperationException(
-                        "Active request count exceeded the tracked active-request index.");
+                        $"Tracked active request count {count} does not match snapshot count {index}.");
                 }
 
-                active[index++] = request.View();
+                return active;
             }
-
-            if (index != active.Length)
+            catch
             {
-                throw new InvalidOperationException(
-                    $"Tracked active request count {_activeRequestCount} does not match snapshot count {index}.");
+                Array.Clear(active, 0, index);
+                ArrayPool<RequestView>.Shared.Return(active);
+                throw;
             }
-
-            return active;
         }
+    }
+
+    private static void ReturnActiveRequestSnapshot(
+        RequestView[] active,
+        int count)
+    {
+        Array.Clear(active, 0, count);
+        ArrayPool<RequestView>.Shared.Return(active);
     }
 
     private SchedulingCandidate BuildCandidate(in RequestView request, int tokensPerKvPage)
