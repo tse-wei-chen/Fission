@@ -1066,7 +1066,7 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
                     shape),
             TensorElementType.Float16 =>
                 OrtValue.CreateTensorValueFromMemory(
-                    Array.Empty<Half>(),
+                    Array.Empty<Float16>(),
                     shape),
             _ => throw new InvalidOperationException(
                 $"Unsupported CUDA decoder KV element type {elementType}.")
