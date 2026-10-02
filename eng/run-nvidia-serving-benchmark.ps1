@@ -11,6 +11,9 @@ param(
     [ValidateNotNullOrEmpty()]
     [string] $ModelId,
 
+    [ValidateSet("fp32", "fp16")]
+    [string] $ModelPrecision = "fp32",
+
     [Parameter(Mandatory = $true)]
     [ValidateRange(1, 2147483647)]
     [int] $NumHiddenLayers,
@@ -160,6 +163,15 @@ $ortProfileSummarizer = Join-Path $repositoryRoot "eng/summarize-ort-profile.ps1
 
 $model = Resolve-RequiredFile -Path $ModelPath -Label "ONNX model"
 $tokenizer = Resolve-RequiredFile -Path $TokenizerPath -Label "Tokenizer"
+if ($ModelPrecision -eq "fp16") {
+    if ([string]::IsNullOrWhiteSpace($SampledTokenIdsOutput)) {
+        throw "FP16 CUDA serving benchmark currently requires -SampledTokenIdsOutput."
+    }
+
+    if ($PageLockedDecodeLogits) {
+        throw "-PageLockedDecodeLogits is not used by the graph-sampled FP16 CUDA path."
+    }
+}
 $manifestPath = Resolve-RepositoryFile -RepositoryRoot $repositoryRoot -Path $Manifest -Label "Benchmark manifest"
 $cudaRuntimeLibrary = if ([string]::IsNullOrWhiteSpace($CudaRuntimeLibraryPath)) {
     ""
@@ -286,6 +298,7 @@ $metadata = [ordered]@{
     }
     model = [ordered]@{
         id = $ModelId
+        precision = $ModelPrecision
         model_path = $model
         tokenizer_path = $tokenizer
         num_hidden_layers = $NumHiddenLayers
@@ -319,6 +332,7 @@ $settings = [ordered]@{
     "Fission__CudaRuntimeLibraryPath" = $cudaRuntimeLibrary
     "Fission__CudaPageLockedDecodeLogits" = if ($PageLockedDecodeLogits) { "true" } else { "false" }
     "Fission__SampledTokenIdsOutput" = $SampledTokenIdsOutput
+    "Fission__ModelPrecision" = $ModelPrecision
     "Fission__OrtProfileOutputPathPrefix" = if ($OrtProfile) { $ortProfilePrefix } else { "" }
     "Fission__ControlToken" = $controlToken
     "Fission__ModelPath" = $model
@@ -386,6 +400,7 @@ try {
 
     Write-Host "Fission NVIDIA serving benchmark"
     Write-Host "  model:       $ModelId"
+    Write-Host "  precision:   $ModelPrecision"
     Write-Host "  device:      cuda:$CudaDeviceId ($($selectedGpu.name))"
     Write-Host "  driver:      $($selectedGpu.driver_version)"
     Write-Host "  pinned logits: $([bool] $PageLockedDecodeLogits)"
