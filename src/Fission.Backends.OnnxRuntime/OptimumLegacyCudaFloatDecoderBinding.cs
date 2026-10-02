@@ -42,6 +42,7 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
     private long _scratchFloatRentCount;
     private long _scratchLongRentCount;
     private long _pageLockedDecodeLogitsRentCount;
+    private long _graphSampledTokenIdReadCount;
     private int _disposed;
 
     public OptimumLegacyCudaFloatDecoderBinding(
@@ -101,11 +102,27 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
                 nameof(profile));
         }
 
+        var additionalOutputCount = profile.Contract.AdditionalOutputs?.Count ?? 0;
+        var sampledOutputConfigured = !string.IsNullOrWhiteSpace(profile.SampledTokenIdsOutput);
+        var sampledOutputMatchesContract =
+            sampledOutputConfigured &&
+            additionalOutputCount == 1 &&
+            StringComparer.Ordinal.Equals(
+                profile.Contract.AdditionalOutputs![0].LogicalName,
+                "sampled_token_ids") &&
+            StringComparer.Ordinal.Equals(
+                profile.Contract.AdditionalOutputs[0].TensorName,
+                profile.SampledTokenIdsOutput) &&
+            profile.Contract.AdditionalOutputs[0].Rank == 2 &&
+            profile.Contract.AdditionalOutputs[0].ElementType == TensorElementType.Int64;
+
         if ((profile.Contract.AdditionalInputs?.Count ?? 0) != 0 ||
-            (profile.Contract.AdditionalOutputs?.Count ?? 0) != 0)
+            (sampledOutputConfigured
+                ? !sampledOutputMatchesContract
+                : additionalOutputCount != 0))
         {
             throw new ArgumentException(
-                "Additional model-specific tensors are not supported by the CUDA Optimum FP32 binding.",
+                "The CUDA Optimum FP32 binding only supports the optional sampled_token_ids int64 rank-2 output in addition to the standard decoder tensors.",
                 nameof(profile));
         }
 
@@ -152,6 +169,10 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
     public bool PageLockedDecodeLogitsEnabled => _decodeLogitsHostPool is not null;
     public long PageLockedDecodeLogitsRentCount =>
         Interlocked.Read(ref _pageLockedDecodeLogitsRentCount);
+    public bool GraphGreedySamplingEnabled =>
+        !string.IsNullOrWhiteSpace(_profile.SampledTokenIdsOutput);
+    public long GraphSampledTokenIdReadCount =>
+        Interlocked.Read(ref _graphSampledTokenIdReadCount);
 
     public DecoderOrtCudaResidentStateLease AcquireCudaResidentState(
         DecoderOrtState state,
@@ -644,31 +665,51 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
                 Interlocked.Increment(ref _cudaPastReuseCount);
             }
 
-            var logitsShape = geometry.GetLogitsShape(batchSize, sequenceLength);
-            var logitsLength = CheckedTensorLength(logitsShape);
-            Memory<float> logitsMemory;
-            if (useDecodeLogitsHostPool && _decodeLogitsHostPool is not null)
+            var graphGreedySampling = GraphGreedySamplingEnabled;
+            Memory<float> logitsMemory = default;
+            Memory<long> sampledTokenIdsMemory = default;
+
+            if (graphGreedySampling)
             {
-                var logitsLease = _decodeLogitsHostPool.Rent(logitsLength);
-                scratchLeases.Add(logitsLease);
-                logitsMemory = logitsLease.Memory;
-                Interlocked.Increment(ref _pageLockedDecodeLogitsRentCount);
+                var sampledTokenIdsLease = RentLongScratch(
+                    batchSize,
+                    scratchLeases);
+                sampledTokenIdsMemory = sampledTokenIdsLease.Memory;
+                var sampledTokenIdsValue = OrtValue.CreateTensorValueFromMemory(
+                    OrtMemoryInfo.DefaultInstance,
+                    sampledTokenIdsMemory,
+                    new long[] { batchSize, 1 });
+                ownedOutputs.Add(sampledTokenIdsValue);
+                outputNames.Add(_profile.SampledTokenIdsOutput!);
+                outputValues.Add(sampledTokenIdsValue);
             }
             else
             {
-                var logitsLease = RentFloatScratch(
-                    logitsLength,
-                    scratchLeases);
-                logitsMemory = logitsLease.Memory;
-            }
+                var logitsShape = geometry.GetLogitsShape(batchSize, sequenceLength);
+                var logitsLength = CheckedTensorLength(logitsShape);
+                if (useDecodeLogitsHostPool && _decodeLogitsHostPool is not null)
+                {
+                    var logitsLease = _decodeLogitsHostPool.Rent(logitsLength);
+                    scratchLeases.Add(logitsLease);
+                    logitsMemory = logitsLease.Memory;
+                    Interlocked.Increment(ref _pageLockedDecodeLogitsRentCount);
+                }
+                else
+                {
+                    var logitsLease = RentFloatScratch(
+                        logitsLength,
+                        scratchLeases);
+                    logitsMemory = logitsLease.Memory;
+                }
 
-            var logitsValue = OrtValue.CreateTensorValueFromMemory(
-                OrtMemoryInfo.DefaultInstance,
-                logitsMemory,
-                logitsShape);
-            ownedOutputs.Add(logitsValue);
-            outputNames.Add(contract.Logits);
-            outputValues.Add(logitsValue);
+                var logitsValue = OrtValue.CreateTensorValueFromMemory(
+                    OrtMemoryInfo.DefaultInstance,
+                    logitsMemory,
+                    logitsShape);
+                ownedOutputs.Add(logitsValue);
+                outputNames.Add(contract.Logits);
+                outputValues.Add(logitsValue);
+            }
 
             present = new OptimumLegacyCudaPresentKvBatch(
                 _profile,
@@ -691,17 +732,39 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
             }
             Interlocked.Increment(ref _ortRunCount);
 
-            var perSequenceLogitsLength = CheckedTensorLength(
-                geometry.GetLogitsShape(batchSize: 1, sequenceLength));
+            var perSequenceLogitsLength = graphGreedySampling
+                ? 0
+                : CheckedTensorLength(
+                    geometry.GetLogitsShape(batchSize: 1, sequenceLength));
             var results = new DecoderOrtStepResult[batchSize];
             for (var row = 0; row < batchSize; row++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var logitsOffset = checked(row * perSequenceLogitsLength);
-                var tokenId = OptimumLegacyFloatDecoderBinding.GreedySampleLastPosition(
-                    logitsMemory.Span.Slice(logitsOffset, perSequenceLogitsLength),
-                    sequenceLength,
-                    geometry.VocabularySize);
+
+                int tokenId;
+                if (graphGreedySampling)
+                {
+                    var sampledTokenId = sampledTokenIdsMemory.Span[row];
+                    if (sampledTokenId < 0 ||
+                        sampledTokenId >= geometry.VocabularySize ||
+                        sampledTokenId > int.MaxValue)
+                    {
+                        throw new InvalidOperationException(
+                            $"Graph-side greedy sampler returned token id {sampledTokenId}, outside vocabulary size {geometry.VocabularySize}.");
+                    }
+
+                    tokenId = checked((int)sampledTokenId);
+                    Interlocked.Increment(ref _graphSampledTokenIdReadCount);
+                }
+                else
+                {
+                    var logitsOffset = checked(row * perSequenceLogitsLength);
+                    tokenId = OptimumLegacyFloatDecoderBinding.GreedySampleLastPosition(
+                        logitsMemory.Span.Slice(logitsOffset, perSequenceLogitsLength),
+                        sequenceLength,
+                        geometry.VocabularySize);
+                }
+
                 var state = present.CreateRowState(row, tokenId);
                 producedStates.Add(state);
                 results[execution.ResultIndicesByRow[row]] = new DecoderOrtStepResult(
