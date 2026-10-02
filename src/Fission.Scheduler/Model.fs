@@ -71,6 +71,7 @@ type RejectedSequence =
     { Sequence: ReadySequence
       Reason: AdmissionRejectionReason }
 
+[<Struct>]
 type SchedulingDecision =
     { Selected: ScheduledSequence list
       Deferred: DeferredSequence list
