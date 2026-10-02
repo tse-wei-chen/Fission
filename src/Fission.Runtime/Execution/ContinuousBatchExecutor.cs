@@ -66,8 +66,16 @@ public sealed partial class ContinuousBatchExecutor : IAsyncDisposable
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxBatchSize);
 
-        await backend.InitializeAsync(cancellationToken).ConfigureAwait(false);
-        return new ContinuousBatchExecutor(backend, capacity, maxBatchSize);
+        try
+        {
+            await backend.InitializeAsync(cancellationToken).ConfigureAwait(false);
+            return new ContinuousBatchExecutor(backend, capacity, maxBatchSize);
+        }
+        catch
+        {
+            await backend.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
     }
 
     internal static AtomicSubmissionBatch BeginAtomicSubmission(int itemCount) =>
