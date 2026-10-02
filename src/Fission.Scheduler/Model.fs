@@ -11,6 +11,7 @@ type SequencePhase =
     | Finished
     | Cancelled
 
+[<Struct>]
 type ReadySequence =
     { SequenceId: SequenceId
       Phase: SequencePhase
