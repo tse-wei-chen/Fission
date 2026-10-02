@@ -745,7 +745,7 @@ module Scheduler =
                 selectMergedCandidates
                     budget
                     policy
-                    urgencyCutoffTicks
+                    compareCandidates
                     afterReserve
                     remainingDecodes
                     orderedPrefills
