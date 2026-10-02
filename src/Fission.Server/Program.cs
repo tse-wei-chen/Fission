@@ -42,6 +42,21 @@ await using var worker = new InferenceWorker(
     engine,
     new InferenceWorkerOptions(admissionCapacity));
 
+var startupProbe = await ServerStartupProbe.RunAsync(
+    builder.Configuration,
+    worker,
+    textCodec);
+if (startupProbe is not null)
+{
+    app.Logger.LogInformation(
+        "Startup inference probe succeeded for model {ModelId}: promptTokens={PromptTokens}, generatedTokens={GeneratedTokens}, finishReason={FinishReason}, elapsedMs={ElapsedMs:F1}.",
+        startupProbe.ModelId.Value,
+        startupProbe.PromptTokenCount,
+        startupProbe.GeneratedTokenCount,
+        startupProbe.FinishReason,
+        startupProbe.Elapsed.TotalMilliseconds);
+}
+
 OpenAiEndpoints.Map(app, worker, textCodec);
 await app.RunAsync();
 
