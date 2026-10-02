@@ -164,23 +164,36 @@ module Scheduler =
         | ValueSome usedSequences -> usedSequences
         | ValueNone -> 0
 
+    let rec private removeDeviceValue
+        (device: Fission.Abstractions.DeviceId)
+        (values: (Fission.Abstractions.DeviceId * 'T) list)
+        =
+        match values with
+        | [] -> struct (ValueNone, [])
+        | (candidate, value) :: tail when candidate = device ->
+            struct (ValueSome value, tail)
+        | head :: tail ->
+            let struct (current, withoutDevice) =
+                removeDeviceValue device tail
+            struct (current, head :: withoutDevice)
+
     let private addDeviceBytes device byteGrant used =
-        let current =
-            used
-            |> List.tryPick (fun (candidate, usedBytes) ->
-                if candidate = device then Some usedBytes else None)
-            |> Option.defaultValue 0L
-        let withoutDevice = used |> List.filter (fun (candidate, _) -> candidate <> device)
-        (device, current + byteGrant) :: withoutDevice
+        let struct (current, withoutDevice) =
+            removeDeviceValue device used
+        let currentBytes =
+            match current with
+            | ValueSome usedBytes -> usedBytes
+            | ValueNone -> 0L
+        (device, currentBytes + byteGrant) :: withoutDevice
 
     let private addDeviceSequence device used =
-        let current =
-            used
-            |> List.tryPick (fun (candidate, usedSequences) ->
-                if candidate = device then Some usedSequences else None)
-            |> Option.defaultValue 0
-        let withoutDevice = used |> List.filter (fun (candidate, _) -> candidate <> device)
-        (device, current + 1) :: withoutDevice
+        let struct (current, withoutDevice) =
+            removeDeviceValue device used
+        let currentSequences =
+            match current with
+            | ValueSome usedSequences -> usedSequences
+            | ValueNone -> 0
+        (device, currentSequences + 1) :: withoutDevice
 
     let private classifyAdmission (sequence: ReadySequence) =
         if not (isRunnable sequence) then
