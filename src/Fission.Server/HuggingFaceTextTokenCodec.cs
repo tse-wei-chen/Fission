@@ -21,15 +21,15 @@ public sealed class HuggingFaceTextTokenCodec : ITextTokenCodec
 {
     private readonly HfTokenizer _tokenizer;
     private readonly HuggingFaceChatTemplate _chatTemplate;
-    private readonly bool _addSpecialTokens;
-    private readonly bool _skipSpecialTokens;
+    private readonly bool _addPromptSpecialTokens;
+    private readonly bool _skipSpecialTokensOnDecode;
     private bool _disposed;
 
     public HuggingFaceTextTokenCodec(
         string tokenizerPath,
         HuggingFaceChatTemplate chatTemplate = HuggingFaceChatTemplate.None,
-        bool addSpecialTokens = true,
-        bool skipSpecialTokens = true)
+        bool addPromptSpecialTokens = true,
+        bool skipSpecialTokensOnDecode = true)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(tokenizerPath);
 
@@ -42,9 +42,13 @@ public sealed class HuggingFaceTextTokenCodec : ITextTokenCodec
         }
 
         _tokenizer = HfTokenizer.FromFile(TokenizerPath);
+        // Hugging Face's setting is intentionally inverted from its name:
+        // false extracts configured added special tokens and maps them directly
+        // to their ids; true sends the control strings through the normal model.
+        _tokenizer.SetEncodeSpecialTokens(false);
         _chatTemplate = chatTemplate;
-        _addSpecialTokens = addSpecialTokens;
-        _skipSpecialTokens = skipSpecialTokens;
+        _addPromptSpecialTokens = addPromptSpecialTokens;
+        _skipSpecialTokensOnDecode = skipSpecialTokensOnDecode;
     }
 
     public string TokenizerPath { get; }
@@ -53,7 +57,7 @@ public sealed class HuggingFaceTextTokenCodec : ITextTokenCodec
     {
         ThrowIfDisposed();
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
-        return Encode(prompt, _addSpecialTokens);
+        return Encode(prompt, _addPromptSpecialTokens);
     }
 
     public int[] EncodeChat(IReadOnlyList<OpenAiChatMessage> messages)
@@ -83,7 +87,7 @@ public sealed class HuggingFaceTextTokenCodec : ITextTokenCodec
     public ITextTokenDecoder CreateDecoder()
     {
         ThrowIfDisposed();
-        return new Decoder(_tokenizer, _skipSpecialTokens);
+        return new Decoder(_tokenizer, _skipSpecialTokensOnDecode);
     }
 
     public void Dispose()
@@ -150,6 +154,13 @@ public sealed class HuggingFaceTextTokenCodec : ITextTokenCodec
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(message.Role);
         ArgumentException.ThrowIfNullOrWhiteSpace(message.Content);
+
+        if (message.Role is not ("system" or "developer" or "user" or "assistant" or "tool"))
+        {
+            throw new ArgumentException(
+                $"Unsupported chat role '{message.Role}'.",
+                nameof(message));
+        }
     }
 
     private void ThrowIfDisposed()
