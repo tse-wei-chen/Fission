@@ -433,6 +433,7 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
                 inputIdsLease.Memory,
                 positionIdsLease.Memory,
                 scratchLeases,
+                useDecodeLogitsHostPool: false,
                 cancellationToken);
         }
         finally
@@ -499,6 +500,7 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
                 inputIdsLease.Memory,
                 positionIdsLease.Memory,
                 scratchLeases,
+                useDecodeLogitsHostPool: true,
                 cancellationToken);
         }
         finally
@@ -519,6 +521,7 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
         Memory<long> inputIds,
         Memory<long> positionIds,
         List<IDisposable> scratchLeases,
+        bool useDecodeLogitsHostPool,
         CancellationToken cancellationToken)
     {
         var geometry = Geometry;
@@ -644,7 +647,7 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
             var logitsShape = geometry.GetLogitsShape(batchSize, sequenceLength);
             var logitsLength = CheckedTensorLength(logitsShape);
             Memory<float> logitsMemory;
-            if (sequenceLength == 1 && _decodeLogitsHostPool is not null)
+            if (useDecodeLogitsHostPool && _decodeLogitsHostPool is not null)
             {
                 var logitsLease = _decodeLogitsHostPool.Rent(logitsLength);
                 scratchLeases.Add(logitsLease);
