@@ -457,6 +457,45 @@ await using var worker = new InferenceWorker(
     engine,
     new InferenceWorkerOptions(AdmissionCapacity: 16));
 
+using (var probeCodec = new DeterministicTextTokenCodec())
+{
+    var disabledProbe = await ServerStartupProbe.RunAsync(
+        new ConfigurationManager(),
+        worker,
+        probeCodec);
+    Require(
+        disabledProbe is null,
+        "Startup inference probe must remain disabled by default.");
+
+    var probeConfiguration = new ConfigurationManager();
+    probeConfiguration["Fission:StartupProbeEnabled"] = "true";
+    probeConfiguration["Fission:StartupProbePrompt"] = "probe";
+    probeConfiguration["Fission:ModelId"] = "server-spec-model";
+    probeConfiguration["Fission:StartupProbeMaxTokens"] = "2";
+    probeConfiguration["Fission:StartupProbeTimeoutSeconds"] = "5";
+
+    var probe = await ServerStartupProbe.RunAsync(
+        probeConfiguration,
+        worker,
+        probeCodec);
+    Require(
+        probe is not null,
+        "Enabled startup inference probe must return a result.");
+    Require(
+        probe.PromptTokenCount == 5 &&
+        probe.GeneratedTokenCount == 2 &&
+        probe.FinishReason == InferenceFinishReason.Length,
+        "Startup probe must exercise prompt encoding and complete through the worker/runtime/backend path.");
+    Require(
+        !string.IsNullOrWhiteSpace(probe.DecodedText),
+        "Startup probe must exercise request-scoped generated-text decoding.");
+    Require(
+        runtime.SequenceCount == 0 &&
+        kvPool.AllocatedPages == 0 &&
+        engine.ActiveRequestCount == 0,
+        "Successful startup probe must release runtime sequence and KV ownership before serving.");
+}
+
 var builder = WebApplication.CreateBuilder();
 builder.WebHost.UseUrls("http://127.0.0.1:0");
 var app = builder.Build();
