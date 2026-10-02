@@ -214,3 +214,41 @@ model and vocabulary, an eight-row FP32 decode step exposes about 1.5 MiB of
 logits to the host path. A graph-side `Gather -> ArgMax` output reduces the
 requested host result to eight int64 token ids while leaving the logits tensor
 inside ONNX Runtime.
+
+
+## Graph-side greedy A/B result
+
+A three-repetition comparison against the validated page-locked baseline showed
+that returning only graph-side greedy token ids does **not** improve this model
+consistently on the RTX 3060:
+
+| Workload | C | Pinned tok/s | Graph greedy tok/s | Throughput delta | Pinned TPOT p50 ms | Graph TPOT p50 ms | TPOT delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| gpu-short | 1 | 59.01 | 55.29 | -6.30% | 16.31 | 17.47 | +7.10% |
+| gpu-short | 4 | 111.07 | 105.76 | -4.78% | 34.25 | 36.11 | +5.43% |
+| gpu-short | 8 | 196.23 | 202.57 | +3.23% | 38.72 | 37.65 | -2.78% |
+| gpu-decode | 1 | 51.86 | 48.55 | -6.38% | 19.03 | 20.43 | +7.34% |
+| gpu-decode | 4 | 91.47 | 84.38 | -7.75% | 42.95 | 46.59 | +8.46% |
+| gpu-decode | 8 | 140.51 | 136.82 | -2.63% | 55.80 | 57.67 | +3.35% |
+
+All measured requests succeeded with exact usage accounting. The graph-side path
+therefore remains an experiment rather than the default. Removing the full
+logits host result saves transfer volume, but the added graph operations and/or
+provider scheduling cost more at C=1/4 and on the long C=8 decode workload.
+Only the short C=8 row shows a modest win.
+
+This result makes the existing 121 Memcpy nodes and CPU/CUDA graph partition the
+next attribution target. Use the ORT profiling gate before changing provider
+options or graph placement.
+
+### Checker boundary for ORT-optimized graphs
+
+The validated model contains `SimplifiedLayerNormalization`, which the generic
+ONNX checker may not recognize even though the target ONNX Runtime build accepts
+and executes the graph. The graph rewrite tool therefore supports
+`--skip-check`, **disabled by default**.
+
+Use `--skip-check` only when the checker fails on an operator already accepted
+by the target runtime, then require the normal Fission NVIDIA one-shot smoke
+before benchmarking the rewritten model. Skipping the checker is not runtime
+validation.

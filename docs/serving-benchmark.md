@@ -280,3 +280,42 @@ pwsh ./eng/run-nvidia-serving-benchmark.ps1 `
 Do not add `-PageLockedDecodeLogits` for this comparison: graph-side sampling
 bypasses the full host logits output entirely, so the pinned-logits path is not
 used.
+
+
+### ONNX Runtime profiling gate
+
+Use ORT profiling after an A/B result identifies a bottleneck that cannot be
+explained by request scheduling alone. Profiling changes timing, so do not use
+the profiled run itself as the performance comparison.
+
+For the current validated pinned-logits path:
+
+```powershell
+pwsh ./eng/run-nvidia-serving-benchmark.ps1 `
+  -ModelPath artifacts/models/SmolLM2-135M-Instruct/onnx/model.onnx `
+  -TokenizerPath artifacts/models/SmolLM2-135M-Instruct/tokenizer.json `
+  -ModelId SmolLM2-135M-Instruct `
+  -NumHiddenLayers 30 `
+  -NumKvHeads 3 `
+  -HeadDim 64 `
+  -VocabularySize 49152 `
+  -EosTokenIds 2 `
+  -PageLockedDecodeLogits `
+  -OrtProfile `
+  -Label fission-cuda-pinned-profile `
+  -Repetitions 1
+```
+
+The runner uses a token-gated graceful shutdown so ORT can flush its profile
+during session disposal. The timestamped run directory contains:
+
+- the raw `ort-profile*.json` Chrome trace;
+- `ort-profile-summary.md`;
+- `ort-profile-summary.json`;
+- the normal serving report and environment metadata.
+
+The summary aggregates ORT `Node` trace event durations by execution provider
+and operator and reports Memcpy execution-event count and summed duration.
+Summed trace durations are diagnostic event time, not wall-clock request
+latency. Use them to answer whether the CUDA/CPU partition and Memcpy nodes are
+actually expensive before changing graph placement or provider options.
