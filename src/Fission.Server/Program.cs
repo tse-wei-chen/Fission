@@ -40,7 +40,8 @@ await using var worker = new InferenceWorker(
     engine,
     new InferenceWorkerOptions(admissionCapacity));
 
-OpenAiEndpoints.Map(app, worker, new DeterministicTextTokenCodec());
+using var codec = ServerTextTokenCodecFactory.Create(builder.Configuration);
+OpenAiEndpoints.Map(app, worker, codec);
 await app.RunAsync();
 
 static int ReadPositiveInt(string? value, int fallback)
