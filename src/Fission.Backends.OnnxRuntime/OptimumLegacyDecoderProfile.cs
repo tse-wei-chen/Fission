@@ -11,7 +11,8 @@ namespace Fission.Backends.OnnxRuntime;
 /// </summary>
 public sealed record OptimumLegacyDecoderProfile(
     DecoderOrtGeometry Geometry,
-    DecoderOnlyOnnxContract Contract)
+    DecoderOnlyOnnxContract Contract,
+    string? SampledTokenIdsOutput = null)
 {
     public static OptimumLegacyDecoderProfile CreateLlamaLike(
         int numHiddenLayers,
@@ -27,7 +28,8 @@ public sealed record OptimumLegacyDecoderProfile(
         string pastKeyNames = "past_key_values.{0}.key",
         string pastValueNames = "past_key_values.{0}.value",
         string presentKeyNames = "present.{0}.key",
-        string presentValueNames = "present.{0}.value")
+        string presentValueNames = "present.{0}.value",
+        string? sampledTokenIdsOutput = null)
     {
         var geometry = new DecoderOrtGeometry(
             numHiddenLayers,
@@ -53,9 +55,22 @@ public sealed record OptimumLegacyDecoderProfile(
             PositionIdsElementType: TensorElementType.Int64,
             KvRank: 4,
             KvElementType: kvElementType,
-            LogitsElementType: logitsElementType);
+            LogitsElementType: logitsElementType,
+            AdditionalOutputs: sampledTokenIdsOutput is null
+                ? null
+                :
+                [
+                    new OnnxTensorContract(
+                        "sampled_token_ids",
+                        sampledTokenIdsOutput,
+                        Rank: 2,
+                        ElementType: TensorElementType.Int64)
+                ]);
 
-        return new OptimumLegacyDecoderProfile(geometry, contract);
+        return new OptimumLegacyDecoderProfile(
+            geometry,
+            contract,
+            sampledTokenIdsOutput);
     }
 
     public OnnxSessionContract SessionContract => Contract.ToSessionContract();

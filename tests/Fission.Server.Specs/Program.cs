@@ -145,6 +145,12 @@ static async Task ValidateBackendCompositionAsync()
             backend.Device == device,
             "ONNX backend composition must preserve the configured device.");
 
+        onnx["Fission:SampledTokenIdsOutput"] = "fission_sampled_token_ids";
+        RequireThrows<InvalidOperationException>(
+            () => ServerBackendFactory.Create(onnx, device),
+            "Graph-side sampled token output must fail fast on the CPU provider.");
+        onnx["Fission:SampledTokenIdsOutput"] = null;
+
         onnx["Fission:ExecutionProvider"] = "cuda";
         onnx["Fission:CudaDeviceId"] = "-1";
         RequireThrows<InvalidOperationException>(

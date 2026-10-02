@@ -140,6 +140,13 @@ CUDA mode accepts:
   When `true`, decode logits are written into reusable CUDA page-locked host
   buffers before CPU greedy sampling. Prefill logits remain on the existing
   pageable scratch path. Defaults to `false`.
+- `Fission:SampledTokenIdsOutput`: optional CUDA-only rank-2 int64 graph
+  output containing one greedy token id per batch row. When configured, the
+  CUDA binding fetches this small output instead of the full logits tensor for
+  both prefill and decode. The graph output must have shape `[batch, 1]`.
+  `eng/add-greedy-argmax-output.py` can append the matching
+  `Gather(last sequence position) -> ArgMax(vocabulary)` path to a compatible
+  decoder graph.
 - `Fission:CudaPoolMaxRetainedBytes`: maximum idle KV/device-buffer bytes
   retained for exact-size reuse; defaults to 256 MiB. Set `0` to disable idle
   retention.

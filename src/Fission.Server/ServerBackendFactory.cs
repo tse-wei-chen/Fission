@@ -70,14 +70,26 @@ public static class ServerBackendFactory
         }
 
         var modelId = ReadRequired(configuration, "Fission:ModelId");
+        var provider = ReadExecutionProvider(configuration);
+        var sampledTokenIdsOutput = ReadOptional(
+            configuration,
+            "Fission:SampledTokenIdsOutput");
+        if (sampledTokenIdsOutput is not null &&
+            provider != OnnxExecutionProvider.Cuda)
+        {
+            throw new InvalidOperationException(
+                "Fission:SampledTokenIdsOutput is currently supported only with the CUDA execution provider.");
+        }
+
         var profile = OptimumLegacyDecoderProfile.CreateLlamaLike(
             numHiddenLayers: ReadPositiveInt(configuration, "Fission:NumHiddenLayers"),
             numKvHeads: ReadPositiveInt(configuration, "Fission:NumKvHeads"),
             headDim: ReadPositiveInt(configuration, "Fission:HeadDim"),
-            vocabularySize: ReadPositiveInt(configuration, "Fission:VocabularySize"));
+            vocabularySize: ReadPositiveInt(configuration, "Fission:VocabularySize"),
+            sampledTokenIdsOutput: sampledTokenIdsOutput);
         var eosTokenIds = ReadTokenIds(configuration, "Fission:EosTokenIds");
 
-        return ReadExecutionProvider(configuration) switch
+        return provider switch
         {
             OnnxExecutionProvider.Cpu =>
                 CreateCpuOnnxRuntime(
