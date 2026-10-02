@@ -385,6 +385,30 @@ module Scheduler =
 
         loop state orderedDecodes
 
+    let private reserveDecodeArrayTokens
+        (budget: ResourceBudget)
+        (policy: SchedulingPolicy)
+        (orderedDecodes: ReadySequence array)
+        (state: SelectionState)
+        =
+        let reserveTarget = min policy.DecodeTokenReserve budget.MaxBatchTokens
+        let mutable current = state
+        let mutable index = 0
+
+        while
+            current.UsedTokens < reserveTarget
+            && index < orderedDecodes.Length
+            do
+            current <-
+                trySelect
+                    budget
+                    policy
+                    current
+                    orderedDecodes[index]
+            index <- index + 1
+
+        struct (current, index)
+
     let private selectMergedCandidates
         (budget: ResourceBudget)
         (policy: SchedulingPolicy)
@@ -426,6 +450,53 @@ module Scheduler =
                             (prefillIndex + 1)
 
         loop initialState orderedDecodes 0
+
+    let private selectMergedCandidateArrays
+        (budget: ResourceBudget)
+        (policy: SchedulingPolicy)
+        (compareCandidates: ReadySequence -> ReadySequence -> int)
+        (initialState: SelectionState)
+        (orderedDecodes: ReadySequence array)
+        (decodeStartIndex: int)
+        (orderedPrefills: ReadySequence array)
+        =
+        let mutable state = initialState
+        let mutable decodeIndex = decodeStartIndex
+        let mutable prefillIndex = 0
+
+        while
+            decodeIndex < orderedDecodes.Length
+            || prefillIndex < orderedPrefills.Length
+            do
+            let useDecode =
+                if decodeIndex >= orderedDecodes.Length then
+                    false
+                elif prefillIndex >= orderedPrefills.Length then
+                    true
+                else
+                    compareCandidates
+                        orderedDecodes[decodeIndex]
+                        orderedPrefills[prefillIndex]
+                    <= 0
+
+            if useDecode then
+                state <-
+                    trySelect
+                        budget
+                        policy
+                        state
+                        orderedDecodes[decodeIndex]
+                decodeIndex <- decodeIndex + 1
+            else
+                state <-
+                    trySelect
+                        budget
+                        policy
+                        state
+                        orderedPrefills[prefillIndex]
+                prefillIndex <- prefillIndex + 1
+
+        state
 
     let private validateScheduleInputs
         (budget: ResourceBudget)
@@ -514,7 +585,6 @@ module Scheduler =
         =
         let urgencyCutoffTicks = now.Add(policy.DeadlineUrgencyWindow).UtcTicks
         let compareCandidates = compareReady urgencyCutoffTicks
-        let orderedDecodes = decodes |> List.sortWith compareCandidates
 
         let initialState =
             { SelectedRev = []
@@ -527,9 +597,6 @@ module Scheduler =
               FirstUsedDevice = ValueNone
               AdditionalUsedDevices = [] }
 
-        let struct (afterReserve, remainingDecodes) =
-            reserveDecodeTokens budget policy orderedDecodes initialState
-
         let orderedPrefills =
             match prefills with
             | [] -> Array.empty
@@ -540,13 +607,46 @@ module Scheduler =
                 items
 
         let finalState =
-            selectMergedCandidates
-                budget
-                policy
-                compareCandidates
-                afterReserve
-                remainingDecodes
-                orderedPrefills
+            match decodes with
+            | [] ->
+                selectMergedCandidates
+                    budget
+                    policy
+                    compareCandidates
+                    initialState
+                    []
+                    orderedPrefills
+            | [_] ->
+                let struct (afterReserve, remainingDecodes) =
+                    reserveDecodeTokens
+                        budget
+                        policy
+                        decodes
+                        initialState
+                selectMergedCandidates
+                    budget
+                    policy
+                    compareCandidates
+                    afterReserve
+                    remainingDecodes
+                    orderedPrefills
+            | _ ->
+                let orderedDecodes = List.toArray decodes
+                Array.sortInPlaceWith compareCandidates orderedDecodes
+                let struct (afterReserve, decodeStartIndex) =
+                    reserveDecodeArrayTokens
+                        budget
+                        policy
+                        orderedDecodes
+                        initialState
+                selectMergedCandidateArrays
+                    budget
+                    policy
+                    compareCandidates
+                    afterReserve
+                    orderedDecodes
+                    decodeStartIndex
+                    orderedPrefills
 
         { Selected = List.rev finalState.SelectedRev
           Deferred = initiallyDeferred @ List.rev finalState.DeferredRev
