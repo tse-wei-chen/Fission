@@ -11,7 +11,7 @@ module ScheduleCompiler =
         let rec fill index remaining =
             match remaining with
             | [] -> items
-            | selectedItem :: tail ->
+            | (selectedItem: ScheduledSequence) :: tail ->
                 let kind, completesPrefill =
                     match selectedItem.Sequence.Phase with
                     | Prefilling ->
