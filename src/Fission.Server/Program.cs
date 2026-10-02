@@ -18,6 +18,8 @@ var maxBatchSequences = ReadPositiveInt(builder.Configuration["Fission:MaxBatchS
 var maxPrefillChunk = ReadPositiveInt(builder.Configuration["Fission:MaxPrefillChunkTokens"], 512);
 var admissionCapacity = ReadPositiveInt(builder.Configuration["Fission:AdmissionCapacity"], 1_024);
 
+using var textCodec = ServerTextTokenCodecFactory.Create(builder.Configuration);
+
 var backend = ServerBackendFactory.Create(builder.Configuration, device);
 await using var deviceExecutor = await ContinuousBatchExecutor.CreateAsync(
     backend,
@@ -40,7 +42,7 @@ await using var worker = new InferenceWorker(
     engine,
     new InferenceWorkerOptions(admissionCapacity));
 
-OpenAiEndpoints.Map(app, worker, new DeterministicTextTokenCodec());
+OpenAiEndpoints.Map(app, worker, textCodec);
 await app.RunAsync();
 
 static int ReadPositiveInt(string? value, int fallback)
