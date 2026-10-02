@@ -1,0 +1,125 @@
+name: image
+
+on:
+  pull_request:
+    branches: [ develop ]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - Directory.Build.props
+      - Fission.slnx
+      - global.json
+      - src/**
+      - .github/workflows/image.yml
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: GHCR tag for this manually published image
+        required: true
+        default: edge
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve image metadata
+        id: image
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          MANUAL_TAG: ${{ inputs.image_tag }}
+          OWNER: ${{ github.repository_owner }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          image="ghcr.io/${OWNER,,}/fission"
+
+          case "$EVENT_NAME" in
+            pull_request)
+              tag="pr-${PR_NUMBER}"
+              publish=false
+              ;;
+            workflow_dispatch)
+              tag="$MANUAL_TAG"
+              publish=true
+              ;;
+            push)
+              tag="$REF_NAME"
+              publish=true
+              if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+                echo "Release tags must use vMAJOR.MINOR.PATCH with an optional prerelease suffix." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "Unsupported event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ ! "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "Invalid Docker image tag: $tag" >&2
+            exit 1
+          fi
+
+          {
+            echo "image=$image"
+            echo "tag=$tag"
+            echo "publish=$publish"
+            echo "tags<<EOF"
+            echo "$image:$tag"
+            if [[ "$EVENT_NAME" == "push" && "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "$image:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify release tag is reachable from master
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin master --depth=1
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "Release tags must point to a commit reachable from master." >&2
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.image.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and optionally publish image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ steps.image.outputs.publish == 'true' }}
+          tags: ${{ steps.image.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.image.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
