@@ -47,3 +47,40 @@ The OpenAI transport maps these to `stop`, `length`, and `cancelled` respectivel
 ## Backpressure
 
 Admission remains bounded at `InferenceWorker`. Per-request output channels remain unbounded for now so a slow network consumer cannot block the scheduler actor or device loop. A later serving policy may add bounded output buffering plus explicit slow-consumer cancellation/drop rules.
+
+
+## Backend composition
+
+`Fission.Server` defaults to the deterministic backend so CI, transport specs,
+and zero-model smoke runs remain self-contained. Set `Fission:Backend=onnx` to
+compose the existing stateful Optimum legacy decoder stack:
+
+```text
+OnnxRuntimeModelSource
+  -> OptimumLegacyFloatDecoderBinding
+  -> DecoderOnlyOnnxExecutionAdapter
+  -> OnnxRuntimeBackend
+  -> ContinuousBatchExecutor
+  -> InferenceEngine
+```
+
+The initial real-model composition requires:
+
+- `Fission:ModelPath`: local decoder-with-past ONNX file.
+- `Fission:ModelId`: model id expected by serving requests.
+- `Fission:NumHiddenLayers`: positive decoder layer count.
+- `Fission:NumKvHeads`: positive KV-head count.
+- `Fission:HeadDim`: positive attention head dimension.
+- `Fission:VocabularySize`: positive vocabulary size.
+- `Fission:EosTokenIds`: optional comma/semicolon/space-separated EOS token ids.
+
+The server validates configuration and model-file existence before runtime
+construction. `ContinuousBatchExecutor.CreateAsync` initializes the backend
+before Kestrel starts serving, so an invalid ONNX graph/session contract fails
+startup rather than the first inference request.
+
+This composition currently uses the CPU FP32 Optimum legacy binding and still
+uses `DeterministicTextTokenCodec` at the HTTP boundary. Production tokenizer,
+chat-template, and CUDA Execution Provider composition are separate follow-up
+milestones; the deterministic backend remains the default until those layers are
+wired and hardware-tested.

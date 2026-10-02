@@ -14,6 +14,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Configuration;
 
 static void Require(bool condition, string message)
 {
@@ -36,6 +37,94 @@ static async Task WaitUntilAsync(Func<bool> predicate, TimeSpan timeout)
         await Task.Delay(20);
     }
 }
+
+static TException RequireThrows<TException>(
+    Action action,
+    string message)
+    where TException : Exception
+{
+    try
+    {
+        action();
+    }
+    catch (TException exception)
+    {
+        return exception;
+    }
+
+    throw new InvalidOperationException(message);
+}
+
+static async Task ValidateBackendCompositionAsync()
+{
+    var device = new DeviceId("cpu:composition-spec");
+
+    var defaults = new ConfigurationManager();
+    await using (var backend = ServerBackendFactory.Create(defaults, device))
+    {
+        Require(
+            backend.Name == "deterministic",
+            "Server backend composition must default to the deterministic backend.");
+        Require(
+            backend.Device == device,
+            "Deterministic backend composition must preserve the configured device.");
+    }
+
+    var unsupported = new ConfigurationManager();
+    unsupported["Fission:Backend"] = "not-a-backend";
+    RequireThrows<InvalidOperationException>(
+        () => ServerBackendFactory.Create(unsupported, device),
+        "Unknown server backends must fail during composition.");
+
+    var missingModel = new ConfigurationManager();
+    missingModel["Fission:Backend"] = "onnx";
+    missingModel["Fission:ModelPath"] = Path.Combine(
+        Path.GetTempPath(),
+        $"missing-fission-{Guid.NewGuid():N}.onnx");
+    var missingException = RequireThrows<FileNotFoundException>(
+        () => ServerBackendFactory.Create(missingModel, device),
+        "The ONNX backend must reject a missing model before server startup.");
+    Require(
+        missingException.FileName is not null,
+        "Missing-model failure should include the resolved model path.");
+
+    var modelPath = Path.Combine(
+        Path.GetTempPath(),
+        $"fission-composition-{Guid.NewGuid():N}.onnx");
+    await File.WriteAllBytesAsync(modelPath, [0]);
+
+    try
+    {
+        var onnx = new ConfigurationManager();
+        onnx["Fission:Backend"] = "onnx";
+        onnx["Fission:ModelPath"] = modelPath;
+        onnx["Fission:ModelId"] = "composition-spec-model";
+        onnx["Fission:NumHiddenLayers"] = "2";
+        onnx["Fission:NumKvHeads"] = "2";
+        onnx["Fission:HeadDim"] = "4";
+        onnx["Fission:VocabularySize"] = "32";
+        onnx["Fission:EosTokenIds"] = "2, 3";
+
+        await using var backend = ServerBackendFactory.Create(onnx, device);
+        Require(
+            backend.Name == "onnxruntime/decoder/optimum-legacy-fp32-greedy",
+            "ONNX composition must build the Optimum legacy decoder backend.");
+        Require(
+            backend.Device == device,
+            "ONNX backend composition must preserve the configured device.");
+
+        onnx["Fission:VocabularySize"] = "0";
+        RequireThrows<InvalidOperationException>(
+            () => ServerBackendFactory.Create(onnx, device),
+            "Invalid ONNX geometry must fail during server composition.");
+    }
+    finally
+    {
+        File.Delete(modelPath);
+    }
+}
+
+await ValidateBackendCompositionAsync();
 
 var device = new DeviceId("cpu:server-spec");
 var kvPool = new KvPagePool(capacity: 1024, tokensPerPage: 4);

@@ -18,8 +18,9 @@ var maxBatchSequences = ReadPositiveInt(builder.Configuration["Fission:MaxBatchS
 var maxPrefillChunk = ReadPositiveInt(builder.Configuration["Fission:MaxPrefillChunkTokens"], 512);
 var admissionCapacity = ReadPositiveInt(builder.Configuration["Fission:AdmissionCapacity"], 1_024);
 
+var backend = ServerBackendFactory.Create(builder.Configuration, device);
 await using var deviceExecutor = await ContinuousBatchExecutor.CreateAsync(
-    new DeterministicBackend(device),
+    backend,
     capacity: admissionCapacity,
     maxBatchSize: maxBatchSequences);
 using var runtime = new ExecutionPlanExecutor(
