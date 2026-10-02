@@ -147,7 +147,7 @@ public static class OpenAiEndpoints
         ITextTokenCodec codec)
     {
         var text = new StringBuilder();
-        var decoder = codec.CreateDecoder();
+        using var decoder = codec.CreateDecoder();
         var completed = false;
 
         try
@@ -197,7 +197,7 @@ public static class OpenAiEndpoints
         ITextTokenCodec codec)
     {
         var text = new StringBuilder();
-        var decoder = codec.CreateDecoder();
+        using var decoder = codec.CreateDecoder();
         var completed = false;
 
         try
@@ -248,7 +248,7 @@ public static class OpenAiEndpoints
         PrepareSse(context.Response);
         var id = $"cmpl-{stream.SequenceId.Value:N}";
         var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var decoder = codec.CreateDecoder();
+        using var decoder = codec.CreateDecoder();
         var completed = false;
 
         try
@@ -323,7 +323,7 @@ public static class OpenAiEndpoints
         PrepareSse(context.Response);
         var id = $"chatcmpl-{stream.SequenceId.Value:N}";
         var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var decoder = codec.CreateDecoder();
+        using var decoder = codec.CreateDecoder();
         var completed = false;
 
         try
