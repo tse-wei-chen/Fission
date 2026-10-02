@@ -18,16 +18,19 @@ type SchedulingKernel() =
         (mapping: 'T -> 'U)
         (items: 'T list)
         =
-        let mapped = Array.zeroCreate<'U> (List.length items)
+        match items with
+        | [] -> Array.empty<'U>
+        | _ ->
+            let mapped = Array.zeroCreate<'U> (List.length items)
 
-        let rec fill index remaining =
-            match remaining with
-            | [] -> mapped
-            | item :: tail ->
-                mapped[index] <- mapping item
-                fill (index + 1) tail
+            let rec fill index remaining =
+                match remaining with
+                | [] -> mapped
+                | item :: tail ->
+                    mapped[index] <- mapping item
+                    fill (index + 1) tail
 
-        fill 0 items
+            fill 0 items
 
     let toPhase (phase: SchedulingPhase) =
         match phase with
