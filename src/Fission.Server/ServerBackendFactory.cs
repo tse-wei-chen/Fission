@@ -148,6 +148,9 @@ public static class ServerBackendFactory
     {
         var cudaDeviceId = ReadCudaDeviceId(configuration);
         var runtimeLibraryPath = ReadOptional(configuration, "Fission:CudaRuntimeLibraryPath");
+        var ortProfileOutputPathPrefix = ReadOptional(
+            configuration,
+            "Fission:OrtProfileOutputPathPrefix");
         var pageLockedDecodeLogits = ReadBoolean(
             configuration,
             "Fission:CudaPageLockedDecodeLogits",
@@ -209,7 +212,9 @@ public static class ServerBackendFactory
                     DeviceMemoryPressureSource: pressureMonitor,
                     DeviceMemoryReclaimer: pressureMonitor),
                 adapter,
-                OnnxRuntimeSessionOptions.Cuda(cudaDeviceId),
+                OnnxRuntimeSessionOptions.Cuda(
+                    cudaDeviceId,
+                    ortProfileOutputPathPrefix),
                 ownedResource: pool);
         }
         catch
