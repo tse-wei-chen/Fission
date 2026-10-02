@@ -90,6 +90,20 @@ module Scheduler =
                     if byArrival <> 0 then byArrival
                     else compare left.SequenceId.Value right.SequenceId.Value
 
+    [<Struct>]
+    type private ReadySequenceComparer =
+        val UrgencyCutoffTicks: int64
+
+        new(urgencyCutoffTicks) =
+            { UrgencyCutoffTicks = urgencyCutoffTicks }
+
+        interface System.Collections.Generic.IComparer<ReadySequence> with
+            member this.Compare(left, right) =
+                compareReady
+                    this.UrgencyCutoffTicks
+                    left
+                    right
+
     let private pagesForTokens tokensPerPage (tokenCount: int64) =
         if tokenCount <= 0L then
             0L
@@ -526,7 +540,7 @@ module Scheduler =
     let private selectMergedCandidateWorkspace
         (budget: ResourceBudget)
         (policy: SchedulingPolicy)
-        (compareCandidates: ReadySequence -> ReadySequence -> int)
+        (urgencyCutoffTicks: int64)
         (initialState: SelectionState)
         (orderedCandidates: ReadySequence array)
         (decodeStartIndex: int)
@@ -547,7 +561,8 @@ module Scheduler =
                 elif prefillIndex >= orderedCandidates.Length then
                     true
                 else
-                    compareCandidates
+                    compareReady
+                        urgencyCutoffTicks
                         orderedCandidates[decodeIndex]
                         orderedCandidates[prefillIndex]
                     <= 0
@@ -730,7 +745,7 @@ module Scheduler =
                 selectMergedCandidates
                     budget
                     policy
-                    compareCandidates
+                    urgencyCutoffTicks
                     afterReserve
                     remainingDecodes
                     orderedPrefills
@@ -844,26 +859,17 @@ module Scheduler =
 
             let urgencyCutoffTicks =
                 now.Add(policy.DeadlineUrgencyWindow).UtcTicks
-            let compareCandidates = compareReady urgencyCutoffTicks
-            let comparer =
-                System.Collections.Generic.Comparer<ReadySequence>.Create(
-                    System.Comparison<ReadySequence>(
-                        fun left right ->
-                            compareCandidates left right))
+            let comparer = ReadySequenceComparer urgencyCutoffTicks
 
             if decodeCount > 1 then
-                System.Array.Sort<ReadySequence>(
-                    workspace,
-                    0,
-                    decodeCount,
+                System.MemoryExtensions.Sort<ReadySequence, ReadySequenceComparer>(
+                    workspace.AsSpan(0, decodeCount),
                     comparer)
 
             let prefillCount = workspace.Length - prefillStartIndex
             if prefillCount > 1 then
-                System.Array.Sort<ReadySequence>(
-                    workspace,
-                    prefillStartIndex,
-                    prefillCount,
+                System.MemoryExtensions.Sort<ReadySequence, ReadySequenceComparer>(
+                    workspace.AsSpan(prefillStartIndex, prefillCount),
                     comparer)
 
             let initialState =
