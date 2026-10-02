@@ -1119,21 +1119,7 @@ public sealed partial class InferenceEngine : IDisposable
             return false;
         }
 
-        var selectedTransientByDevice = new Dictionary<DeviceId, long>();
-        foreach (var item in decision.Batch.Items)
-        {
-            if (!candidateBySequence.TryGetValue(item.SequenceId, out var candidate) ||
-                candidate.ExecutionDevice is not { } device)
-            {
-                continue;
-            }
-
-            selectedTransientByDevice.TryGetValue(device, out var usedBytes);
-            selectedTransientByDevice[device] = checked(
-                usedBytes + item.TransientKvByteGrant);
-        }
-
-        var firstBlockedByDevice = new Dictionary<DeviceId, SchedulingCandidate>();
+        Dictionary<DeviceId, SchedulingCandidate>? firstBlockedByDevice = null;
         foreach (var deferred in decision.Deferred)
         {
             if (deferred.Reason != SchedulingDeferralReason.DeviceMemoryBudget ||
@@ -1143,12 +1129,29 @@ public sealed partial class InferenceEngine : IDisposable
                 continue;
             }
 
-            firstBlockedByDevice.TryAdd(device, candidate);
+            (firstBlockedByDevice ??=
+                new Dictionary<DeviceId, SchedulingCandidate>())
+                .TryAdd(device, candidate);
         }
 
-        if (firstBlockedByDevice.Count == 0)
+        if (firstBlockedByDevice is null)
         {
             return false;
+        }
+
+        Dictionary<DeviceId, long>? selectedTransientByDevice = null;
+        foreach (var item in decision.Batch.Items)
+        {
+            if (!candidateBySequence.TryGetValue(item.SequenceId, out var candidate) ||
+                candidate.ExecutionDevice is not { } device)
+            {
+                continue;
+            }
+
+            selectedTransientByDevice ??= new Dictionary<DeviceId, long>();
+            selectedTransientByDevice.TryGetValue(device, out var usedBytes);
+            selectedTransientByDevice[device] = checked(
+                usedBytes + item.TransientKvByteGrant);
         }
 
         var blockedDevices = firstBlockedByDevice.Keys
@@ -1165,7 +1168,14 @@ public sealed partial class InferenceEngine : IDisposable
                 continue;
             }
 
-            selectedTransientByDevice.TryGetValue(device, out var selectedTransientBytes);
+            var selectedTransientBytes = 0L;
+            if (selectedTransientByDevice is not null)
+            {
+                selectedTransientByDevice.TryGetValue(
+                    device,
+                    out selectedTransientBytes);
+            }
+
             var outstandingReservationBytes = GetReservedDeviceMemoryBytes(
                 reservations,
                 device);
