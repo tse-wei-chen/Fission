@@ -100,7 +100,7 @@ $records = @(
             event_name = $eventName
             duration_us = $durationUs
             is_memcpy = $isMemcpy
-            op_key = "$provider::$opName"
+            op_key = "${provider}::$opName"
         }
     }
 )
@@ -171,7 +171,7 @@ $summary = [ordered]@{
 $lines = [System.Collections.Generic.List[string]]::new()
 $lines.Add("# ONNX Runtime profile summary")
 $lines.Add("")
-$lines.Add("Profile: `$(Escape-Markdown $resolvedProfile)`")
+$lines.Add(("Profile: {0}{1}{0}" -f [char]96, (Escape-Markdown $resolvedProfile)))
 $lines.Add("")
 $lines.Add("- Node execution events: $($records.Count)")
 $lines.Add("- Summed node duration: $("{0:F2}" -f ($totalDurationUs / 1000.0)) ms")
