@@ -17,8 +17,8 @@ module Scheduler =
           UsedKvPages: int
           UsedKvBytes: int64
           UsedTransientKvBytes: int64
-          UsedDeviceTransientBytes: (Fission.Abstractions.DeviceId * int64) list
-          UsedDeviceSequences: (Fission.Abstractions.DeviceId * int) list }
+          UsedDeviceTransientBytes: struct (Fission.Abstractions.DeviceId * int64) list
+          UsedDeviceSequences: struct (Fission.Abstractions.DeviceId * int) list }
 
     let rec private containsDevice
         (device: Fission.Abstractions.DeviceId)
@@ -161,46 +161,58 @@ module Scheduler =
     let private tryFindDeviceSequenceBudget (budget: ResourceBudget) device =
         tryFindDeviceValue device budget.MaxDeviceSequences
 
+    let rec private tryFindUsedDeviceValue
+        (device: Fission.Abstractions.DeviceId)
+        (values: struct (Fission.Abstractions.DeviceId * 'T) list)
+        =
+        match values with
+        | [] -> ValueNone
+        | struct (candidate, value) :: tail ->
+            if candidate = device then
+                ValueSome value
+            else
+                tryFindUsedDeviceValue device tail
+
     let private usedDeviceBytes (state: SelectionState) device =
-        match tryFindDeviceValue device state.UsedDeviceTransientBytes with
+        match tryFindUsedDeviceValue device state.UsedDeviceTransientBytes with
         | ValueSome usedBytes -> usedBytes
         | ValueNone -> 0L
 
     let private usedDeviceSequences (state: SelectionState) device =
-        match tryFindDeviceValue device state.UsedDeviceSequences with
+        match tryFindUsedDeviceValue device state.UsedDeviceSequences with
         | ValueSome usedSequences -> usedSequences
         | ValueNone -> 0
 
-    let rec private removeDeviceValue
+    let rec private removeUsedDeviceValue
         (device: Fission.Abstractions.DeviceId)
-        (values: (Fission.Abstractions.DeviceId * 'T) list)
+        (values: struct (Fission.Abstractions.DeviceId * 'T) list)
         =
         match values with
         | [] -> struct (ValueNone, [])
-        | (candidate, value) :: tail when candidate = device ->
+        | struct (candidate, value) :: tail when candidate = device ->
             struct (ValueSome value, tail)
         | head :: tail ->
             let struct (current, withoutDevice) =
-                removeDeviceValue device tail
+                removeUsedDeviceValue device tail
             struct (current, head :: withoutDevice)
 
     let private addDeviceBytes device byteGrant used =
         let struct (current, withoutDevice) =
-            removeDeviceValue device used
+            removeUsedDeviceValue device used
         let currentBytes =
             match current with
             | ValueSome usedBytes -> usedBytes
             | ValueNone -> 0L
-        (device, currentBytes + byteGrant) :: withoutDevice
+        struct (device, currentBytes + byteGrant) :: withoutDevice
 
     let private addDeviceSequence device used =
         let struct (current, withoutDevice) =
-            removeDeviceValue device used
+            removeUsedDeviceValue device used
         let currentSequences =
             match current with
             | ValueSome usedSequences -> usedSequences
             | ValueNone -> 0
-        (device, currentSequences + 1) :: withoutDevice
+        struct (device, currentSequences + 1) :: withoutDevice
 
     let private classifyAdmission (sequence: ReadySequence) =
         if not (isRunnable sequence) then
