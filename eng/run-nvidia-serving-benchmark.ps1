@@ -150,6 +150,16 @@ $suiteRunner = Join-Path $repositoryRoot "eng/run-serving-suite.ps1"
 $model = Resolve-RequiredFile -Path $ModelPath -Label "ONNX model"
 $tokenizer = Resolve-RequiredFile -Path $TokenizerPath -Label "Tokenizer"
 $manifestPath = Resolve-RepositoryFile -RepositoryRoot $repositoryRoot -Path $Manifest -Label "Benchmark manifest"
+$cudaRuntimeLibrary = if ([string]::IsNullOrWhiteSpace($CudaRuntimeLibraryPath)) {
+    ""
+} else {
+    Resolve-RequiredFile -Path $CudaRuntimeLibraryPath -Label "CUDA Runtime library"
+}
+$cudaLibraryDirectory = if ([string]::IsNullOrWhiteSpace($cudaRuntimeLibrary)) {
+    $null
+} else {
+    Split-Path -Parent $cudaRuntimeLibrary
+}
 
 $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 if ($null -eq $nvidiaSmi) {
@@ -253,7 +263,8 @@ $metadata = [ordered]@{
     runtime = [ordered]@{
         dotnet_sdk = $dotnetVersion
         onnxruntime_gpu = $onnxRuntimeVersion
-        cuda_runtime_library = if ([string]::IsNullOrWhiteSpace($CudaRuntimeLibraryPath)) { $null } else { $CudaRuntimeLibraryPath }
+        cuda_runtime_library = if ([string]::IsNullOrWhiteSpace($cudaRuntimeLibrary)) { $null } else { $cudaRuntimeLibrary }
+        cuda_library_search_directory = $cudaLibraryDirectory
     }
     model = [ordered]@{
         id = $ModelId
@@ -286,7 +297,7 @@ $settings = [ordered]@{
     "Fission__ExecutionProvider" = "cuda"
     "Fission__Device" = "cuda:$CudaDeviceId"
     "Fission__CudaDeviceId" = "$CudaDeviceId"
-    "Fission__CudaRuntimeLibraryPath" = $CudaRuntimeLibraryPath
+    "Fission__CudaRuntimeLibraryPath" = $cudaRuntimeLibrary
     "Fission__ModelPath" = $model
     "Fission__ModelId" = $ModelId
     "Fission__NumHiddenLayers" = "$NumHiddenLayers"
@@ -303,6 +314,19 @@ $settings = [ordered]@{
     "Fission__StartupProbeModelId" = $ModelId
     "Fission__StartupProbeMaxTokens" = "$StartupProbeMaxTokens"
     "Fission__StartupProbeTimeoutSeconds" = "$StartupProbeTimeoutSeconds"
+}
+
+if (-not [string]::IsNullOrWhiteSpace($cudaLibraryDirectory)) {
+    $isWindowsPlatform = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+    $librarySearchVariable = if ($isWindowsPlatform) { "PATH" } else { "LD_LIBRARY_PATH" }
+    $currentLibrarySearchPath = [Environment]::GetEnvironmentVariable(
+        $librarySearchVariable,
+        [EnvironmentVariableTarget]::Process)
+    $settings[$librarySearchVariable] = if ([string]::IsNullOrWhiteSpace($currentLibrarySearchPath)) {
+        $cudaLibraryDirectory
+    } else {
+        "$cudaLibraryDirectory$([System.IO.Path]::PathSeparator)$currentLibrarySearchPath"
+    }
 }
 
 $previous = @{}
