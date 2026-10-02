@@ -427,39 +427,34 @@ module Scheduler =
                 struct (decodes, prefills, deferred, rejectedItem :: rejected))
             (struct ([], [], [], []))
 
-    let private classifyArray (sequences: ReadySequence array) =
-        let mutable decodesRev = []
-        let mutable prefillsRev = []
-        let mutable deferredRev = []
-        let mutable rejectedRev = []
+    let private classifyArrayInOrder (sequences: ReadySequence array) =
+        let mutable decodes = []
+        let mutable prefills = []
+        let mutable deferred = []
+        let mutable rejected = []
 
-        for index = 0 to sequences.Length - 1 do
+        for index = sequences.Length - 1 downto 0 do
             match classifyAdmission sequences[index] with
             | Admitted candidate when candidate.Phase = Decoding ->
-                decodesRev <- candidate :: decodesRev
+                decodes <- candidate :: decodes
             | Admitted candidate ->
-                prefillsRev <- candidate :: prefillsRev
+                prefills <- candidate :: prefills
             | DeferredAdmission deferredItem ->
-                deferredRev <- deferredItem :: deferredRev
+                deferred <- deferredItem :: deferred
             | RejectedAdmission rejectedItem ->
-                rejectedRev <- rejectedItem :: rejectedRev
+                rejected <- rejectedItem :: rejected
 
-        struct (decodesRev, prefillsRev, deferredRev, rejectedRev)
+        struct (decodes, prefills, deferred, rejected)
 
-    let private scheduleClassifiedAt
+    let private schedulePartitionedAt
         (now: DateTimeOffset)
         (budget: ResourceBudget)
         (policy: SchedulingPolicy)
-        decodesRev
-        prefillsRev
-        deferredRev
-        rejectedRev
+        decodes
+        prefills
+        initiallyDeferred
+        rejected
         =
-        let decodes = List.rev decodesRev
-        let prefills = List.rev prefillsRev
-        let initiallyDeferred = List.rev deferredRev
-        let rejected = List.rev rejectedRev
-
         let orderedDecodes = decodes |> List.sortWith (compareReady now policy)
 
         let initialState =
@@ -502,14 +497,14 @@ module Scheduler =
         let struct (decodesRev, prefillsRev, deferredRev, rejectedRev) =
             classifyList sequences
 
-        scheduleClassifiedAt
+        schedulePartitionedAt
             now
             budget
             policy
-            decodesRev
-            prefillsRev
-            deferredRev
-            rejectedRev
+            (List.rev decodesRev)
+            (List.rev prefillsRev)
+            (List.rev deferredRev)
+            (List.rev rejectedRev)
 
     let scheduleArrayAt
         (now: DateTimeOffset)
@@ -518,17 +513,17 @@ module Scheduler =
         (sequences: ReadySequence array)
         =
         validateScheduleInputs budget policy
-        let struct (decodesRev, prefillsRev, deferredRev, rejectedRev) =
-            classifyArray sequences
+        let struct (decodes, prefills, deferred, rejected) =
+            classifyArrayInOrder sequences
 
-        scheduleClassifiedAt
+        schedulePartitionedAt
             now
             budget
             policy
-            decodesRev
-            prefillsRev
-            deferredRev
-            rejectedRev
+            decodes
+            prefills
+            deferred
+            rejected
 
     let schedule (budget: ResourceBudget) (policy: SchedulingPolicy) (sequences: ReadySequence list) =
         scheduleAt DateTimeOffset.UtcNow budget policy sequences
