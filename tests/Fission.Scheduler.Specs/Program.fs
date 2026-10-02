@@ -38,8 +38,8 @@ let budget =
       AvailableKvPages = 2
       MaxBatchSequences = 3
       AvailableKvBytes = Int64.MaxValue
-      AvailableDeviceBytes = []
-      MaxDeviceSequences = [] }
+      AvailableDeviceBytes = [||]
+      MaxDeviceSequences = [||] }
 
 let decodeA =
     mk
@@ -181,8 +181,8 @@ let pressureBudget =
       AvailableKvPages = 1
       MaxBatchSequences = 1
       AvailableKvBytes = Int64.MaxValue
-      AvailableDeviceBytes = []
-      MaxDeviceSequences = [] }
+      AvailableDeviceBytes = [||]
+      MaxDeviceSequences = [||] }
 
 let pressurePrefill =
     mk (sid "00000000-0000-0000-0000-000000000016") Prefilling 0 None now 16 0 blockSize
@@ -202,8 +202,8 @@ let bytePressureBudget =
       AvailableKvPages = 16
       MaxBatchSequences = 1
       AvailableKvBytes = 512L
-      AvailableDeviceBytes = []
-      MaxDeviceSequences = [] }
+      AvailableDeviceBytes = [||]
+      MaxDeviceSequences = [||] }
 
 let bytePressureDecision =
     Scheduler.scheduleAt now bytePressureBudget pressurePolicy [ bytePressurePrefill ]
@@ -243,8 +243,8 @@ let transientBudget =
       AvailableKvPages = 16
       MaxBatchSequences = 1
       AvailableKvBytes = 512L
-      AvailableDeviceBytes = []
-      MaxDeviceSequences = [] }
+      AvailableDeviceBytes = [||]
+      MaxDeviceSequences = [||] }
 
 let transientFitsDecision =
     Scheduler.scheduleAt now transientBudget admissionPolicy [ transientFits ]
@@ -264,8 +264,8 @@ let noPageBudget =
       AvailableKvPages = 0
       MaxBatchSequences = 1
       AvailableKvBytes = Int64.MaxValue
-      AvailableDeviceBytes = []
-      MaxDeviceSequences = [] }
+      AvailableDeviceBytes = [||]
+      MaxDeviceSequences = [||] }
 
 let decodeInsidePage =
     mk (sid "00000000-0000-0000-0000-000000000017") Decoding 0 None now 1 3 blockSize
@@ -283,8 +283,8 @@ let oneSlotBudget =
       AvailableKvPages = 1
       MaxBatchSequences = 1
       AvailableKvBytes = Int64.MaxValue
-      AvailableDeviceBytes = []
-      MaxDeviceSequences = [] }
+      AvailableDeviceBytes = [||]
+      MaxDeviceSequences = [||] }
 
 let urgentLowPriority =
     mk
@@ -370,8 +370,8 @@ let splitDeviceBudget =
       AvailableKvPages = 16
       MaxBatchSequences = 2
       AvailableKvBytes = Int64.MaxValue
-      AvailableDeviceBytes = [ struct (deviceA, 128L); struct (deviceB, 128L) ]
-      MaxDeviceSequences = [] }
+      AvailableDeviceBytes = [| struct (deviceA, 128L); struct (deviceB, 128L) |]
+      MaxDeviceSequences = [||] }
 let splitDeviceDecision =
     Scheduler.scheduleAt now splitDeviceBudget admissionPolicy [ devicePrefillA; devicePrefillB ]
 require
@@ -397,8 +397,8 @@ let deviceSequenceBudget =
       AvailableKvPages = 16
       MaxBatchSequences = 4
       AvailableKvBytes = Int64.MaxValue
-      AvailableDeviceBytes = []
-      MaxDeviceSequences = [ struct (deviceA, 1); struct (deviceB, 2) ] }
+      AvailableDeviceBytes = [||]
+      MaxDeviceSequences = [| struct (deviceA, 1); struct (deviceB, 2) |] }
 let deviceSequenceDecision =
     Scheduler.scheduleAt
         now
