@@ -28,8 +28,8 @@ type ResourceBudget =
       AvailableKvPages: int
       MaxBatchSequences: int
       AvailableKvBytes: int64
-      AvailableDeviceBytes: (DeviceId * int64) list
-      MaxDeviceSequences: (DeviceId * int) list }
+      AvailableDeviceBytes: struct (DeviceId * int64) list
+      MaxDeviceSequences: struct (DeviceId * int) list }
 
 type SchedulingPolicy =
     { DecodeTokenReserve: int
