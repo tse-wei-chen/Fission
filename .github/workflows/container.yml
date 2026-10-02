@@ -82,6 +82,57 @@ jobs:
             }
           }
 
+      - name: Validate ORT profile summarizer
+        shell: pwsh
+        run: |
+          @'
+          [
+            {
+              "cat": "Node",
+              "name": "MemcpyFromHost_kernel_time",
+              "dur": 125.0,
+              "args": {
+                "provider": "CUDAExecutionProvider",
+                "op_name": "MemcpyFromHost"
+              }
+            },
+            {
+              "cat": "Node",
+              "name": "MatMul_kernel_time",
+              "dur": 875.0,
+              "args": {
+                "provider": "CUDAExecutionProvider",
+                "op_name": "MatMul"
+              }
+            },
+            {
+              "cat": "Node",
+              "name": "Shape_kernel_time",
+              "dur": 50.0,
+              "args": {
+                "provider": "CPUExecutionProvider",
+                "op_name": "Shape"
+              }
+            }
+          ]
+          '@ | Set-Content ./artifacts-ort-profile.json -Encoding UTF8
+
+          pwsh ./eng/summarize-ort-profile.ps1 `
+            -ProfilePath ./artifacts-ort-profile.json `
+            -MarkdownPath ./artifacts-ort-profile.md `
+            -JsonPath ./artifacts-ort-profile-summary.json
+
+          $summary = Get-Content ./artifacts-ort-profile-summary.json -Raw | ConvertFrom-Json
+          if ($summary.node_event_count -ne 3) {
+            throw "Expected three summarized ORT node events."
+          }
+          if ($summary.memcpy_event_count -ne 1) {
+            throw "Expected one summarized Memcpy event."
+          }
+          if ([math]::Abs($summary.memcpy_percent_of_node_duration - 11.9047619) -gt 0.001) {
+            throw "Unexpected Memcpy duration share."
+          }
+
       - name: Validate ONNX graph rewrite syntax
         run: python3 -m py_compile ./eng/add-greedy-argmax-output.py
 
