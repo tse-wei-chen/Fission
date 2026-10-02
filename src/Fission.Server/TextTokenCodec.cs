@@ -2,7 +2,7 @@ using System.Text;
 
 namespace Fission.Server;
 
-public interface ITextTokenDecoder
+public interface ITextTokenDecoder : IDisposable
 {
     /// <summary>
     /// Appends one generated token and returns text that is stable enough to emit.
@@ -64,5 +64,6 @@ public sealed class DeterministicTextTokenCodec : ITextTokenCodec
     {
         public string Append(int tokenId) => $"<{tokenId}>";
         public string Complete() => string.Empty;
+        public void Dispose() { }
     }
 }
