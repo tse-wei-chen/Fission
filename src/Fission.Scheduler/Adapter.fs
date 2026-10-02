@@ -45,11 +45,11 @@ type SchedulingKernel() =
     let toCandidate (candidate: SchedulingCandidate) : ReadySequence =
         { SequenceId = candidate.SequenceId
           Phase = toPhase candidate.Phase
-          Deadline =
+          DeadlineUtcTicks =
             if candidate.Deadline.HasValue then
-                Some candidate.Deadline.Value
+                candidate.Deadline.Value.UtcTicks
             else
-                None
+                -1L
           EnqueuedAt = candidate.EnqueuedAt
           TokenDemand = candidate.TokenDemand
           Position = candidate.Position
