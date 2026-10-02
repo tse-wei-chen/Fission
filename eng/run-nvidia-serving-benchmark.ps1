@@ -72,7 +72,12 @@ param(
     [ValidateNotNullOrEmpty()]
     [string] $Configuration = "Release",
 
+    [ValidateRange(1, 300)]
+    [int] $GracefulShutdownTimeoutSeconds = 30,
+
     [switch] $PageLockedDecodeLogits,
+
+    [switch] $OrtProfile,
 
     [switch] $NoBuild
 )
@@ -151,6 +156,7 @@ $loadGenProject = Join-Path $repositoryRoot "benchmarks/Fission.Serving.LoadGen/
 $reporterProject = Join-Path $repositoryRoot "benchmarks/Fission.Serving.Reporter/Fission.Serving.Reporter.csproj"
 $backendProject = Join-Path $repositoryRoot "src/Fission.Backends.OnnxRuntime/Fission.Backends.OnnxRuntime.csproj"
 $suiteRunner = Join-Path $repositoryRoot "eng/run-serving-suite.ps1"
+$ortProfileSummarizer = Join-Path $repositoryRoot "eng/summarize-ort-profile.ps1"
 
 $model = Resolve-RequiredFile -Path $ModelPath -Label "ONNX model"
 $tokenizer = Resolve-RequiredFile -Path $TokenizerPath -Label "Tokenizer"
@@ -225,7 +231,11 @@ $stderrPath = Join-Path $runRoot "server.stderr.log"
 $metadataPath = Join-Path $runRoot "environment.json"
 $reportMarkdown = Join-Path $runRoot "report.md"
 $reportCsv = Join-Path $runRoot "report.csv"
+$ortProfilePrefix = Join-Path $runRoot "ort-profile"
+$ortProfileSummaryMarkdown = Join-Path $runRoot "ort-profile-summary.md"
+$ortProfileSummaryJson = Join-Path $runRoot "ort-profile-summary.json"
 $baseUrl = "http://127.0.0.1:$Port"
+$controlToken = [Guid]::NewGuid().ToString("N")
 
 $gitCommit = $null
 $git = Get-Command git -ErrorAction SilentlyContinue
@@ -271,6 +281,8 @@ $metadata = [ordered]@{
         cuda_runtime_library = if ([string]::IsNullOrWhiteSpace($cudaRuntimeLibrary)) { $null } else { $cudaRuntimeLibrary }
         cuda_library_search_directory = $cudaLibraryDirectory
         page_locked_decode_logits = [bool] $PageLockedDecodeLogits
+        ort_profile_enabled = [bool] $OrtProfile
+        ort_profile_prefix = if ($OrtProfile) { $ortProfilePrefix } else { $null }
     }
     model = [ordered]@{
         id = $ModelId
@@ -307,6 +319,8 @@ $settings = [ordered]@{
     "Fission__CudaRuntimeLibraryPath" = $cudaRuntimeLibrary
     "Fission__CudaPageLockedDecodeLogits" = if ($PageLockedDecodeLogits) { "true" } else { "false" }
     "Fission__SampledTokenIdsOutput" = $SampledTokenIdsOutput
+    "Fission__OrtProfileOutputPathPrefix" = if ($OrtProfile) { $ortProfilePrefix } else { "" }
+    "Fission__ControlToken" = $controlToken
     "Fission__ModelPath" = $model
     "Fission__ModelId" = $ModelId
     "Fission__NumHiddenLayers" = "$NumHiddenLayers"
@@ -375,6 +389,7 @@ try {
     Write-Host "  device:      cuda:$CudaDeviceId ($($selectedGpu.name))"
     Write-Host "  driver:      $($selectedGpu.driver_version)"
     Write-Host "  pinned logits: $([bool] $PageLockedDecodeLogits)"
+    Write-Host "  ORT profile: $([bool] $OrtProfile)"
     Write-Host "  target:      $baseUrl"
     Write-Host "  manifest:    $manifestPath"
     Write-Host "  output:      $runRoot"
@@ -421,6 +436,58 @@ try {
         throw "Serving benchmark reporter failed with exit code $LASTEXITCODE."
     }
 
+    $shutdownResponse = Invoke-WebRequest `
+        -Method Post `
+        -Uri "$baseUrl/internal/control/shutdown" `
+        -Headers @{ "X-Fission-Control-Token" = $controlToken } `
+        -UseBasicParsing `
+        -TimeoutSec 10
+    if ($shutdownResponse.StatusCode -ne 202) {
+        throw "Fission.Server graceful shutdown returned HTTP $($shutdownResponse.StatusCode)."
+    }
+
+    $shutdownDeadline = [DateTimeOffset]::UtcNow.AddSeconds(
+        $GracefulShutdownTimeoutSeconds)
+    while (-not $serverProcess.HasExited -and
+           [DateTimeOffset]::UtcNow -lt $shutdownDeadline) {
+        Start-Sleep -Milliseconds 100
+    }
+
+    if (-not $serverProcess.HasExited) {
+        throw "Fission.Server did not stop gracefully within $GracefulShutdownTimeoutSeconds second(s)."
+    }
+
+    $serverProcess.WaitForExit()
+    if ($serverProcess.ExitCode -ne 0) {
+        Show-ServerLogs -StdOutPath $stdoutPath -StdErrPath $stderrPath
+        throw "Fission.Server exited with code $($serverProcess.ExitCode) during graceful shutdown."
+    }
+
+    if ($OrtProfile) {
+        $profileFiles = @(
+            Get-ChildItem -LiteralPath $runRoot -Filter "ort-profile*.json" -File |
+                Sort-Object LastWriteTimeUtc -Descending
+        )
+        if ($profileFiles.Count -eq 0) {
+            throw "ORT profiling was enabled but no profile JSON was produced under '$runRoot'."
+        }
+
+        $ortProfilePath = $profileFiles[0].FullName
+        & $ortProfileSummarizer `
+            -ProfilePath $ortProfilePath `
+            -MarkdownPath $ortProfileSummaryMarkdown `
+            -JsonPath $ortProfileSummaryJson
+        if ($LASTEXITCODE -ne 0) {
+            throw "ORT profile summarizer failed with exit code $LASTEXITCODE."
+        }
+
+        $metadata["ort_profile"] = [ordered]@{
+            profile_path = $ortProfilePath
+            summary_markdown = $ortProfileSummaryMarkdown
+            summary_json = $ortProfileSummaryJson
+        }
+    }
+
     $metadata["status"] = "passed"
     $metadata["completed_at_utc"] = [DateTimeOffset]::UtcNow.ToString("O")
     $metadata["elapsed_seconds"] = ([DateTimeOffset]::UtcNow - $startedAt).TotalSeconds
@@ -431,6 +498,10 @@ try {
     Write-Host "  environment: $metadataPath"
     Write-Host "  report:      $reportMarkdown"
     Write-Host "  csv:         $reportCsv"
+    if ($OrtProfile) {
+        Write-Host "  ORT profile: $ortProfilePath"
+        Write-Host "  ORT summary: $ortProfileSummaryMarkdown"
+    }
     Write-Host ""
     Get-Content -LiteralPath $reportMarkdown
 }
