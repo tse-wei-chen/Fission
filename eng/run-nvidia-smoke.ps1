@@ -12,19 +12,19 @@ param(
     [string] $ModelId,
 
     [Parameter(Mandatory = $true)]
-    [ValidateRange(1, [int]::MaxValue)]
+    [ValidateRange(1, 2147483647)]
     [int] $NumHiddenLayers,
 
     [Parameter(Mandatory = $true)]
-    [ValidateRange(1, [int]::MaxValue)]
+    [ValidateRange(1, 2147483647)]
     [int] $NumKvHeads,
 
     [Parameter(Mandatory = $true)]
-    [ValidateRange(1, [int]::MaxValue)]
+    [ValidateRange(1, 2147483647)]
     [int] $HeadDim,
 
     [Parameter(Mandatory = $true)]
-    [ValidateRange(1, [int]::MaxValue)]
+    [ValidateRange(1, 2147483647)]
     [int] $VocabularySize,
 
     [ValidateNotNull()]
@@ -33,7 +33,7 @@ param(
     [ValidateSet("none", "chatml", "qwen2", "llama3")]
     [string] $ChatTemplate = "none",
 
-    [ValidateRange(0, [int]::MaxValue)]
+    [ValidateRange(0, 2147483647)]
     [int] $CudaDeviceId = 0,
 
     [ValidateRange(1, 4096)]

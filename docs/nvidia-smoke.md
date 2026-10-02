@@ -49,14 +49,14 @@ of assuming a CUDA major version from the driver alone:
 Build and execute the one-shot probe from the repository root:
 
 ```powershell
-pwsh ./eng/run-nvidia-smoke.ps1 \
-  -ModelPath /models/model/decoder_with_past_model.onnx \
-  -TokenizerPath /models/model/tokenizer.json \
-  -ModelId model-smoke \
-  -NumHiddenLayers <layers> \
-  -NumKvHeads <kv-heads> \
-  -HeadDim <head-dim> \
-  -VocabularySize <vocabulary-size> \
+pwsh ./eng/run-nvidia-smoke.ps1 `
+  -ModelPath /models/model/decoder_with_past_model.onnx `
+  -TokenizerPath /models/model/tokenizer.json `
+  -ModelId model-smoke `
+  -NumHiddenLayers <layers> `
+  -NumKvHeads <kv-heads> `
+  -HeadDim <head-dim> `
+  -VocabularySize <vocabulary-size> `
   -EosTokenIds "<comma-separated-token-ids>"
 ```
 
