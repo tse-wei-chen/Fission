@@ -65,19 +65,9 @@ type SchedulingKernel() =
                 reversed
             mapped
 
-    let toPhase (phase: SchedulingPhase) =
-        match phase with
-        | SchedulingPhase.Waiting -> Waiting
-        | SchedulingPhase.Prefilling -> Prefilling
-        | SchedulingPhase.Decoding -> Decoding
-        | SchedulingPhase.Suspended -> Suspended
-        | SchedulingPhase.Finished -> Finished
-        | SchedulingPhase.Cancelled -> Cancelled
-        | _ -> invalidArg "phase" $"Unsupported scheduling phase {phase}."
-
     let toCandidate (candidate: SchedulingCandidate) : ReadySequence =
         { SequenceId = candidate.SequenceId
-          Phase = toPhase candidate.Phase
+          Phase = candidate.Phase
           DeadlineUtcTicks =
             if candidate.Deadline.HasValue then
                 candidate.Deadline.Value.UtcTicks
