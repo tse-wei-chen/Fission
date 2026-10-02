@@ -28,22 +28,22 @@ module Scheduler =
           FirstUsedDevice: DeviceUsage voption
           AdditionalUsedDevices: DeviceUsage list }
 
-    let rec private containsDevice
-        (device: Fission.Abstractions.DeviceId)
-        (budgets: struct (Fission.Abstractions.DeviceId * 'T) list)
+    let private hasDuplicateDevice
+        (budgets: struct (Fission.Abstractions.DeviceId * 'T) array)
         =
-        match budgets with
-        | [] -> false
-        | struct (candidate, _) :: tail ->
-            candidate = device || containsDevice device tail
+        let mutable duplicate = false
+        let mutable leftIndex = 0
 
-    let rec private hasDuplicateDevice
-        (budgets: struct (Fission.Abstractions.DeviceId * 'T) list)
-        =
-        match budgets with
-        | [] | [_] -> false
-        | struct (device, _) :: tail ->
-            containsDevice device tail || hasDuplicateDevice tail
+        while not duplicate && leftIndex < budgets.Length - 1 do
+            let struct (device, _) = budgets[leftIndex]
+            let mutable rightIndex = leftIndex + 1
+            while not duplicate && rightIndex < budgets.Length do
+                let struct (candidate, _) = budgets[rightIndex]
+                duplicate <- candidate = device
+                rightIndex <- rightIndex + 1
+            leftIndex <- leftIndex + 1
+
+        duplicate
 
     let private isRunnable (sequence: ReadySequence) =
         sequence.Phase = Prefilling || sequence.Phase = Decoding
@@ -164,17 +164,21 @@ module Scheduler =
         else
             (int64 sequence.Position + int64 tokenGrant) * sequence.KvBytesPerToken
 
-    let rec private tryFindDeviceValue
+    let private tryFindDeviceValue
         (device: Fission.Abstractions.DeviceId)
-        (values: struct (Fission.Abstractions.DeviceId * 'T) list)
+        (values: struct (Fission.Abstractions.DeviceId * 'T) array)
         =
-        match values with
-        | [] -> ValueNone
-        | struct (candidate, value) :: tail ->
-            if candidate = device then
-                ValueSome value
+        let rec loop index =
+            if index >= values.Length then
+                ValueNone
             else
-                tryFindDeviceValue device tail
+                let struct (candidate, value) = values[index]
+                if candidate = device then
+                    ValueSome value
+                else
+                    loop (index + 1)
+
+        loop 0
 
     let private tryFindDeviceBudget (budget: ResourceBudget) device =
         tryFindDeviceValue device budget.AvailableDeviceBytes
@@ -601,11 +605,11 @@ module Scheduler =
         if budget.AvailableKvPages < 0 then invalidArg "AvailableKvPages" "AvailableKvPages cannot be negative."
         if budget.MaxBatchSequences < 0 then invalidArg "MaxBatchSequences" "MaxBatchSequences cannot be negative."
         if budget.AvailableKvBytes < 0L then invalidArg "AvailableKvBytes" "AvailableKvBytes cannot be negative."
-        if budget.AvailableDeviceBytes |> List.exists (fun struct (_, availableBytes) -> availableBytes < 0L) then
+        if budget.AvailableDeviceBytes |> Array.exists (fun struct (_, availableBytes) -> availableBytes < 0L) then
             invalidArg "AvailableDeviceBytes" "Available device bytes cannot be negative."
         if hasDuplicateDevice budget.AvailableDeviceBytes then
             invalidArg "AvailableDeviceBytes" "Each execution device may appear only once in the device-memory budget."
-        if budget.MaxDeviceSequences |> List.exists (fun struct (_, maxSequences) -> maxSequences < 0) then
+        if budget.MaxDeviceSequences |> Array.exists (fun struct (_, maxSequences) -> maxSequences < 0) then
             invalidArg "MaxDeviceSequences" "Per-device sequence capacity cannot be negative."
         if hasDuplicateDevice budget.MaxDeviceSequences then
             invalidArg "MaxDeviceSequences" "Each execution device may appear only once in the per-device sequence budget."
