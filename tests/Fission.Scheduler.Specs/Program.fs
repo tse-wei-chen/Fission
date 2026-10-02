@@ -16,7 +16,10 @@ let blockSize = 4
 let mk sequenceId phase priority deadline enqueuedAt tokenDemand position tokensPerKvPage =
     { SequenceId = sequenceId
       Phase = phase
-      Deadline = deadline
+      DeadlineUtcTicks =
+          match deadline with
+          | Some value -> value.UtcTicks
+          | None -> -1L
       EnqueuedAt = enqueuedAt
       TokenDemand = tokenDemand
       Position = position
@@ -318,7 +321,7 @@ require urgentCompiled.Items[0].CompletesPrefill "A grant that consumes the full
 let distantDeadline =
     { urgentLowPriority with
         SequenceId = sid "00000000-0000-0000-0000-000000000022"
-        Deadline = Some(now + TimeSpan.FromSeconds(10.0)) }
+        DeadlineUtcTicks = (now + TimeSpan.FromSeconds(10.0)).UtcTicks }
 
 let nonUrgentDecision =
     Scheduler.scheduleAt now oneSlotBudget admissionPolicy [ distantDeadline; nonUrgentHighPriority ]
