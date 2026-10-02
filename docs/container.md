@@ -77,9 +77,11 @@ ASP.NET Core converts double underscores in environment names such as `Fission__
 
 ## CI validation
 
-`.github/workflows/container.yml` validates the Compose model, builds the image, starts it, waits for `/healthz`, and sends a small request to `/v1/completions`.
+`.github/workflows/container.yml` validates the Compose model, builds the image, starts it, waits for `/healthz`, sends an OpenAI-compatible request, and runs a small concurrent streaming workload through the serving load generator.
 
-Image publication is intentionally not part of this workflow yet. The repository policy reserves `master` for explicit releases, so GHCR publication should be introduced together with the first release/tag policy rather than publishing every development commit.
+`.github/workflows/image.yml` separately validates the publication build path. Pull requests build without pushing. Explicit release tags and manual dispatches can publish to GHCR.
+
+See [releases and container publication](releases.md) for tag rules, `master` promotion, and GHCR behavior.
 
 ## Planned GPU image
 
