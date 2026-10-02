@@ -38,7 +38,7 @@ module Scheduler =
             candidate = device || containsDevice device tail
 
     let rec private hasDuplicateDevice
-        (budgets: (Fission.Abstractions.DeviceId * 'T) list)
+        (budgets: struct (Fission.Abstractions.DeviceId * 'T) list)
         =
         match budgets with
         | [] | [_] -> false
