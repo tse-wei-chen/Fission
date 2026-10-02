@@ -98,11 +98,18 @@ module Scheduler =
             { UrgencyCutoffTicks = urgencyCutoffTicks }
 
         interface System.Collections.Generic.IComparer<ReadySequence> with
-            member this.Compare(left, right) =
-                compareReady
-                    this.UrgencyCutoffTicks
-                    left
-                    right
+            member this.Compare(
+                left: ReadySequence | null,
+                right: ReadySequence | null) =
+                match left, right with
+                | null, null -> 0
+                | null, _ -> -1
+                | _, null -> 1
+                | left, right ->
+                    compareReady
+                        this.UrgencyCutoffTicks
+                        left
+                        right
 
     let private pagesForTokens tokensPerPage (tokenCount: int64) =
         if tokenCount <= 0L then
@@ -895,7 +902,7 @@ module Scheduler =
                 selectMergedCandidateWorkspace
                     budget
                     policy
-                    compareCandidates
+                    urgencyCutoffTicks
                     afterReserve
                     workspace
                     decodeStartIndex
