@@ -204,10 +204,10 @@ module Scheduler =
     let private addDeviceUsage device byteGrant sequenceGrant used =
         let struct (current, withoutDevice) =
             removeDeviceUsage device used
-        let currentBytes, currentSequences =
+        let struct (currentBytes, currentSequences) =
             match current with
-            | ValueSome usage -> usage.TransientBytes, usage.Sequences
-            | ValueNone -> 0L, 0
+            | ValueSome usage -> struct (usage.TransientBytes, usage.Sequences)
+            | ValueNone -> struct (0L, 0)
         { Device = device
           TransientBytes = currentBytes + byteGrant
           Sequences = currentSequences + sequenceGrant }
@@ -243,11 +243,23 @@ module Scheduler =
                 match sequence.ExecutionDevice with
                 | Some device -> tryFindDeviceSequenceBudget budget device
                 | None -> ValueNone
-
+            let deviceMemoryBudget =
+                match sequence.ExecutionDevice with
+                | Some device -> tryFindDeviceBudget budget device
+                | None -> ValueNone
+            let tracksDeviceMemory =
+                match deviceMemoryBudget with
+                | ValueSome _ -> true
+                | ValueNone -> false
+            let tracksDeviceSequences =
+                match deviceSequenceBudget with
+                | ValueSome _ -> true
+                | ValueNone -> false
             let currentDeviceUsage =
                 match sequence.ExecutionDevice with
-                | Some device -> tryFindDeviceUsage device state.UsedDevices
-                | None -> ValueNone
+                | Some device when tracksDeviceMemory || tracksDeviceSequences ->
+                    tryFindDeviceUsage device state.UsedDevices
+                | _ -> ValueNone
 
             let deviceSequenceCapacityReached =
                 match deviceSequenceBudget with
@@ -277,11 +289,6 @@ module Scheduler =
                     let availableTransientKvBytes = budget.AvailableKvBytes - state.UsedTransientKvBytes
                     let transientKvByteTokenCapacity =
                         tokensWritableWithTransientKvBytes sequence availableTransientKvBytes
-                    let deviceMemoryBudget =
-                        match sequence.ExecutionDevice with
-                        | Some device -> tryFindDeviceBudget budget device
-                        | None -> ValueNone
-
                     let deviceMemoryTokenCapacity =
                         match deviceMemoryBudget with
                         | ValueSome availableBytes ->
@@ -310,14 +317,6 @@ module Scheduler =
                         let kvPageGrant = kvPagesForGrant sequence tokenGrant
                         let kvByteGrant = int64 tokenGrant * sequence.KvBytesPerToken
                         let transientKvByteGrant = transientKvBytesForGrant sequence tokenGrant
-                        let tracksDeviceMemory =
-                            match deviceMemoryBudget with
-                            | ValueSome _ -> true
-                            | ValueNone -> false
-                        let tracksDeviceSequences =
-                            match deviceSequenceBudget with
-                            | ValueSome _ -> true
-                            | ValueNone -> false
                         let nextDeviceUsage =
                             match sequence.ExecutionDevice with
                             | Some device when tracksDeviceMemory || tracksDeviceSequences ->
