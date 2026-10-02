@@ -94,7 +94,8 @@ public static class ServerBackendFactory
                     device,
                     profile,
                     eosTokenIds),
-            _ => throw new UnreachableException()
+            _ => throw new InvalidOperationException(
+                "Unsupported ONNX execution-provider state.")
         };
     }
 
