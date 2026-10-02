@@ -236,3 +236,47 @@ Hosted-runner timing is not treated as a performance threshold.
 Container CI writes its tiny suite under `artifacts/serving-ci/`, adds the generated Markdown report to the GitHub Actions job summary, and uploads the JSON/Markdown/CSV directory as a 14-day workflow artifact.
 
 This makes protocol/orchestration benchmark evidence inspectable after a PR run without treating hosted-runner timing as a performance threshold. Real GPU comparison artifacts should be produced on controlled hardware using the full workload manifest.
+
+
+### A/B graph-side greedy sampling
+
+After validating page-locked decode logits, the next transfer-reduction gate is
+to keep the full logits tensor inside the ONNX CUDA graph and return only one
+int64 token id per batch row.
+
+Install the ONNX Python package in the model-export environment, then append the
+extra output:
+
+```powershell
+python -m pip install onnx
+python ./eng/add-greedy-argmax-output.py `
+  --input artifacts/models/SmolLM2-135M-Instruct/onnx/model.onnx `
+  --output artifacts/models/SmolLM2-135M-Instruct/onnx/model.fission-greedy.onnx `
+  --sampled-output fission_sampled_token_ids
+```
+
+The rewrite preserves the original `logits` graph output for compatibility and
+adds `Gather` over the last sequence position followed by `ArgMax` over the
+vocabulary. Fission does not fetch `logits` when the sampled-token output is
+configured.
+
+Benchmark the rewritten graph with the same hardware and workload:
+
+```powershell
+pwsh ./eng/run-nvidia-serving-benchmark.ps1 `
+  -ModelPath artifacts/models/SmolLM2-135M-Instruct/onnx/model.fission-greedy.onnx `
+  -TokenizerPath artifacts/models/SmolLM2-135M-Instruct/tokenizer.json `
+  -ModelId SmolLM2-135M-Instruct `
+  -NumHiddenLayers 30 `
+  -NumKvHeads 3 `
+  -HeadDim 64 `
+  -VocabularySize 49152 `
+  -EosTokenIds 2 `
+  -SampledTokenIdsOutput fission_sampled_token_ids `
+  -Label fission-cuda-graph-greedy `
+  -Repetitions 3
+```
+
+Do not add `-PageLockedDecodeLogits` for this comparison: graph-side sampling
+bypasses the full host logits output entirely, so the pinned-logits path is not
+used.
