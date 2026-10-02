@@ -48,6 +48,9 @@ param(
     [ValidateNotNull()]
     [string] $CudaRuntimeLibraryPath = "",
 
+    [ValidateNotNull()]
+    [string] $SampledTokenIdsOutput = "",
+
     [ValidateNotNullOrEmpty()]
     [string] $Configuration = "Release",
 
@@ -118,6 +121,7 @@ $settings = [ordered]@{
     "Fission__Device" = "cuda:$CudaDeviceId"
     "Fission__CudaDeviceId" = "$CudaDeviceId"
     "Fission__CudaRuntimeLibraryPath" = $cudaRuntimeLibrary
+    "Fission__SampledTokenIdsOutput" = $SampledTokenIdsOutput
     "Fission__ModelPath" = $model
     "Fission__ModelId" = $ModelId
     "Fission__NumHiddenLayers" = "$NumHiddenLayers"
