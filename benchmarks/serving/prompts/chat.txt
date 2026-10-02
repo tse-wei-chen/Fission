@@ -1,0 +1,1 @@
+You are reviewing the design of a high-concurrency language-model inference service. Explain the tradeoffs among request latency, batch size, KV-cache pressure, and fairness. Give a concise engineering-oriented answer with practical examples.
