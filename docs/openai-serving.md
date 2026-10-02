@@ -123,9 +123,54 @@ construction. `ContinuousBatchExecutor.CreateAsync` initializes the backend
 before Kestrel starts serving, so an invalid ONNX graph/session contract fails
 startup rather than the first inference request.
 
-This composition currently uses the CPU FP32 Optimum legacy binding. Tokenizer
-composition is independently selectable, so an ONNX model can be paired with a
-matching Hugging Face `tokenizer.json` and explicit chat-template profile.
-CUDA Execution Provider composition remains a separate hardware-tested
-milestone. The deterministic backend and tokenizer both remain defaults for CI
-and zero-model smoke paths.
+### ONNX execution provider
+
+`Fission:ExecutionProvider` selects the ONNX Runtime execution provider for an
+ONNX backend:
+
+- `cpu` (default): uses the existing FP32 Optimum decoder binding.
+- `cuda`: appends the ONNX Runtime CUDA Execution Provider and uses the
+  CUDA-resident Optimum FP32 decoder binding.
+
+CUDA mode accepts:
+
+- `Fission:CudaDeviceId`: non-negative CUDA ordinal; defaults to `0`.
+- `Fission:CudaRuntimeLibraryPath`: optional explicit CUDA Runtime library.
+- `Fission:CudaPoolMaxRetainedBytes`: maximum idle KV/device-buffer bytes
+  retained for exact-size reuse; defaults to 256 MiB. Set `0` to disable idle
+  retention.
+- `Fission:CudaPoolMaxRetainedBuffersPerSize`: exact-size idle buffer count
+  limit; defaults to `8`. Set `0` to disable idle retention.
+
+When `Fission:Device` is not explicitly set, CUDA mode derives the logical
+runtime device as `cuda:<CudaDeviceId>`; CPU and deterministic modes default to
+`cpu:0`.
+
+CUDA composition couples three existing layers:
+
+```text
+ONNX Runtime CUDA EP
+  + OptimumLegacyCudaFloatDecoderBinding
+  + CudaPooledDeviceMemoryAllocator
+  + CudaDeviceMemoryPressureMonitor
+        |
+        v
+ContinuousBatchExecutor / runtime memory admission
+```
+
+The device-wide pressure monitor uses `cudaMemGetInfo`, so scheduling sees
+model weights, ONNX Runtime workspaces, resident KV, allocator caches, and other
+CUDA allocations as one physical VRAM budget. Idle bytes retained by the Fission
+CUDA pool are classified as reclaimable and may be synchronously trimmed through
+the runtime memory-reclaim capability.
+
+The server now uses the `Microsoft.ML.OnnxRuntime.Gpu` package for ONNX hosting.
+CPU remains the default execution provider; CUDA native/provider initialization
+is only requested when `ExecutionProvider=cuda`.
+
+Tokenizer composition is independently selectable, so an ONNX model can be
+paired with a matching Hugging Face `tokenizer.json` and explicit chat-template
+profile. CPU and deterministic serving remain the hardware-independent CI paths.
+CUDA composition is now wired, while the next milestone is a real NVIDIA
+hardware smoke using an exported decoder-with-past model before CUDA mode is
+treated as production-validated.
