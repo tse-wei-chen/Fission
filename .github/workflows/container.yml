@@ -16,6 +16,7 @@ on:
       - benchmarks/Fission.Serving.Reporter/**
       - benchmarks/serving/**
       - eng/run-serving-suite.ps1
+      - eng/run-nvidia-smoke.ps1
       - .github/workflows/container.yml
   pull_request:
     branches: [ develop ]
@@ -32,6 +33,7 @@ on:
       - benchmarks/Fission.Serving.Reporter/**
       - benchmarks/serving/**
       - eng/run-serving-suite.ps1
+      - eng/run-nvidia-smoke.ps1
       - .github/workflows/container.yml
 
 concurrency:
@@ -54,8 +56,35 @@ jobs:
       - name: Validate Compose configuration
         run: docker compose config --quiet
 
+      - name: Validate NVIDIA smoke runner syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void] [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ./eng/run-nvidia-smoke.ps1).Path,
+            [ref] $tokens,
+            [ref] $errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+
       - name: Build image
         run: docker build --tag fission:ci .
+
+      - name: Smoke test one-shot startup probe
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          timeout 30s docker run --rm \
+            --env Fission__StartupProbeEnabled=true \
+            --env Fission__StartupProbeExitAfterSuccess=true \
+            --env Fission__StartupProbePrompt=probe \
+            --env Fission__StartupProbeMaxTokens=1 \
+            --env Fission__ModelId=container-probe \
+            fission:ci
 
       - name: Smoke test server image
         shell: bash

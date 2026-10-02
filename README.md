@@ -42,3 +42,17 @@ dotnet run --project benchmarks/Fission.Serving.LoadGen/Fission.Serving.LoadGen.
 It reports TTFT, TPOT, E2E latency, request throughput, output-token throughput, and p50/p95/p99 summaries.
 
 See [`docs/serving-benchmark.md`](docs/serving-benchmark.md) for cross-engine comparison guidance.
+
+## NVIDIA real-model smoke
+
+The server can run its full tokenizer -> scheduler/runtime -> ONNX Runtime CUDA
+path as a one-shot startup probe and exit before opening an HTTP listener. The
+helper script validates the NVIDIA host and supplies the production composition
+settings:
+
+```powershell
+pwsh ./eng/run-nvidia-smoke.ps1 -ModelPath <decoder-with-past.onnx> -TokenizerPath <tokenizer.json> -ModelId <model> -NumHiddenLayers <n> -NumKvHeads <n> -HeadDim <n> -VocabularySize <n>
+```
+
+See [`docs/nvidia-smoke.md`](docs/nvidia-smoke.md) for the model contract,
+CUDA/ONNX Runtime prerequisites, and expected success criteria.

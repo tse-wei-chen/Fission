@@ -55,6 +55,13 @@ if (startupProbe is not null)
         startupProbe.GeneratedTokenCount,
         startupProbe.FinishReason,
         startupProbe.Elapsed.TotalMilliseconds);
+
+    if (startupProbe.ExitAfterSuccess)
+    {
+        app.Logger.LogInformation(
+            "Startup inference probe one-shot mode completed; exiting before HTTP serving starts.");
+        return;
+    }
 }
 
 OpenAiEndpoints.Map(app, worker, textCodec);
