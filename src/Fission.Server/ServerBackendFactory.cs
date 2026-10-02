@@ -9,10 +9,38 @@ namespace Fission.Server;
 
 /// <summary>
 /// Builds the inference backend selected by server configuration.
-/// Deterministic remains the default for tests and zero-model smoke runs.
+/// Deterministic and CPU ONNX remain hardware-independent defaults; CUDA is
+/// opt-in and fails during startup when its native provider/runtime is unavailable.
 /// </summary>
 public static class ServerBackendFactory
 {
+    private const long DefaultCudaPoolRetainedBytes = 256L * 1024L * 1024L;
+    private const int DefaultCudaPoolRetainedBuffersPerSize = 8;
+
+    public static DeviceId ResolveDevice(IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        var explicitDevice = configuration["Fission:Device"];
+        if (!string.IsNullOrWhiteSpace(explicitDevice))
+        {
+            return new DeviceId(explicitDevice.Trim());
+        }
+
+        var backend = (configuration["Fission:Backend"] ?? "deterministic").Trim();
+        if (backend.Equals("onnx", StringComparison.OrdinalIgnoreCase) ||
+            backend.Equals("onnxruntime", StringComparison.OrdinalIgnoreCase))
+        {
+            var provider = ReadExecutionProvider(configuration);
+            if (provider == OnnxExecutionProvider.Cuda)
+            {
+                return new DeviceId($"cuda:{ReadCudaDeviceId(configuration)}");
+            }
+        }
+
+        return new DeviceId("cpu:0");
+    }
+
     public static IInferenceBackend Create(
         IConfiguration configuration,
         DeviceId device)
@@ -47,10 +75,37 @@ public static class ServerBackendFactory
             numKvHeads: ReadPositiveInt(configuration, "Fission:NumKvHeads"),
             headDim: ReadPositiveInt(configuration, "Fission:HeadDim"),
             vocabularySize: ReadPositiveInt(configuration, "Fission:VocabularySize"));
+        var eosTokenIds = ReadTokenIds(configuration, "Fission:EosTokenIds");
 
-        var binding = new OptimumLegacyFloatDecoderBinding(
-            profile,
-            ReadTokenIds(configuration, "Fission:EosTokenIds"));
+        return ReadExecutionProvider(configuration) switch
+        {
+            OnnxExecutionProvider.Cpu =>
+                CreateCpuOnnxRuntime(
+                    modelPath,
+                    modelId,
+                    device,
+                    profile,
+                    eosTokenIds),
+            OnnxExecutionProvider.Cuda =>
+                CreateCudaOnnxRuntime(
+                    configuration,
+                    modelPath,
+                    modelId,
+                    device,
+                    profile,
+                    eosTokenIds),
+            _ => throw new UnreachableException()
+        };
+    }
+
+    private static IInferenceBackend CreateCpuOnnxRuntime(
+        string modelPath,
+        string modelId,
+        DeviceId device,
+        OptimumLegacyDecoderProfile profile,
+        int[] eosTokenIds)
+    {
+        var binding = new OptimumLegacyFloatDecoderBinding(profile, eosTokenIds);
         var adapter = new DecoderOnlyOnnxExecutionAdapter(binding);
 
         try
@@ -70,6 +125,88 @@ public static class ServerBackendFactory
         }
     }
 
+    private static IInferenceBackend CreateCudaOnnxRuntime(
+        IConfiguration configuration,
+        string modelPath,
+        string modelId,
+        DeviceId device,
+        OptimumLegacyDecoderProfile profile,
+        int[] eosTokenIds)
+    {
+        var cudaDeviceId = ReadCudaDeviceId(configuration);
+        var runtimeLibraryPath = ReadOptional(configuration, "Fission:CudaRuntimeLibraryPath");
+        var pool = new CudaPooledDeviceMemoryAllocator(
+            new CudaDeviceMemoryPoolOptions
+            {
+                MaxRetainedBytes = ReadNonNegativeLong(
+                    configuration,
+                    "Fission:CudaPoolMaxRetainedBytes",
+                    DefaultCudaPoolRetainedBytes),
+                MaxRetainedBuffersPerSize = ReadNonNegativeInt(
+                    configuration,
+                    "Fission:CudaPoolMaxRetainedBuffersPerSize",
+                    DefaultCudaPoolRetainedBuffersPerSize)
+            },
+            new CudaDeviceMemoryAllocatorOptions
+            {
+                DeviceId = cudaDeviceId,
+                RuntimeLibraryPath = runtimeLibraryPath
+            });
+
+        DecoderOnlyOnnxExecutionAdapter? adapter = null;
+        try
+        {
+            var poolController = new CudaDeviceMemoryPoolController(pool);
+            var pressureMonitor = new CudaDeviceMemoryPressureMonitor(
+                new CudaDeviceMemoryPressureMonitorOptions
+                {
+                    DeviceId = cudaDeviceId,
+                    RuntimeLibraryPath = runtimeLibraryPath
+                },
+                poolController);
+
+            var binding = new OptimumLegacyCudaFloatDecoderBinding(
+                profile,
+                pool,
+                eosTokenIds);
+            adapter = new DecoderOnlyOnnxExecutionAdapter(binding);
+
+            return new OnnxRuntimeBackend(
+                new OnnxRuntimeBackendOptions(
+                    new ModelId(modelId),
+                    device,
+                    OnnxRuntimeModelSource.FromFile(modelPath),
+                    SessionContract: profile.SessionContract,
+                    DeviceMemoryPressureSource: pressureMonitor,
+                    DeviceMemoryReclaimer: pressureMonitor),
+                adapter,
+                OnnxRuntimeSessionOptions.Cuda(cudaDeviceId),
+                ownedResource: pool);
+        }
+        catch
+        {
+            adapter?.Dispose();
+            pool.Dispose();
+            throw;
+        }
+    }
+
+    private static OnnxExecutionProvider ReadExecutionProvider(
+        IConfiguration configuration)
+    {
+        var value = (configuration["Fission:ExecutionProvider"] ?? "cpu").Trim();
+        return value.ToLowerInvariant() switch
+        {
+            "" or "cpu" => OnnxExecutionProvider.Cpu,
+            "cuda" or "gpu" => OnnxExecutionProvider.Cuda,
+            _ => throw new InvalidOperationException(
+                $"Unsupported Fission execution provider '{value}'. Expected 'cpu' or 'cuda'.")
+        };
+    }
+
+    private static int ReadCudaDeviceId(IConfiguration configuration) =>
+        ReadNonNegativeInt(configuration, "Fission:CudaDeviceId", fallback: 0);
+
     private static string ReadRequired(
         IConfiguration configuration,
         string key)
@@ -82,6 +219,14 @@ public static class ServerBackendFactory
         }
 
         return value.Trim();
+    }
+
+    private static string? ReadOptional(
+        IConfiguration configuration,
+        string key)
+    {
+        var value = configuration[key];
+        return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
     }
 
     private static int ReadPositiveInt(
@@ -98,6 +243,56 @@ public static class ServerBackendFactory
         {
             throw new InvalidOperationException(
                 $"Configuration value '{key}' must be a positive integer.");
+        }
+
+        return parsed;
+    }
+
+    private static int ReadNonNegativeInt(
+        IConfiguration configuration,
+        string key,
+        int fallback)
+    {
+        var value = configuration[key];
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        if (!int.TryParse(
+                value,
+                NumberStyles.Integer,
+                CultureInfo.InvariantCulture,
+                out var parsed) ||
+            parsed < 0)
+        {
+            throw new InvalidOperationException(
+                $"Configuration value '{key}' must be a non-negative integer.");
+        }
+
+        return parsed;
+    }
+
+    private static long ReadNonNegativeLong(
+        IConfiguration configuration,
+        string key,
+        long fallback)
+    {
+        var value = configuration[key];
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        if (!long.TryParse(
+                value,
+                NumberStyles.Integer,
+                CultureInfo.InvariantCulture,
+                out var parsed) ||
+            parsed < 0)
+        {
+            throw new InvalidOperationException(
+                $"Configuration value '{key}' must be a non-negative integer.");
         }
 
         return parsed;
@@ -135,5 +330,11 @@ public static class ServerBackendFactory
         }
 
         return tokenIds;
+    }
+
+    private enum OnnxExecutionProvider
+    {
+        Cpu,
+        Cuda
     }
 }
