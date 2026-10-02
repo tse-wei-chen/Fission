@@ -18,6 +18,7 @@ on:
       - eng/run-serving-suite.ps1
       - eng/run-nvidia-smoke.ps1
       - eng/run-nvidia-serving-benchmark.ps1
+      - eng/summarize-ort-profile.ps1
       - eng/add-greedy-argmax-output.py
       - .github/workflows/container.yml
   pull_request:
@@ -37,6 +38,7 @@ on:
       - eng/run-serving-suite.ps1
       - eng/run-nvidia-smoke.ps1
       - eng/run-nvidia-serving-benchmark.ps1
+      - eng/summarize-ort-profile.ps1
       - eng/add-greedy-argmax-output.py
       - .github/workflows/container.yml
 
@@ -65,7 +67,8 @@ jobs:
         run: |
           foreach ($path in @(
             "./eng/run-nvidia-smoke.ps1",
-            "./eng/run-nvidia-serving-benchmark.ps1"
+            "./eng/run-nvidia-serving-benchmark.ps1",
+            "./eng/summarize-ort-profile.ps1"
           )) {
             $tokens = $null
             $errors = $null
@@ -173,6 +176,39 @@ jobs:
 
           cat artifacts/serving-ci/report.md
           cat artifacts/serving-ci/report.csv
+
+          unauthorized_status="$(curl --silent --output /tmp/fission-control-unauthorized.json             --write-out '%{http_code}'             --request POST             http://127.0.0.1:18000/internal/control/shutdown)"
+          if [ "$unauthorized_status" -ne 401 ]; then
+            echo "Expected unauthenticated shutdown to return 401, got $unauthorized_status." >&2
+            exit 1
+          fi
+
+          shutdown_status="$(curl --silent --output /tmp/fission-control-shutdown.json             --write-out '%{http_code}'             --request POST             --header 'X-Fission-Control-Token: ci-control-token'             http://127.0.0.1:18000/internal/control/shutdown)"
+          if [ "$shutdown_status" -ne 202 ]; then
+            echo "Expected authenticated shutdown to return 202, got $shutdown_status." >&2
+            cat /tmp/fission-control-shutdown.json >&2 || true
+            exit 1
+          fi
+
+          stopped=0
+          for _ in {1..30}; do
+            if [ "$(docker inspect --format '{{.State.Running}}' fission-container-ci)" = "false" ]; then
+              stopped=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$stopped" -ne 1 ]; then
+            echo "Fission container did not stop gracefully." >&2
+            exit 1
+          fi
+
+          exit_code="$(docker inspect --format '{{.State.ExitCode}}' fission-container-ci)"
+          if [ "$exit_code" -ne 0 ]; then
+            echo "Fission container exited with code $exit_code." >&2
+            exit 1
+          fi
 
           {
             echo "## Serving benchmark smoke report"
