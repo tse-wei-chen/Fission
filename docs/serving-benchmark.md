@@ -86,6 +86,45 @@ artifacts/serving/
 
 The engine label is intentionally separate from the API model name so multiple servers can expose the same model identifier.
 
+## NVIDIA hardware gate
+
+Once the one-shot NVIDIA real-model smoke passes, use the dedicated hardware
+runner rather than manually composing environment variables and benchmark
+commands:
+
+```powershell
+pwsh ./eng/run-nvidia-serving-benchmark.ps1 `
+  -ModelPath <decoder-with-past.onnx> `
+  -TokenizerPath <tokenizer.json> `
+  -ModelId <model> `
+  -NumHiddenLayers <layers> `
+  -NumKvHeads <kv-heads> `
+  -HeadDim <head-dim> `
+  -VocabularySize <vocab>
+```
+
+The default manifest is `benchmarks/serving/workloads.gpu-smoke.json`. It is a
+small functional/performance gate, not a final throughput characterization. The
+runner:
+
+1. inventories the selected NVIDIA GPU and driver;
+2. records the repository commit, .NET SDK, ONNX Runtime GPU package, model
+   geometry, and benchmark settings;
+3. starts `Fission.Server` with ONNX Runtime CUDA and the production tokenizer;
+4. keeps the startup inference probe enabled before HTTP serving;
+5. waits for `/healthz`;
+6. runs the existing serving suite;
+7. generates Markdown and CSV reports;
+8. preserves server stdout/stderr beside the results.
+
+Each invocation writes to a timestamped directory under
+`artifacts/serving-gpu/`, preventing older measurements from being silently
+mixed into a new report.
+
+After this gate is stable, use
+`-Manifest benchmarks/serving/workloads.json -Repetitions 3` for the larger
+concurrency matrix.
+
 ## Aggregate reports
 
 Create Markdown and CSV summaries:
