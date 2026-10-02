@@ -73,7 +73,8 @@ type SchedulingKernel() =
                 | null -> []
                 | deviceMemory ->
                     mapReadOnlyList
-                        (fun item -> item.Device, item.AvailableBytes)
+                        (fun (item: SchedulingDeviceMemoryBudget) ->
+                            item.Device, item.AvailableBytes)
                         deviceMemory
 
             let maxDeviceSequences =
@@ -81,7 +82,8 @@ type SchedulingKernel() =
                 | null -> []
                 | deviceSequences ->
                     mapReadOnlyList
-                        (fun item -> item.Device, item.MaxSequences)
+                        (fun (item: SchedulingDeviceSequenceBudget) ->
+                            item.Device, item.MaxSequences)
                         deviceSequences
 
             let resourceBudget : ResourceBudget =
