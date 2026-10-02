@@ -2,11 +2,26 @@ using System.Text;
 
 namespace Fission.Server;
 
+public interface ITextTokenDecoder : IDisposable
+{
+    /// <summary>
+    /// Appends one generated token and returns text that is stable enough to emit.
+    /// A contextual tokenizer may return an empty string until later token ids
+    /// complete a byte sequence or otherwise make the decoded suffix stable.
+    /// </summary>
+    string Append(int tokenId);
+
+    /// <summary>
+    /// Completes the request-scoped decode and returns any remaining text.
+    /// </summary>
+    string Complete();
+}
+
 public interface ITextTokenCodec
 {
     int[] EncodePrompt(string prompt);
     int[] EncodeChat(IReadOnlyList<OpenAiChatMessage> messages);
-    string DecodeToken(int tokenId);
+    ITextTokenDecoder CreateDecoder();
 }
 
 /// <summary>
@@ -43,5 +58,12 @@ public sealed class DeterministicTextTokenCodec : ITextTokenCodec
         return EncodePrompt(builder.ToString());
     }
 
-    public string DecodeToken(int tokenId) => $"<{tokenId}>";
+    public ITextTokenDecoder CreateDecoder() => new Decoder();
+
+    private sealed class Decoder : ITextTokenDecoder
+    {
+        public string Append(int tokenId) => $"<{tokenId}>";
+        public string Complete() => string.Empty;
+        public void Dispose() { }
+    }
 }

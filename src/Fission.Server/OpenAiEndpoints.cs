@@ -147,15 +147,17 @@ public static class OpenAiEndpoints
         ITextTokenCodec codec)
     {
         var text = new StringBuilder();
+        using var decoder = codec.CreateDecoder();
         var completed = false;
 
         try
         {
             await foreach (var token in stream.ReadTokensAsync(context.RequestAborted))
             {
-                text.Append(codec.DecodeToken(token));
+                text.Append(decoder.Append(token));
             }
 
+            text.Append(decoder.Complete());
             var snapshot = await stream.Completion.WaitAsync(context.RequestAborted)
                 .ConfigureAwait(false);
             completed = true;
@@ -195,15 +197,17 @@ public static class OpenAiEndpoints
         ITextTokenCodec codec)
     {
         var text = new StringBuilder();
+        using var decoder = codec.CreateDecoder();
         var completed = false;
 
         try
         {
             await foreach (var token in stream.ReadTokensAsync(context.RequestAborted))
             {
-                text.Append(codec.DecodeToken(token));
+                text.Append(decoder.Append(token));
             }
 
+            text.Append(decoder.Complete());
             var snapshot = await stream.Completion.WaitAsync(context.RequestAborted)
                 .ConfigureAwait(false);
             completed = true;
@@ -244,31 +248,35 @@ public static class OpenAiEndpoints
         PrepareSse(context.Response);
         var id = $"cmpl-{stream.SequenceId.Value:N}";
         var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        using var decoder = codec.CreateDecoder();
         var completed = false;
 
         try
         {
             await foreach (var token in stream.ReadTokensAsync(context.RequestAborted))
             {
-                await WriteSseAsync(
-                    context.Response,
-                    new
-                    {
+                var text = decoder.Append(token);
+                if (text.Length != 0)
+                {
+                    await WriteCompletionTextChunkAsync(
+                        context.Response,
                         id,
-                        @object = "text_completion",
                         created,
                         model,
-                        choices = new[]
-                        {
-                            new
-                            {
-                                text = codec.DecodeToken(token),
-                                index = 0,
-                                logprobs = (object?)null,
-                                finish_reason = (string?)null
-                            }
-                        }
-                    },
+                        text,
+                        context.RequestAborted).ConfigureAwait(false);
+                }
+            }
+
+            var remainingText = decoder.Complete();
+            if (remainingText.Length != 0)
+            {
+                await WriteCompletionTextChunkAsync(
+                    context.Response,
+                    id,
+                    created,
+                    model,
+                    remainingText,
                     context.RequestAborted).ConfigureAwait(false);
             }
 
@@ -315,6 +323,7 @@ public static class OpenAiEndpoints
         PrepareSse(context.Response);
         var id = $"chatcmpl-{stream.SequenceId.Value:N}";
         var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        using var decoder = codec.CreateDecoder();
         var completed = false;
 
         try
@@ -341,24 +350,28 @@ public static class OpenAiEndpoints
 
             await foreach (var token in stream.ReadTokensAsync(context.RequestAborted))
             {
-                await WriteSseAsync(
-                    context.Response,
-                    new
-                    {
+                var text = decoder.Append(token);
+                if (text.Length != 0)
+                {
+                    await WriteChatTextChunkAsync(
+                        context.Response,
                         id,
-                        @object = "chat.completion.chunk",
                         created,
                         model,
-                        choices = new[]
-                        {
-                            new
-                            {
-                                index = 0,
-                                delta = new { content = codec.DecodeToken(token) },
-                                finish_reason = (string?)null
-                            }
-                        }
-                    },
+                        text,
+                        context.RequestAborted).ConfigureAwait(false);
+                }
+            }
+
+            var remainingText = decoder.Complete();
+            if (remainingText.Length != 0)
+            {
+                await WriteChatTextChunkAsync(
+                    context.Response,
+                    id,
+                    created,
+                    model,
+                    remainingText,
                     context.RequestAborted).ConfigureAwait(false);
             }
 
@@ -392,6 +405,61 @@ public static class OpenAiEndpoints
             await CancelIfAbandonedAsync(stream, completed).ConfigureAwait(false);
         }
     }
+
+    private static ValueTask WriteCompletionTextChunkAsync(
+        HttpResponse response,
+        string id,
+        long created,
+        string model,
+        string text,
+        CancellationToken cancellationToken) =>
+        WriteSseAsync(
+            response,
+            new
+            {
+                id,
+                @object = "text_completion",
+                created,
+                model,
+                choices = new[]
+                {
+                    new
+                    {
+                        text,
+                        index = 0,
+                        logprobs = (object?)null,
+                        finish_reason = (string?)null
+                    }
+                }
+            },
+            cancellationToken);
+
+    private static ValueTask WriteChatTextChunkAsync(
+        HttpResponse response,
+        string id,
+        long created,
+        string model,
+        string text,
+        CancellationToken cancellationToken) =>
+        WriteSseAsync(
+            response,
+            new
+            {
+                id,
+                @object = "chat.completion.chunk",
+                created,
+                model,
+                choices = new[]
+                {
+                    new
+                    {
+                        index = 0,
+                        delta = new { content = text },
+                        finish_reason = (string?)null
+                    }
+                }
+            },
+            cancellationToken);
 
     private static bool TryValidateModelAndLimit(
         string model,
