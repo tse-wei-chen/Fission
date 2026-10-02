@@ -17,6 +17,7 @@ on:
       - benchmarks/serving/**
       - eng/run-serving-suite.ps1
       - eng/run-nvidia-smoke.ps1
+      - eng/run-nvidia-serving-benchmark.ps1
       - .github/workflows/container.yml
   pull_request:
     branches: [ develop ]
@@ -34,6 +35,7 @@ on:
       - benchmarks/serving/**
       - eng/run-serving-suite.ps1
       - eng/run-nvidia-smoke.ps1
+      - eng/run-nvidia-serving-benchmark.ps1
       - .github/workflows/container.yml
 
 concurrency:
@@ -56,18 +58,34 @@ jobs:
       - name: Validate Compose configuration
         run: docker compose config --quiet
 
-      - name: Validate NVIDIA smoke runner syntax
+      - name: Validate NVIDIA runner syntax
         shell: pwsh
         run: |
-          $tokens = $null
-          $errors = $null
-          [void] [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path ./eng/run-nvidia-smoke.ps1).Path,
-            [ref] $tokens,
-            [ref] $errors)
-          if ($errors.Count -gt 0) {
-            $errors | ForEach-Object { Write-Error $_.Message }
-            exit 1
+          foreach ($path in @(
+            "./eng/run-nvidia-smoke.ps1",
+            "./eng/run-nvidia-serving-benchmark.ps1"
+          )) {
+            $tokens = $null
+            $errors = $null
+            [void] [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path).Path,
+              [ref] $tokens,
+              [ref] $errors)
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$path`: $($_.Message)" }
+              exit 1
+            }
+          }
+
+      - name: Validate GPU serving smoke manifest
+        shell: pwsh
+        run: |
+          $manifest = Get-Content ./benchmarks/serving/workloads.gpu-smoke.json -Raw | ConvertFrom-Json
+          if ($manifest.schema_version -ne 1) {
+            throw "GPU serving smoke manifest must use schema_version 1."
+          }
+          if (@($manifest.workloads).Count -eq 0) {
+            throw "GPU serving smoke manifest must contain workloads."
           }
 
       - name: Build image
