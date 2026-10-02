@@ -157,7 +157,17 @@ static async Task ValidateBackendCompositionAsync()
             () => ServerBackendFactory.Create(onnx, new DeviceId("cuda:0")),
             "CUDA composition must validate pool retention before loading CUDA Runtime.");
 
-        onnx["Fission:ExecutionProvider"] = "cpu";
+        onnx["Fission:CudaPoolMaxRetainedBytes"] = "0";
+        onnx["Fission:CudaRuntimeLibraryPath"] = Path.Combine(
+            Path.GetTempPath(),
+            $"missing-cudart-{Guid.NewGuid():N}");
+        RequireThrows<DllNotFoundException>(
+            () => ServerBackendFactory.Create(onnx, new DeviceId("cuda:0")),
+            "CUDA composition must fail before serving when its configured CUDA Runtime cannot be loaded.");
+
+        onnx["Fission:ExecutionProvider"] = null;
+        onnx["Fission:OnnxExecutionProvider"] = "cpu";
+        onnx["Fission:CudaRuntimeLibraryPath"] = null;
         onnx["Fission:CudaPoolMaxRetainedBytes"] = null;
         onnx["Fission:VocabularySize"] = "0";
         RequireThrows<InvalidOperationException>(
