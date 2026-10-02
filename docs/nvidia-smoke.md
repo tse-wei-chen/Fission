@@ -252,3 +252,59 @@ Use `--skip-check` only when the checker fails on an operator already accepted
 by the target runtime, then require the normal Fission NVIDIA one-shot smoke
 before benchmarking the rewritten model. Skipping the checker is not runtime
 validation.
+
+
+## ORT profile attribution: FP32 GQA CPU island
+
+The first pinned-logits ORT profile reached ORT's event limit, so it is a
+partial trace. Even with that limitation, the provider/operator distribution is
+decisive:
+
+| Signal | Partial-trace value |
+| --- | ---: |
+| Node execution events | 996,376 |
+| Summed node duration | 40,311.79 ms |
+| CUDA provider share | 92.17% |
+| CPU provider share | 7.83% |
+| Memcpy events | 219,204 |
+| Memcpy duration share | 18.57% |
+| CPU GroupQueryAttention events | 54,348 |
+| CPU GroupQueryAttention share | 7.67% |
+| MemcpyFromHost events | 54,348 |
+| MemcpyToHost events | 164,856 |
+| CUDA MatMul share | 44.75% |
+
+The exact equality between CPU `GroupQueryAttention` and
+`MemcpyFromHost` event counts, together with roughly three
+`MemcpyToHost` events per GQA invocation, strongly identifies GQA as a CPU
+island inside the otherwise CUDA-heavy graph. Treat that event-count relationship
+as attribution evidence, not a proof that every Memcpy belongs exclusively to
+GQA.
+
+The reason is visible in ONNX Runtime 1.30 itself: the CUDA
+`GroupQueryAttention` contrib kernel is registered for FP16/BF16 (plus
+quantized-KV variants), while the current Fission/SmolLM2 validation graph is
+FP32. The CPU provider has an FP32 GQA kernel, so ORT partitions those nodes to
+CPU and inserts transfers around them.
+
+For reference, inspect the ONNX Runtime 1.30 source:
+
+- `onnxruntime/contrib_ops/cuda/bert/group_query_attention.cc`
+- `onnxruntime/contrib_ops/cuda/cuda_contrib_kernels.cc`
+
+The next validated path is therefore FP16 CUDA execution rather than another
+scheduler or logits-transfer tweak.
+
+### Constrained FP16 path
+
+Fission's first FP16 CUDA path intentionally supports only:
+
+- FP16 model/KV tensors;
+- CUDA execution provider;
+- graph-side sampled token ids;
+- CUDA-resident FP16 KV state.
+
+It does **not** yet add an FP16 pageable/pinned host-logits sampler. This keeps
+the first experiment narrow enough to answer whether moving GQA off CPU removes
+the measured transfer island. Existing FP32 page-locked serving remains the
+validated default until the FP16 hardware gate passes.
