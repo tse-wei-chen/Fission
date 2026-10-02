@@ -226,8 +226,7 @@ module Scheduler =
         =
         if state.SelectedCount >= budget.MaxBatchSequences then
             { state with
-                DeferredRev = { Sequence = sequence; Reason = BatchSequenceBudget } :: state.DeferredRev },
-            false
+                DeferredRev = { Sequence = sequence; Reason = BatchSequenceBudget } :: state.DeferredRev }
         else
             let deviceSequenceBudget =
                 match sequence.ExecutionDevice with
@@ -242,14 +241,12 @@ module Scheduler =
 
             if deviceSequenceCapacityReached then
                 { state with
-                    DeferredRev = { Sequence = sequence; Reason = DeviceSequenceBudget } :: state.DeferredRev },
-                false
+                    DeferredRev = { Sequence = sequence; Reason = DeviceSequenceBudget } :: state.DeferredRev }
             else
                 let availableTokens = budget.MaxBatchTokens - state.UsedTokens
                 if availableTokens <= 0 then
                     { state with
-                        DeferredRev = { Sequence = sequence; Reason = TokenBudget } :: state.DeferredRev },
-                    false
+                        DeferredRev = { Sequence = sequence; Reason = TokenBudget } :: state.DeferredRev }
                 else
                     let desiredTokens =
                         if sequence.Phase = Decoding then
@@ -292,8 +289,7 @@ module Scheduler =
                             elif deviceMemoryTokenCapacity <= 0 then DeviceMemoryBudget
                             else TokenBudget
                         { state with
-                            DeferredRev = { Sequence = sequence; Reason = reason } :: state.DeferredRev },
-                        false
+                            DeferredRev = { Sequence = sequence; Reason = reason } :: state.DeferredRev }
                     else
                         let kvPageGrant = kvPagesForGrant sequence tokenGrant
                         let kvByteGrant = int64 tokenGrant * sequence.KvBytesPerToken
@@ -322,8 +318,7 @@ module Scheduler =
                             UsedKvBytes = state.UsedKvBytes + kvByteGrant
                             UsedTransientKvBytes = state.UsedTransientKvBytes + transientKvByteGrant
                             UsedDeviceTransientBytes = nextDeviceUsage
-                            UsedDeviceSequences = nextDeviceSequenceUsage },
-                        true
+                            UsedDeviceSequences = nextDeviceSequenceUsage }
 
     let private reserveDecodeTokens
         (budget: ResourceBudget)
@@ -340,7 +335,7 @@ module Scheduler =
                 match remaining with
                 | [] -> current, []
                 | sequence :: tail ->
-                    let next, _ = trySelect budget policy current sequence
+                    let next = trySelect budget policy current sequence
                     loop next tail
 
         loop state orderedDecodes
@@ -408,7 +403,7 @@ module Scheduler =
 
         let finalState =
             remainingCandidates
-            |> List.fold (fun state sequence -> fst (trySelect budget policy state sequence)) afterReserve
+            |> List.fold (fun state sequence -> trySelect budget policy state sequence) afterReserve
 
         { Selected = List.rev finalState.SelectedRev
           Deferred = initiallyDeferred @ List.rev finalState.DeferredRev
