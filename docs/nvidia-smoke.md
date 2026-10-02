@@ -181,3 +181,36 @@ host-backed. For vocabulary 49,152, an 8-row FP32 decode batch writes about
 `-PageLockedDecodeLogits` benchmark switch exist to measure whether replacing
 the pageable decode-logits destination with reusable CUDA page-locked memory
 improves TPOT on this host.
+
+
+## Page-locked logits A/B validation
+
+A three-repetition A/B run on the same RTX 3060 validated the page-locked
+decode-logits experiment. The table below reports mean output throughput and
+mean-of-run TPOT p50 values:
+
+| Workload | C | Baseline tok/s | Pinned tok/s | Delta | Baseline TPOT p50 ms | Pinned TPOT p50 ms | Delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| gpu-short | 1 | 52.97 | 59.01 | +11.41% | 18.26 | 16.31 | -10.66% |
+| gpu-short | 4 | 97.58 | 111.07 | +13.83% | 38.88 | 34.25 | -11.91% |
+| gpu-short | 8 | 168.59 | 196.23 | +16.39% | 45.05 | 38.72 | -14.05% |
+| gpu-decode | 1 | 47.66 | 51.86 | +8.82% | 20.73 | 19.03 | -8.22% |
+| gpu-decode | 4 | 84.41 | 91.47 | +8.36% | 46.78 | 42.95 | -8.19% |
+| gpu-decode | 8 | 140.08 | 140.51 | +0.31% | 56.07 | 55.80 | -0.48% |
+
+All 288 measured requests succeeded and every run returned exact usage
+accounting. The page-locked path therefore has a repeatable TPOT/throughput
+benefit at low and medium concurrency and for the short workload through
+concurrency 8. The long decode-heavy workload at concurrency 8 is effectively
+flat, indicating that full-batch long-context execution is dominated elsewhere.
+
+TTFT deltas from this experiment are not attributed to page-locked decode
+logits. The optimization is entered only after prefill has produced the first
+token, so it cannot causally change the first-token path; observed TTFT movement
+is treated as run-to-run scheduling/system variation.
+
+The next transfer-reduction experiment is graph-side greedy sampling. For this
+model and vocabulary, an eight-row FP32 decode step exposes about 1.5 MiB of
+logits to the host path. A graph-side `Gather -> ArgMax` output reduces the
+requested host result to eight int64 token ids while leaving the logits tensor
+inside ONNX Runtime.
