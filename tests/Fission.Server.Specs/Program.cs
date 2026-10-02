@@ -55,6 +55,202 @@ static TException RequireThrows<TException>(
     throw new InvalidOperationException(message);
 }
 
+static async Task ValidateTextCodecCompositionAsync()
+{
+    var defaults = new ConfigurationManager();
+    using (var codec = ServerTextTokenCodecFactory.Create(defaults))
+    {
+        Require(
+            codec is DeterministicTextTokenCodec,
+            "Server tokenizer composition must default to the deterministic codec.");
+    }
+
+    var unsupported = new ConfigurationManager();
+    unsupported["Fission:Tokenizer"] = "not-a-tokenizer";
+    RequireThrows<InvalidOperationException>(
+        () => ServerTextTokenCodecFactory.Create(unsupported),
+        "Unknown server tokenizers must fail during composition.");
+
+    var missingTokenizer = new ConfigurationManager();
+    missingTokenizer["Fission:Tokenizer"] = "huggingface";
+    missingTokenizer["Fission:TokenizerPath"] = Path.Combine(
+        Path.GetTempPath(),
+        $"missing-tokenizer-{Guid.NewGuid():N}.json");
+    RequireThrows<FileNotFoundException>(
+        () => ServerTextTokenCodecFactory.Create(missingTokenizer),
+        "The Hugging Face codec must reject a missing tokenizer before server startup.");
+
+    var tokenizerPath = Path.Combine(
+        Path.GetTempPath(),
+        $"fission-tokenizer-{Guid.NewGuid():N}.json");
+
+    const string tokenizerJson =
+        """
+        {
+          "version": "1.0",
+          "truncation": null,
+          "padding": null,
+          "added_tokens": [
+            {
+              "id": 1,
+              "content": "<|im_start|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            },
+            {
+              "id": 2,
+              "content": "<|im_end|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            },
+            {
+              "id": 8,
+              "content": "<|begin_of_text|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            },
+            {
+              "id": 9,
+              "content": "<|start_header_id|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            },
+            {
+              "id": 10,
+              "content": "<|end_header_id|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            },
+            {
+              "id": 11,
+              "content": "<|eot_id|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            }
+          ],
+          "normalizer": null,
+          "pre_tokenizer": {
+            "type": "Whitespace"
+          },
+          "post_processor": null,
+          "decoder": null,
+          "model": {
+            "type": "WordLevel",
+            "vocab": {
+              "[UNK]": 0,
+              "<|im_start|>": 1,
+              "<|im_end|>": 2,
+              "user": 3,
+              "assistant": 4,
+              "hello": 5,
+              "world": 6,
+              "system": 7,
+              "<|begin_of_text|>": 8,
+              "<|start_header_id|>": 9,
+              "<|end_header_id|>": 10,
+              "<|eot_id|>": 11,
+              "developer": 12,
+              "tool": 13
+            },
+            "unk_token": "[UNK]"
+          }
+        }
+        """;
+
+    await File.WriteAllTextAsync(tokenizerPath, tokenizerJson);
+
+    try
+    {
+        var qwen = new ConfigurationManager();
+        qwen["Fission:Tokenizer"] = "huggingface";
+        qwen["Fission:TokenizerPath"] = tokenizerPath;
+        qwen["Fission:ChatTemplate"] = "qwen2";
+        qwen["Fission:AddPromptSpecialTokens"] = "false";
+
+        using (var codec = ServerTextTokenCodecFactory.Create(qwen))
+        {
+            Require(
+                codec.EncodePrompt("hello world").SequenceEqual([5, 6]),
+                "Hugging Face prompt encoding must use tokenizer.json ids.");
+
+            var chatTokens = codec.EncodeChat(
+            [
+                new OpenAiChatMessage("user", "hello")
+            ]);
+            Require(
+                chatTokens.SequenceEqual([1, 3, 5, 2, 1, 4]),
+                "Qwen2 chat rendering must preserve added control tokens as single ids.");
+
+            using var decoder = codec.CreateDecoder();
+            Require(
+                decoder.Append(5) == "hello",
+                "Streaming tokenizer decode must emit a stable first token.");
+            Require(
+                decoder.Append(6) == " world",
+                "Streaming tokenizer decode must preserve cross-token spacing.");
+            Require(
+                decoder.Complete() == string.Empty,
+                "Streaming tokenizer decode must not duplicate already emitted text.");
+        }
+
+        var llama = new ConfigurationManager();
+        llama["Fission:Tokenizer"] = "huggingface";
+        llama["Fission:TokenizerPath"] = tokenizerPath;
+        llama["Fission:ChatTemplate"] = "llama3";
+        llama["Fission:AddPromptSpecialTokens"] = "false";
+
+        using (var codec = ServerTextTokenCodecFactory.Create(llama))
+        {
+            var chatTokens = codec.EncodeChat(
+            [
+                new OpenAiChatMessage("system", "hello"),
+                new OpenAiChatMessage("user", "world")
+            ]);
+            Require(
+                chatTokens.SequenceEqual(
+                [
+                    8,
+                    9, 7, 10, 5, 11,
+                    9, 3, 10, 6, 11,
+                    9, 4, 10
+                ]),
+                "Llama 3 chat rendering must preserve header and turn control tokens.");
+        }
+
+        var noTemplate = new ConfigurationManager();
+        noTemplate["Fission:Tokenizer"] = "huggingface";
+        noTemplate["Fission:TokenizerPath"] = tokenizerPath;
+        using (var codec = ServerTextTokenCodecFactory.Create(noTemplate))
+        {
+            RequireThrows<ArgumentException>(
+                () => codec.EncodeChat([new OpenAiChatMessage("user", "hello")]),
+                "Chat requests must fail clearly when no model chat template is configured.");
+        }
+    }
+    finally
+    {
+        File.Delete(tokenizerPath);
+    }
+}
+
 static async Task ValidateBackendCompositionAsync()
 {
     var device = new DeviceId("cpu:composition-spec");
@@ -125,6 +321,7 @@ static async Task ValidateBackendCompositionAsync()
 }
 
 await ValidateBackendCompositionAsync();
+await ValidateTextCodecCompositionAsync();
 
 using var deterministicDecoder = new DeterministicTextTokenCodec().CreateDecoder();
 Require(
@@ -156,7 +353,8 @@ await using var worker = new InferenceWorker(
 var builder = WebApplication.CreateBuilder();
 builder.WebHost.UseUrls("http://127.0.0.1:0");
 var app = builder.Build();
-OpenAiEndpoints.Map(app, worker, new BufferedSpecTextTokenCodec());
+using var servingCodec = new BufferedSpecTextTokenCodec();
+OpenAiEndpoints.Map(app, worker, servingCodec);
 await app.StartAsync();
 
 var server = app.Services.GetRequiredService<IServer>();
@@ -326,6 +524,8 @@ sealed class BufferedSpecTextTokenCodec : ITextTokenCodec
         _promptCodec.EncodeChat(messages);
 
     public ITextTokenDecoder CreateDecoder() => new Decoder();
+
+    public void Dispose() => _promptCodec.Dispose();
 
     private sealed class Decoder : ITextTokenDecoder
     {
