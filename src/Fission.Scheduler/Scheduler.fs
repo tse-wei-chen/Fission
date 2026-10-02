@@ -391,28 +391,41 @@ module Scheduler =
         (compareCandidates: ReadySequence -> ReadySequence -> int)
         (initialState: SelectionState)
         (orderedDecodes: ReadySequence list)
-        (orderedPrefills: ReadySequence list)
+        (orderedPrefills: ReadySequence array)
         =
-        let rec loop state decodes prefills =
-            match decodes, prefills with
-            | [], [] -> state
-            | sequence :: tail, [] ->
-                loop (trySelect budget policy state sequence) tail []
-            | [], sequence :: tail ->
-                loop (trySelect budget policy state sequence) [] tail
-            | decode :: decodeTail, prefill :: prefillTail ->
-                if compareCandidates decode prefill <= 0 then
+        let rec loop state decodes prefillIndex =
+            if prefillIndex >= orderedPrefills.Length then
+                match decodes with
+                | [] -> state
+                | sequence :: tail ->
                     loop
-                        (trySelect budget policy state decode)
-                        decodeTail
-                        prefills
-                else
-                    loop
-                        (trySelect budget policy state prefill)
-                        decodes
-                        prefillTail
+                        (trySelect budget policy state sequence)
+                        tail
+                        prefillIndex
+            else
+                match decodes with
+                | [] ->
+                    let next =
+                        trySelect
+                            budget
+                            policy
+                            state
+                            orderedPrefills[prefillIndex]
+                    loop next [] (prefillIndex + 1)
+                | decode :: decodeTail ->
+                    let prefill = orderedPrefills[prefillIndex]
+                    if compareCandidates decode prefill <= 0 then
+                        loop
+                            (trySelect budget policy state decode)
+                            decodeTail
+                            prefillIndex
+                    else
+                        loop
+                            (trySelect budget policy state prefill)
+                            decodes
+                            (prefillIndex + 1)
 
-        loop initialState orderedDecodes orderedPrefills
+        loop initialState orderedDecodes 0
 
     let private validateScheduleInputs
         (budget: ResourceBudget)
@@ -517,8 +530,8 @@ module Scheduler =
         let struct (afterReserve, remainingDecodes) =
             reserveDecodeTokens budget policy orderedDecodes initialState
 
-        let orderedPrefills =
-            prefills |> List.sortWith compareCandidates
+        let orderedPrefills = List.toArray prefills
+        Array.sortInPlaceWith compareCandidates orderedPrefills
 
         let finalState =
             selectMergedCandidates
