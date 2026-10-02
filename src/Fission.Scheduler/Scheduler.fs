@@ -30,11 +30,11 @@ module Scheduler =
 
     let rec private containsDevice
         (device: Fission.Abstractions.DeviceId)
-        (budgets: (Fission.Abstractions.DeviceId * 'T) list)
+        (budgets: struct (Fission.Abstractions.DeviceId * 'T) list)
         =
         match budgets with
         | [] -> false
-        | (candidate, _) :: tail ->
+        | struct (candidate, _) :: tail ->
             candidate = device || containsDevice device tail
 
     let rec private hasDuplicateDevice
@@ -42,7 +42,7 @@ module Scheduler =
         =
         match budgets with
         | [] | [_] -> false
-        | (device, _) :: tail ->
+        | struct (device, _) :: tail ->
             containsDevice device tail || hasDuplicateDevice tail
 
     let private isRunnable (sequence: ReadySequence) =
@@ -153,11 +153,11 @@ module Scheduler =
 
     let rec private tryFindDeviceValue
         (device: Fission.Abstractions.DeviceId)
-        (values: (Fission.Abstractions.DeviceId * 'T) list)
+        (values: struct (Fission.Abstractions.DeviceId * 'T) list)
         =
         match values with
         | [] -> ValueNone
-        | (candidate, value) :: tail ->
+        | struct (candidate, value) :: tail ->
             if candidate = device then
                 ValueSome value
             else
@@ -403,11 +403,11 @@ module Scheduler =
         if budget.AvailableKvPages < 0 then invalidArg "AvailableKvPages" "AvailableKvPages cannot be negative."
         if budget.MaxBatchSequences < 0 then invalidArg "MaxBatchSequences" "MaxBatchSequences cannot be negative."
         if budget.AvailableKvBytes < 0L then invalidArg "AvailableKvBytes" "AvailableKvBytes cannot be negative."
-        if budget.AvailableDeviceBytes |> List.exists (fun (_, availableBytes) -> availableBytes < 0L) then
+        if budget.AvailableDeviceBytes |> List.exists (fun struct (_, availableBytes) -> availableBytes < 0L) then
             invalidArg "AvailableDeviceBytes" "Available device bytes cannot be negative."
         if hasDuplicateDevice budget.AvailableDeviceBytes then
             invalidArg "AvailableDeviceBytes" "Each execution device may appear only once in the device-memory budget."
-        if budget.MaxDeviceSequences |> List.exists (fun (_, maxSequences) -> maxSequences < 0) then
+        if budget.MaxDeviceSequences |> List.exists (fun struct (_, maxSequences) -> maxSequences < 0) then
             invalidArg "MaxDeviceSequences" "Per-device sequence capacity cannot be negative."
         if hasDuplicateDevice budget.MaxDeviceSequences then
             invalidArg "MaxDeviceSequences" "Each execution device may appear only once in the per-device sequence budget."
