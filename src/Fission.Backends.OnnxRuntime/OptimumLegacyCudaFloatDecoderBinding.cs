@@ -652,11 +652,11 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
                         contract.PastValueNames!,
                         layer));
 
-                    var key = OrtValue.CreateTensorValueFromMemory(
-                        Array.Empty<float>(),
+                    var key = CreateEmptyKvTensor(
+                        geometry.KvElementType,
                         batchedPastShape);
-                    var value = OrtValue.CreateTensorValueFromMemory(
-                        Array.Empty<float>(),
+                    var value = CreateEmptyKvTensor(
+                        geometry.KvElementType,
                         batchedPastShape);
                     ownedInputs.Add(key);
                     ownedInputs.Add(value);
@@ -1055,6 +1055,23 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
         }
     }
 
+    private static OrtValue CreateEmptyKvTensor(
+        TensorElementType elementType,
+        long[] shape) =>
+        elementType switch
+        {
+            TensorElementType.Float =>
+                OrtValue.CreateTensorValueFromMemory(
+                    Array.Empty<float>(),
+                    shape),
+            TensorElementType.Float16 =>
+                OrtValue.CreateTensorValueFromMemory(
+                    Array.Empty<Half>(),
+                    shape),
+            _ => throw new InvalidOperationException(
+                $"Unsupported CUDA decoder KV element type {elementType}.")
+        };
+
     private static int CheckedTensorLength(IReadOnlyList<long> shape)
     {
         long count = 1;
@@ -1146,8 +1163,20 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
                 for (var layer = 0; layer < geometry.NumHiddenLayers; layer++)
                 {
                     var resident = _lease.GetLayer(layer);
-                    ValidateResidentTensor(resident.Key, expectedShape, expectedDeviceId, layer, "key");
-                    ValidateResidentTensor(resident.Value, expectedShape, expectedDeviceId, layer, "value");
+                    ValidateResidentTensor(
+                        resident.Key,
+                        expectedShape,
+                        expectedDeviceId,
+                        geometry.KvElementType,
+                        layer,
+                        "key");
+                    ValidateResidentTensor(
+                        resident.Value,
+                        expectedShape,
+                        expectedDeviceId,
+                        geometry.KvElementType,
+                        layer,
+                        "value");
                     var offset = checked(layer * 2);
                     inputNames[offset] = DecoderOnlyOnnxContract.ExpandLayerName(
                         profile.Contract.PastKeyNames!,
@@ -1158,14 +1187,14 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
 
                     _inputValues[offset] = OrtValue.CreateTensorValueWithData(
                         memoryInfo,
-                        TensorElementType.Float,
+                        geometry.KvElementType,
                         expectedShape,
                         resident.Key.DevicePointer,
                         resident.Key.ByteLength);
                     produced++;
                     _inputValues[offset + 1] = OrtValue.CreateTensorValueWithData(
                         memoryInfo,
-                        TensorElementType.Float,
+                        geometry.KvElementType,
                         expectedShape,
                         resident.Value.DevicePointer,
                         resident.Value.ByteLength);
@@ -1224,15 +1253,16 @@ public sealed class OptimumLegacyCudaFloatDecoderBinding :
             CudaDeviceTensorView tensor,
             IReadOnlyList<long> expectedShape,
             int expectedDeviceId,
+            TensorElementType expectedElementType,
             int layer,
             string slot)
         {
             if (tensor.DeviceId != expectedDeviceId ||
-                tensor.ElementType != TensorElementType.Float ||
+                tensor.ElementType != expectedElementType ||
                 !tensor.Shape.SequenceEqual(expectedShape))
             {
                 throw new InvalidOperationException(
-                    $"CUDA singleton past layer {layer} {slot} does not match the expected FP32 device tensor geometry.");
+                    $"CUDA singleton past layer {layer} {slot} does not match the expected {expectedElementType} device tensor geometry.");
             }
         }
     }
