@@ -13,14 +13,14 @@ let sid (value: string) =
 let now = DateTimeOffset(2026, 9, 24, 12, 0, 0, TimeSpan.Zero)
 let blockSize = 4
 
-let mk sequenceId phase priority (deadline: DateTimeOffset option) enqueuedAt tokenDemand position tokensPerKvPage =
+let mk sequenceId phase priority (deadline: DateTimeOffset option) (enqueuedAt: DateTimeOffset) tokenDemand position tokensPerKvPage =
     { SequenceId = sequenceId
       Phase = phase
       DeadlineUtcTicks =
           match deadline with
           | Some value -> value.UtcTicks
           | None -> -1L
-      EnqueuedAt = enqueuedAt
+      EnqueuedUtcTicks = enqueuedAt.UtcTicks
       TokenDemand = tokenDemand
       Position = position
       TokensPerKvPage = tokensPerKvPage

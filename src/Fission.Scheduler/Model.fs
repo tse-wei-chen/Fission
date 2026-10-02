@@ -15,7 +15,7 @@ type ReadySequence =
     { SequenceId: SequenceId
       Phase: SequencePhase
       DeadlineUtcTicks: int64
-      EnqueuedAt: DateTimeOffset
+      EnqueuedUtcTicks: int64
       TokenDemand: int
       Position: int
       TokensPerKvPage: int

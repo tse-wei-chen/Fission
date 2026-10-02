@@ -76,7 +76,7 @@ module Scheduler =
                 let byPriority = compare right.Priority left.Priority
                 if byPriority <> 0 then byPriority
                 else
-                    let byArrival = compare left.EnqueuedAt.UtcTicks right.EnqueuedAt.UtcTicks
+                    let byArrival = compare left.EnqueuedUtcTicks right.EnqueuedUtcTicks
                     if byArrival <> 0 then byArrival
                     else compare left.SequenceId.Value right.SequenceId.Value
         else
@@ -86,7 +86,7 @@ module Scheduler =
                 let byDeadline = compare (deadlineTicks left) (deadlineTicks right)
                 if byDeadline <> 0 then byDeadline
                 else
-                    let byArrival = compare left.EnqueuedAt.UtcTicks right.EnqueuedAt.UtcTicks
+                    let byArrival = compare left.EnqueuedUtcTicks right.EnqueuedUtcTicks
                     if byArrival <> 0 then byArrival
                     else compare left.SequenceId.Value right.SequenceId.Value
 

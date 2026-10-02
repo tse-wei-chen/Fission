@@ -83,7 +83,7 @@ type SchedulingKernel() =
                 candidate.Deadline.Value.UtcTicks
             else
                 -1L
-          EnqueuedAt = candidate.EnqueuedAt
+          EnqueuedUtcTicks = candidate.EnqueuedAt.UtcTicks
           TokenDemand = candidate.TokenDemand
           Position = candidate.Position
           TokensPerKvPage = candidate.TokensPerKvPage
