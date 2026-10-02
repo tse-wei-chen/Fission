@@ -21,7 +21,7 @@ type ReadySequence =
       TokensPerKvPage: int
       Priority: int
       KvBytesPerToken: int64
-      ExecutionDevice: DeviceId option }
+      ExecutionDevice: DeviceId voption }
 
 type ResourceBudget =
     { MaxBatchTokens: int
