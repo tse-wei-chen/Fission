@@ -14,7 +14,7 @@ type SequencePhase =
 type ReadySequence =
     { SequenceId: SequenceId
       Phase: SequencePhase
-      Deadline: DateTimeOffset option
+      DeadlineUtcTicks: int64
       EnqueuedAt: DateTimeOffset
       TokenDemand: int
       Position: int
