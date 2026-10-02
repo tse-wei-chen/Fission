@@ -78,7 +78,7 @@ services:
       Fission__StartupProbeEnabled: ${FISSION_STARTUP_PROBE_ENABLED:-false}
       Fission__StartupProbeExitAfterSuccess: "false"
       Fission__StartupProbePrompt: ${FISSION_STARTUP_PROBE_PROMPT:-Hello}
-      Fission__StartupProbeModelId: ${FISSION_STARTUP_PROBE_MODEL_ID:-${FISSION_MODEL_ID:-model}}
+      Fission__StartupProbeModelId: ${FISSION_STARTUP_PROBE_MODEL_ID:-model}
       Fission__StartupProbeMaxTokens: ${FISSION_STARTUP_PROBE_MAX_TOKENS:-1}
       Fission__StartupProbeTimeoutSeconds: ${FISSION_STARTUP_PROBE_TIMEOUT_SECONDS:-120}
     volumes:
