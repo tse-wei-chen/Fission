@@ -172,6 +172,42 @@ static async Task ValidateTokenizerCompositionAsync()
               "rstrip": false,
               "normalized": false,
               "special": true
+            },
+            {
+              "id": 8,
+              "content": "<|begin_of_text|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            },
+            {
+              "id": 9,
+              "content": "<|start_header_id|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            },
+            {
+              "id": 10,
+              "content": "<|end_header_id|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
+            },
+            {
+              "id": 11,
+              "content": "<|eot_id|>",
+              "single_word": false,
+              "lstrip": false,
+              "rstrip": false,
+              "normalized": false,
+              "special": true
             }
           ],
           "normalizer": null,
@@ -222,7 +258,8 @@ static async Task ValidateTokenizerCompositionAsync()
         var configured = new ConfigurationManager();
         configured["Fission:Tokenizer"] = "huggingface";
         configured["Fission:TokenizerPath"] = chatTokenizerPath;
-        configured["Fission:ChatTemplate"] = "chatml";
+        configured["Fission:ChatTemplate"] = "qwen2";
+        configured["Fission:AddPromptSpecialTokens"] = "false";
 
         using (var codec = ServerTextTokenCodecFactory.Create(configured))
         {
@@ -236,7 +273,31 @@ static async Task ValidateTokenizerCompositionAsync()
             ]);
             Require(
                 chatTokens.SequenceEqual([6, 2, 4, 7, 6, 3]),
-                "ChatML rendering must encode model special tokens and the assistant generation prefix.");
+                "Qwen2/ChatML rendering must encode model special tokens and the assistant generation prefix.");
+        }
+
+        var llama = new ConfigurationManager();
+        llama["Fission:Tokenizer"] = "huggingface";
+        llama["Fission:TokenizerPath"] = chatTokenizerPath;
+        llama["Fission:ChatTemplate"] = "llama3";
+        llama["Fission:AddPromptSpecialTokens"] = "false";
+
+        using (var codec = ServerTextTokenCodecFactory.Create(llama))
+        {
+            var chatTokens = codec.EncodeChat(
+            [
+                new OpenAiChatMessage("system", "hello"),
+                new OpenAiChatMessage("user", "world")
+            ]);
+            Require(
+                chatTokens.SequenceEqual(
+                [
+                    8,
+                    9, 1, 10, 4, 11,
+                    9, 2, 10, 5, 11,
+                    9, 3, 10
+                ]),
+                "Llama 3 rendering must encode BOS, header, EOT, and assistant-prefix control tokens.");
         }
 
         using (var codec = new HuggingFaceTextTokenCodec(byteTokenizerPath))
@@ -271,6 +332,17 @@ static async Task ValidateTokenizerCompositionAsync()
             RequireThrows<ArgumentException>(
                 () => codec.EncodeChat([new OpenAiChatMessage("user", "hello")]),
                 "Chat encoding must fail explicitly when no model chat template is configured.");
+        }
+
+        var invalidRole = new ConfigurationManager();
+        invalidRole["Fission:Tokenizer"] = "huggingface";
+        invalidRole["Fission:TokenizerPath"] = chatTokenizerPath;
+        invalidRole["Fission:ChatTemplate"] = "qwen2";
+        using (var codec = ServerTextTokenCodecFactory.Create(invalidRole))
+        {
+            RequireThrows<ArgumentException>(
+                () => codec.EncodeChat([new OpenAiChatMessage("not-a-role", "hello")]),
+                "Production chat templates must reject unknown role names rather than embedding arbitrary control roles.");
         }
     }
     finally
