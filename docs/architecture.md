@@ -11,12 +11,15 @@ Fission treats LLM inference as an operating-system-like workload:
 - **KV pages** are virtualized state;
 - **snapshots and forks** are first-class operations;
 - the **scheduler** allocates token and KV budgets under latency/priority constraints;
-- GPU/CPU/native backends are devices behind the runtime boundary.
+- GPU/CPU/NPU/TPU/FPGA/native backends are devices behind the runtime boundary.
 
 ## Project boundaries
 
 ### Fission.Abstractions (C#)
 Stable cross-language identifiers plus the device-facing `IInferenceBackend` contract.
+
+### Fission.Accelerators (C#)
+Provider-neutral accelerator discovery and metadata. It describes physical device kind, execution-provider identity, memory topology, and optional capabilities without teaching the scheduler to parse vendor-specific DeviceId strings.
 
 ### Fission.Plan (F#)
 Typed inference IR. This is where future optimization passes will transform high-level inference intent into executable plans.
