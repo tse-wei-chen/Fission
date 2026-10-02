@@ -362,19 +362,19 @@ module Scheduler =
         if policy.MaxPrefillChunkTokens <= 0 then invalidArg "MaxPrefillChunkTokens" "MaxPrefillChunkTokens must be positive."
         if policy.DeadlineUrgencyWindow < TimeSpan.Zero then invalidArg "DeadlineUrgencyWindow" "DeadlineUrgencyWindow cannot be negative."
 
-        let decodesRev, prefillsRev, deferredRev, rejectedRev =
+        let struct (decodesRev, prefillsRev, deferredRev, rejectedRev) =
             sequences
-            |> List.fold (fun (decodes, prefills, deferred, rejected) sequence ->
+            |> List.fold (fun struct (decodes, prefills, deferred, rejected) sequence ->
                 match classifyAdmission sequence with
                 | Admitted candidate when candidate.Phase = Decoding ->
-                    candidate :: decodes, prefills, deferred, rejected
+                    struct (candidate :: decodes, prefills, deferred, rejected)
                 | Admitted candidate ->
-                    decodes, candidate :: prefills, deferred, rejected
+                    struct (decodes, candidate :: prefills, deferred, rejected)
                 | DeferredAdmission deferredItem ->
-                    decodes, prefills, deferredItem :: deferred, rejected
+                    struct (decodes, prefills, deferredItem :: deferred, rejected)
                 | RejectedAdmission rejectedItem ->
-                    decodes, prefills, deferred, rejectedItem :: rejected)
-                ([], [], [], [])
+                    struct (decodes, prefills, deferred, rejectedItem :: rejected))
+                (struct ([], [], [], []))
 
         let decodes = List.rev decodesRev
         let prefills = List.rev prefillsRev
