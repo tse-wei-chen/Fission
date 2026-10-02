@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1.7
+
+ARG DOTNET_VERSION=10.0
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:13.4.2-cudnn-runtime-ubuntu24.04
+ARG APP_UID=1654
+
+FROM mcr.microsoft.com/dotnet/sdk:${DOTNET_VERSION} AS build
+WORKDIR /src
+
+COPY . .
+RUN dotnet restore src/Fission.Server/Fission.Server.csproj
+RUN dotnet publish src/Fission.Server/Fission.Server.csproj \
+    --configuration Release \
+    --no-restore \
+    --output /out \
+    /p:UseAppHost=false
+
+FROM mcr.microsoft.com/dotnet/aspnet:${DOTNET_VERSION}-noble AS dotnet-runtime
+
+FROM ${CUDA_RUNTIME_IMAGE} AS runtime
+ARG APP_UID
+
+WORKDIR /app
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libc6 \
+        libgcc-s1 \
+        libicu74 \
+        libssl3t64 \
+        libstdc++6 \
+        passwd \
+        tzdata \
+        zlib1g \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid "${APP_UID}" app \
+    && useradd --uid "${APP_UID}" --gid "${APP_UID}" --create-home app
+
+COPY --from=dotnet-runtime /usr/share/dotnet /usr/share/dotnet
+RUN ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet
+
+LABEL org.opencontainers.image.source="https://github.com/tse-wei-chen/Fission" \
+      org.opencontainers.image.title="Fission CUDA" \
+      org.opencontainers.image.description="Experimental Fission ONNX Runtime CUDA serving image"
+
+ENV DOTNET_ROOT=/usr/share/dotnet \
+    PATH=/usr/share/dotnet:${PATH} \
+    ASPNETCORE_URLS=http://+:8000 \
+    DOTNET_EnableDiagnostics=0 \
+    Fission__Backend=onnx \
+    Fission__ExecutionProvider=cuda \
+    Fission__Tokenizer=huggingface \
+    Fission__Device=cuda:0
+
+EXPOSE 8000
+STOPSIGNAL SIGINT
+
+COPY --from=build /out ./
+
+USER ${APP_UID}
+ENTRYPOINT ["dotnet", "Fission.Server.dll"]

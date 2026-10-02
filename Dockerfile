@@ -22,6 +22,9 @@ LABEL org.opencontainers.image.source="https://github.com/tse-wei-chen/Fission" 
 
 ENV ASPNETCORE_URLS=http://+:8000 \
     DOTNET_EnableDiagnostics=0 \
+    Fission__Backend=deterministic \
+    Fission__ExecutionProvider=cpu \
+    Fission__Tokenizer=deterministic \
     Fission__Device=cpu:0
 
 EXPOSE 8000
