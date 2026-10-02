@@ -385,6 +385,35 @@ module Scheduler =
 
         loop state orderedDecodes
 
+    let private selectMergedCandidates
+        (budget: ResourceBudget)
+        (policy: SchedulingPolicy)
+        (compareCandidates: ReadySequence -> ReadySequence -> int)
+        (initialState: SelectionState)
+        (orderedDecodes: ReadySequence list)
+        (orderedPrefills: ReadySequence list)
+        =
+        let rec loop state decodes prefills =
+            match decodes, prefills with
+            | [], [] -> state
+            | sequence :: tail, [] ->
+                loop (trySelect budget policy state sequence) tail []
+            | [], sequence :: tail ->
+                loop (trySelect budget policy state sequence) [] tail
+            | decode :: decodeTail, prefill :: prefillTail ->
+                if compareCandidates decode prefill <= 0 then
+                    loop
+                        (trySelect budget policy state decode)
+                        decodeTail
+                        prefills
+                else
+                    loop
+                        (trySelect budget policy state prefill)
+                        decodes
+                        prefillTail
+
+        loop initialState orderedDecodes orderedPrefills
+
     let private validateScheduleInputs
         (budget: ResourceBudget)
         (policy: SchedulingPolicy)
@@ -488,13 +517,17 @@ module Scheduler =
         let struct (afterReserve, remainingDecodes) =
             reserveDecodeTokens budget policy orderedDecodes initialState
 
-        let remainingCandidates =
-            remainingDecodes @ prefills
-            |> List.sortWith compareCandidates
+        let orderedPrefills =
+            prefills |> List.sortWith compareCandidates
 
         let finalState =
-            remainingCandidates
-            |> List.fold (fun state sequence -> trySelect budget policy state sequence) afterReserve
+            selectMergedCandidates
+                budget
+                policy
+                compareCandidates
+                afterReserve
+                remainingDecodes
+                orderedPrefills
 
         { Selected = List.rev finalState.SelectedRev
           Deferred = initiallyDeferred @ List.rev finalState.DeferredRev
