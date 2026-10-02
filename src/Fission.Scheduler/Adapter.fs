@@ -32,6 +32,39 @@ type SchedulingKernel() =
 
             fill 0 items
 
+    let mapOrderedAndReversedToArray
+        (mapping: 'T -> 'U)
+        (ordered: 'T list)
+        (reversed: 'T list)
+        =
+        match ordered, reversed with
+        | [], [] -> Array.empty<'U>
+        | _ ->
+            let orderedCount = List.length ordered
+            let reversedCount = List.length reversed
+            let mapped =
+                Array.zeroCreate<'U> (orderedCount + reversedCount)
+
+            let rec fillOrdered index remaining =
+                match remaining with
+                | [] -> ()
+                | item :: tail ->
+                    mapped[index] <- mapping item
+                    fillOrdered (index + 1) tail
+
+            let rec fillReversed index remaining =
+                match remaining with
+                | [] -> ()
+                | item :: tail ->
+                    mapped[index] <- mapping item
+                    fillReversed (index - 1) tail
+
+            fillOrdered 0 ordered
+            fillReversed
+                (orderedCount + reversedCount - 1)
+                reversed
+            mapped
+
     let toPhase (phase: SchedulingPhase) =
         match phase with
         | SchedulingPhase.Waiting -> Waiting
@@ -118,21 +151,23 @@ type SchedulingKernel() =
                   DeadlineUrgencyWindow = policy.DeadlineUrgencyWindow }
 
             let decision =
-                Scheduler.scheduleMappedReadOnlyAt
+                Scheduler.scheduleMappedReadOnlyRawAt
                     now
                     resourceBudget
                     schedulingPolicy
                     toCandidate
                     candidates
 
-            let batch = ScheduleCompiler.compile scheduleId decision
+            let batch = ScheduleCompiler.compileRaw scheduleId decision
 
             let deferred =
-                decision.Deferred
-                |> mapListToArray (fun (item: DeferredSequence) ->
-                    SchedulingDeferral(
-                        item.Sequence.SequenceId,
-                        toDeferralReason item.Reason))
+                mapOrderedAndReversedToArray
+                    (fun (item: DeferredSequence) ->
+                        SchedulingDeferral(
+                            item.Sequence.SequenceId,
+                            toDeferralReason item.Reason))
+                    decision.InitiallyDeferred
+                    decision.DeferredRev
 
             let rejected =
                 decision.Rejected

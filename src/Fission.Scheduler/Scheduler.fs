@@ -648,13 +648,25 @@ module Scheduler =
                     decodeStartIndex
                     orderedPrefills
 
-        { Selected = List.rev finalState.SelectedRev
-          Deferred = initiallyDeferred @ List.rev finalState.DeferredRev
+        { SelectedRev = finalState.SelectedRev
+          InitiallyDeferred = initiallyDeferred
+          DeferredRev = finalState.DeferredRev
           Rejected = rejected
           ConsumedTokens = finalState.UsedTokens
           ConsumedKvPages = finalState.UsedKvPages
           ConsumedKvBytes = finalState.UsedKvBytes
           ConsumedTransientKvBytes = finalState.UsedTransientKvBytes }
+
+    let private normalizeDecision (decision: RawSchedulingDecision) =
+        { Selected = List.rev decision.SelectedRev
+          Deferred =
+            decision.InitiallyDeferred
+            @ List.rev decision.DeferredRev
+          Rejected = decision.Rejected
+          ConsumedTokens = decision.ConsumedTokens
+          ConsumedKvPages = decision.ConsumedKvPages
+          ConsumedKvBytes = decision.ConsumedKvBytes
+          ConsumedTransientKvBytes = decision.ConsumedTransientKvBytes }
 
     let scheduleAt
         (now: DateTimeOffset)
@@ -674,6 +686,7 @@ module Scheduler =
             (List.rev prefillsRev)
             (List.rev deferredRev)
             (List.rev rejectedRev)
+        |> normalizeDecision
 
     let scheduleArrayAt
         (now: DateTimeOffset)
@@ -693,8 +706,9 @@ module Scheduler =
             prefills
             deferred
             rejected
+        |> normalizeDecision
 
-    let scheduleMappedReadOnlyAt
+    let internal scheduleMappedReadOnlyRawAt
         (now: DateTimeOffset)
         (budget: ResourceBudget)
         (policy: SchedulingPolicy)
@@ -713,6 +727,21 @@ module Scheduler =
             prefills
             deferred
             rejected
+
+    let scheduleMappedReadOnlyAt
+        (now: DateTimeOffset)
+        (budget: ResourceBudget)
+        (policy: SchedulingPolicy)
+        (mapping: 'T -> ReadySequence)
+        (sequences: System.Collections.Generic.IReadOnlyList<'T>)
+        =
+        scheduleMappedReadOnlyRawAt
+            now
+            budget
+            policy
+            mapping
+            sequences
+        |> normalizeDecision
 
     let schedule (budget: ResourceBudget) (policy: SchedulingPolicy) (sequences: ReadySequence list) =
         scheduleAt DateTimeOffset.UtcNow budget policy sequences
