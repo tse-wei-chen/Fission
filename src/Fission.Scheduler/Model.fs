@@ -3,6 +3,7 @@ namespace Fission.Scheduler
 open System
 open Fission.Abstractions
 
+[<Struct>]
 type SequencePhase =
     | Waiting
     | Prefilling
