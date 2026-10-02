@@ -24,10 +24,31 @@ jobs:
       - run: dotnet restore Fission.slnx
       - run: dotnet build Fission.slnx -c Release --no-restore
       - name: Report scheduler microbenchmark
-        run: dotnet run --project benchmarks/Fission.Scheduler.Benchmarks/Fission.Scheduler.Benchmarks.csproj -c Release --no-build -- 2000
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/benchmarks
+          dotnet run --project benchmarks/Fission.Scheduler.Benchmarks/Fission.Scheduler.Benchmarks.csproj -c Release --no-build -- 2000 \
+            | tee artifacts/benchmarks/scheduler.txt
+
+          {
+            echo "## Scheduler microbenchmark"
+            echo
+            echo '~~~text'
+            cat artifacts/benchmarks/scheduler.txt
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Run samples
         shell: pwsh
         run: ./eng/run-projects.ps1 -Root samples -Configuration Release -NoBuild
       - name: Run specs
         shell: pwsh
         run: ./eng/run-projects.ps1 -Root tests -Configuration Release -NoBuild
+      - name: Upload scheduler benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduler-benchmark-${{ github.run_id }}
+          path: artifacts/benchmarks
+          if-no-files-found: ignore
+          retention-days: 14
