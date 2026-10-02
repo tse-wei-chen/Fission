@@ -1,0 +1,1 @@
+Write a detailed technical explanation of continuous batching for autoregressive transformer inference. Cover prefill, decode, request interleaving, KV-cache state, token-level scheduling, backpressure, cancellation, and why throughput and per-token latency can move in opposite directions.
