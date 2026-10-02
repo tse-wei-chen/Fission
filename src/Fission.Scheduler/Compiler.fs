@@ -8,10 +8,10 @@ module ScheduleCompiler =
     let private toWorkItem (selectedItem: ScheduledSequence) =
         let kind, completesPrefill =
             match selectedItem.Sequence.Phase with
-            | Prefilling ->
+            | SchedulingPhase.Prefilling ->
                 ScheduledWorkKind.Prefill,
                 selectedItem.TokenGrant >= selectedItem.Sequence.TokenDemand
-            | Decoding -> ScheduledWorkKind.Decode, false
+            | SchedulingPhase.Decoding -> ScheduledWorkKind.Decode, false
             | phase -> invalidOp $"Cannot compile non-runnable phase {phase}."
 
         ScheduledWorkItem(
