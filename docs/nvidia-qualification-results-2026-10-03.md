@@ -71,7 +71,7 @@ The memory-gate serving rows were:
 | gpu-decode-extended | 32 | 256 | 1113.12 | 72.64 | 28.57 | 7359.24 |
 | gpu-long-context | 1 | 64 | 110.08 | 53.38 | 8.23 | 631.84 |
 | gpu-long-context | 4 | 64 | 94.42 | 798.44 | 30.10 | 2760.63 |
-| gpu-long-context | 8 | 64 | 94.30 | 1249.14 | 66.48 | 80.81 |
+| gpu-long-context | 8 | 64 | 94.30 | 1249.14 | 66.48 | 5563.23 |
 | gpu-long-context | 16 | 64 | 98.08 | 2399.03 | 125.01 | 10437.78 |
 | gpu-short-high-concurrency | 8 | 32 | 485.19 | 33.24 | 15.53 | 583.40 |
 | gpu-short-high-concurrency | 16 | 32 | 869.27 | 43.25 | 17.56 | 661.09 |
