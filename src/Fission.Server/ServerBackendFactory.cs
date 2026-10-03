@@ -202,6 +202,9 @@ public static class ServerBackendFactory
             });
 
         DecoderOnlyOnnxExecutionAdapter? adapter = null;
+        OptimumLegacyCudaGqaSafeBinding? binding = null;
+        CudaDeviceBoundAsyncCopyEngine? copyEngine = null;
+        CudaOnnxOwnedResources? ownedResources = null;
         try
         {
             var poolController = new CudaDeviceMemoryPoolController(pool);
@@ -224,12 +227,25 @@ public static class ServerBackendFactory
                         });
             }
 
-            var binding = new OptimumLegacyCudaFloatDecoderBinding(
+            var innerBinding = new OptimumLegacyCudaFloatDecoderBinding(
                 profile,
                 pool,
                 eosTokenIds,
                 decodeLogitsHostAllocator: decodeLogitsHostAllocator);
+            copyEngine = new CudaDeviceBoundAsyncCopyEngine(
+                cudaDeviceId,
+                new CudaAsyncCopyEngineOptions
+                {
+                    RuntimeLibraryPath = runtimeLibraryPath
+                });
+            var gatheringBinding = new OptimumLegacyCudaGatheringBinding(
+                profile,
+                pool,
+                copyEngine,
+                innerBinding);
+            binding = new OptimumLegacyCudaGqaSafeBinding(gatheringBinding);
             adapter = new DecoderOnlyOnnxExecutionAdapter(binding);
+            ownedResources = new CudaOnnxOwnedResources(copyEngine, pool);
 
             return new OnnxRuntimeBackend(
                 new OnnxRuntimeBackendOptions(
@@ -243,12 +259,30 @@ public static class ServerBackendFactory
                 OnnxRuntimeSessionOptions.Cuda(
                     cudaDeviceId,
                     ortProfileOutputPathPrefix),
-                ownedResource: pool);
+                ownedResource: ownedResources);
         }
         catch
         {
             adapter?.Dispose();
-            pool.Dispose();
+            if (adapter is null)
+            {
+                binding?.Dispose();
+            }
+
+            if (ownedResources is not null)
+            {
+                ownedResources.Dispose();
+            }
+            else
+            {
+                if (copyEngine is not null)
+                {
+                    copyEngine.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                }
+
+                pool.Dispose();
+            }
+
             throw;
         }
     }
