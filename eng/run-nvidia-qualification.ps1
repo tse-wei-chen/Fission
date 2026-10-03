@@ -107,10 +107,7 @@ if ($GpuTelemetry) {
 
         while (-not (Test-Path -LiteralPath $StopPath)) {
             $rows = @(
-                & $NvidiaSmiPath \
-                    "--id=$DeviceId" \
-                    "--query-gpu=memory.used,memory.total,utilization.gpu,utilization.memory,temperature.gpu" \
-                    "--format=csv,noheader,nounits" 2>$null
+                & $NvidiaSmiPath "--id=$DeviceId" "--query-gpu=memory.used,memory.total,utilization.gpu,utilization.memory,temperature.gpu" "--format=csv,noheader,nounits" 2>$null
             )
             if ($LASTEXITCODE -eq 0 -and $rows.Count -eq 1) {
                 $parts = @([string] $rows[0] -split ",\s*", 5)
@@ -152,7 +149,7 @@ try {
         Repetitions = $Repetitions
     }
     if ($NoBuild) {
-        $runnerArguments.NoBuild = $true
+        $runnerArguments["NoBuild"] = $true
     }
 
     & $benchmarkRunner @runnerArguments
@@ -199,12 +196,14 @@ if ($candidates.Count -eq 0) {
 
 $runRoot = $candidates[0].FullName
 $resultsRoot = Join-Path $runRoot "results"
-& $resultValidator \
-    -ManifestPath $manifest \
-    -ResultsRoot $resultsRoot \
-    -Label $Label \
-    -Repetitions $Repetitions \
-    -Model $ModelId
+$validatorArguments = @{
+    ManifestPath = $manifest
+    ResultsRoot = $resultsRoot
+    Label = $Label
+    Repetitions = $Repetitions
+    Model = $ModelId
+}
+& $resultValidator @validatorArguments
 
 if ($GpuTelemetry) {
     if (-not (Test-Path -LiteralPath $telemetryTempPath -PathType Leaf)) {
