@@ -9,7 +9,8 @@ As of 2026-10-03, the checked-in high-concurrency/long-context suite has passed
 30/30 completeness with zero failures and exact usage, the separate GPU
 telemetry memory gate has passed 10/10 rows with substantial VRAM headroom, and
 the observed structural CUDA-placement gate has passed for
-`GroupQueryAttention`. The remaining promotion question is semantic behavior.
+`GroupQueryAttention`. The remaining promotion question is semantic behavior
+with non-vacuous coverage across every checked-in semantic category.
 
 Keep the FP32 page-locked path available as the compatibility fallback while
 the semantic gate remains open.
@@ -117,6 +118,34 @@ IDs and decoded text, writes JSON/Markdown reports, and cleans up both servers.
 The dual-server run is semantic evidence only; do not treat latency from this
 configuration as a serving benchmark.
 
+### Coverage is separate from equality
+
+A token sequence can be exactly equal while still providing no semantic
+coverage. The first hardware semantic run demonstrated this boundary:
+
+- `short-factual`: 24 FP32 / 24 FP16 tokens, exact;
+- `instruction-following`: 64 / 64, exact;
+- `structured-text`: 96 / 96, exact;
+- `code-formatting`: 0 / 0, vacuous exact;
+- `long-context-reasoning`: 0 / 0, vacuous exact;
+- `long-generation`: 0 / 0, vacuous exact.
+
+The three covered cases provide 184 generated tokens with identical raw token
+IDs and decoded text. That is strong positive parity evidence for those cases,
+but it does not close the semantic gate for the three categories that generated
+nothing.
+
+Each checked-in corpus case therefore declares `min_generated_tokens`. The
+comparator records baseline/candidate coverage independently and fails the run
+when either endpoint is below the case minimum, even if both token sequences
+are empty and technically equal. The current corpus requires at least one token
+for every semantic category and at least 64 generated tokens for
+`long-generation`.
+
+The three formerly vacuous prompts use continuation-style unfinished prefixes,
+which are more appropriate for the completion endpoint than standalone
+instructions that the model may consider terminal.
+
 Example:
 
 ```powershell
@@ -134,12 +163,12 @@ pwsh ./eng/run-nvidia-semantic-parity.ps1 `
   -CandidateSampledTokenIdsOutput fission_sampled_token_ids
 ```
 
-The default gate records exact-token matches, exact-text matches, common token
-prefix lengths/ratios, first divergence indices, full token IDs, and decoded
-text. It does not fail merely because FP16 diverges from FP32. Review divergence
-case by case and distinguish exact token parity from application-level semantic
-acceptability. Use `-RequireExactTokens` only when intentionally running the
-stricter all-cases-exact experiment.
+A promotion-valid report must first show full coverage. Then review exact-token
+matches, exact-text matches, common token prefix lengths/ratios, first
+divergence indices, full token IDs, and decoded text. The default gate does not
+fail merely because a covered FP16 generation diverges from FP32; review any
+such divergence case by case. Use `-RequireExactTokens` only when intentionally
+running the stricter all-cases-exact experiment.
 
 ## Promotion rule
 
@@ -152,7 +181,8 @@ when:
   exact accounting — **passed**;
 - the memory/headroom telemetry remains within the validated envelope —
   **passed**;
-- semantic/token comparison has been reviewed;
+- every semantic corpus case meets its generated-token coverage minimum and the
+  resulting FP32-versus-FP16 token/text comparison has been reviewed;
 - the FP32 page-locked path remains selectable as a compatibility fallback.
 
 After promotion, continue to treat new GPUs, ORT versions, CUDA versions, model

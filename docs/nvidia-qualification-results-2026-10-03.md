@@ -2,7 +2,8 @@
 
 This note records the RTX 3060 + SmolLM2-135M-Instruct FP16 CUDA/GQA
 qualification sequence. The serving qualification, memory gate, and observed
-structural CUDA-placement gate all passed.
+structural CUDA-placement gate all passed. The semantic promotion gate remains
+open pending non-vacuous coverage of every checked-in semantic case.
 
 ## Final qualification status
 
@@ -109,6 +110,38 @@ for approximately 49.97% of observed summed node duration and CUDA
 GroupQueryAttention approximately 21.72%. Host/device Memcpy is no longer the
 observed hot-path bottleneck.
 
+## First semantic parity run — exact where covered, coverage incomplete
+
+The first FP32-versus-FP16 semantic runner reported six of six exact-token and
+exact-text cases with a 100% mean common-prefix ratio. That headline is not a
+complete promotion result because three cases generated zero tokens on both
+endpoints.
+
+| Case | Generated tokens per endpoint | Interpretation |
+| --- | ---: | --- |
+| short-factual | 24 | exact, covered |
+| instruction-following | 64 | exact, covered |
+| code-formatting | 0 | vacuous exact |
+| structured-text | 96 | exact, covered |
+| long-context-reasoning | 0 | vacuous exact |
+| long-generation | 0 | vacuous exact |
+
+The three covered cases contribute 184 generated tokens. Their FP32 and FP16
+raw token IDs and decoded text are identical. This is useful positive evidence,
+but zero-token equality does not exercise code generation, long-context
+reasoning, or long generation.
+
+The corpus and comparator therefore now carry an explicit
+`min_generated_tokens` coverage contract. Every checked-in case must generate
+at least one token on both endpoints; `long-generation` requires at least 64
+generated tokens. The comparator writes coverage status into its JSON/Markdown
+report and fails the promotion run when any case misses its minimum, even if the
+two empty token sequences are technically equal.
+
+The prompts for the three vacuous cases were also changed to continuation-style
+prefixes so the completion endpoint is asked to continue an unfinished answer
+rather than decide that an instruction is already terminal.
+
 ## Earlier partial evidence
 
 Before the GQA continuation-prefill and FP16 gathered-KV fixes, the first
@@ -120,10 +153,9 @@ and forced the missing C=4/8/16 long-context cases to be fixed and rerun.
 ## Remaining promotion gate
 
 The high-concurrency/long-context completeness gate, memory-headroom gate, and
-observed structural CUDA-placement gate are now closed for this
-hardware/model/runtime tuple. The remaining promotion gate is semantic review:
-compare FP32 and FP16 deterministic generations with the checked-in semantic
-parity corpus using raw generated token IDs and decoded text.
+observed structural CUDA-placement gate are closed for this
+hardware/model/runtime tuple. The remaining promotion gate is semantic review
+with complete generated-token coverage across the checked-in corpus.
 
 Keep the FP32 page-locked path selectable as a compatibility fallback. New GPU
 models, ORT/CUDA versions, model families, and precision formats remain separate

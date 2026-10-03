@@ -120,13 +120,22 @@ foreach ($case in $cases) {
     $name = [string] $case.name
     $prompt = [string] $case.prompt
     $maxTokens = [int] $case.max_tokens
+    $minGeneratedProperty = $case.PSObject.Properties["min_generated_tokens"]
+    $minGeneratedTokens = if ($null -eq $minGeneratedProperty) {
+        0
+    } else {
+        [int] $minGeneratedProperty.Value
+    }
+
     if ([string]::IsNullOrWhiteSpace($name) -or
         [string]::IsNullOrWhiteSpace($prompt) -or
-        $maxTokens -le 0) {
+        $maxTokens -le 0 -or
+        $minGeneratedTokens -lt 0 -or
+        $minGeneratedTokens -gt $maxTokens) {
         throw "Semantic parity case '$name' is invalid."
     }
 
-    Write-Host "==> semantic parity / $name"
+    Write-Host "==> semantic parity / $name (min generated tokens: $minGeneratedTokens)"
     $baseline = Invoke-ControlGenerate `
         -BaseUrl $BaselineBaseUrl `
         -ControlToken $BaselineControlToken `
@@ -152,12 +161,21 @@ foreach ($case in $cases) {
     $exactTokens = $baselineTokens.Length -eq $candidateTokens.Length -and
         $prefix -eq $baselineTokens.Length
     $firstDivergence = if ($exactTokens) { $null } else { $prefix }
+    $baselineCoveragePassed = $baselineTokens.Length -ge $minGeneratedTokens
+    $candidateCoveragePassed = $candidateTokens.Length -ge $minGeneratedTokens
+    $coveragePassed = $baselineCoveragePassed -and $candidateCoveragePassed
+    $vacuous = $baselineTokens.Length -eq 0 -and $candidateTokens.Length -eq 0
 
     $results.Add([pscustomobject]@{
         name = $name
         max_tokens = $maxTokens
+        min_generated_tokens = $minGeneratedTokens
         baseline_token_count = $baselineTokens.Length
         candidate_token_count = $candidateTokens.Length
+        baseline_coverage_passed = $baselineCoveragePassed
+        candidate_coverage_passed = $candidateCoveragePassed
+        coverage_passed = $coveragePassed
+        vacuous = $vacuous
         common_prefix_tokens = $prefix
         common_prefix_ratio = $prefixRatio
         first_divergence_index = $firstDivergence
@@ -174,10 +192,20 @@ foreach ($case in $cases) {
 
 $exactTokenCases = @($results | Where-Object { $_.exact_tokens }).Count
 $exactTextCases = @($results | Where-Object { $_.exact_text }).Count
+$coveragePassedCases = @($results | Where-Object { $_.coverage_passed }).Count
+$coverageFailedCases = $results.Count - $coveragePassedCases
+$vacuousCases = @($results | Where-Object { $_.vacuous }).Count
+$exactCoveredTokenCases = @($results | Where-Object { $_.coverage_passed -and $_.exact_tokens }).Count
 $meanPrefixRatio = [double] (($results | Measure-Object -Property common_prefix_ratio -Average).Average)
+$coveredResults = @($results | Where-Object { $_.coverage_passed })
+$meanCoveredPrefixRatio = if ($coveredResults.Count -eq 0) {
+    0.0
+} else {
+    [double] (($coveredResults | Measure-Object -Property common_prefix_ratio -Average).Average)
+}
 
 $report = [ordered]@{
-    schema_version = 1
+    schema_version = 2
     generated_at_utc = [DateTimeOffset]::UtcNow.ToString("O")
     model = $ModelId
     corpus = $corpusPath
@@ -186,9 +214,14 @@ $report = [ordered]@{
     cases = $results
     summary = [ordered]@{
         case_count = $results.Count
+        coverage_passed_cases = $coveragePassedCases
+        coverage_failed_cases = $coverageFailedCases
+        vacuous_cases = $vacuousCases
         exact_token_cases = $exactTokenCases
         exact_text_cases = $exactTextCases
+        exact_covered_token_cases = $exactCoveredTokenCases
         mean_common_prefix_ratio = $meanPrefixRatio
+        mean_covered_common_prefix_ratio = $meanCoveredPrefixRatio
     }
 }
 
@@ -205,18 +238,24 @@ $lines.Add("")
 $lines.Add(("Model: {0}{1}{0}" -f [char]96, $ModelId))
 $lines.Add("")
 $lines.Add("- Cases: $($results.Count)")
+$lines.Add("- Coverage-passed cases: $coveragePassedCases/$($results.Count)")
+$lines.Add("- Vacuous zero-token cases: $vacuousCases")
 $lines.Add("- Exact token cases: $exactTokenCases/$($results.Count)")
+$lines.Add("- Exact token cases with valid coverage: $exactCoveredTokenCases/$($results.Count)")
 $lines.Add("- Exact text cases: $exactTextCases/$($results.Count)")
 $lines.Add("- Mean common token-prefix ratio: $("{0:P2}" -f $meanPrefixRatio)")
+$lines.Add("- Mean common token-prefix ratio across covered cases: $("{0:P2}" -f $meanCoveredPrefixRatio)")
 $lines.Add("")
-$lines.Add("| Case | Baseline tokens | Candidate tokens | Common prefix | Prefix ratio | Exact tokens | Exact text |")
-$lines.Add("| --- | ---: | ---: | ---: | ---: | --- | --- |")
+$lines.Add("| Case | Min generated | Baseline tokens | Candidate tokens | Coverage | Common prefix | Prefix ratio | Exact tokens | Exact text |")
+$lines.Add("| --- | ---: | ---: | ---: | --- | ---: | ---: | --- | --- |")
 foreach ($result in $results) {
+    $coverageLabel = if ($result.coverage_passed) { "PASS" } else { "FAIL" }
     $lines.Add(
-        "| $(Escape-Markdown $result.name) | $($result.baseline_token_count) | $($result.candidate_token_count) | $($result.common_prefix_tokens) | $("{0:P2}" -f $result.common_prefix_ratio) | $($result.exact_tokens) | $($result.exact_text) |")
+        "| $(Escape-Markdown $result.name) | $($result.min_generated_tokens) | $($result.baseline_token_count) | $($result.candidate_token_count) | $coverageLabel | $($result.common_prefix_tokens) | $("{0:P2}" -f $result.common_prefix_ratio) | $($result.exact_tokens) | $($result.exact_text) |")
 }
 $lines.Add("")
 $lines.Add("Token IDs and full decoded text for both endpoints are preserved in the JSON report.")
+$lines.Add("A case is promotion-valid only when both endpoints meet its min_generated_tokens requirement.")
 
 $markdownFullPath = [System.IO.Path]::GetFullPath($OutputMarkdown)
 $markdownDirectory = Split-Path -Parent $markdownFullPath
@@ -226,6 +265,11 @@ if (-not [string]::IsNullOrWhiteSpace($markdownDirectory)) {
 $lines | Set-Content -LiteralPath $markdownFullPath -Encoding UTF8
 
 Get-Content -LiteralPath $markdownFullPath
+
+if ($coverageFailedCases -ne 0) {
+    $failedNames = @($results | Where-Object { -not $_.coverage_passed } | ForEach-Object { $_.name }) -join ", "
+    throw "Semantic parity coverage gate failed: $coveragePassedCases/$($results.Count) case(s) met minimum generated-token coverage. Failed: $failedNames."
+}
 
 if ($RequireExactTokens -and $exactTokenCases -ne $results.Count) {
     throw "Semantic parity failed exact-token gate: $exactTokenCases/$($results.Count) case(s) matched exactly."
