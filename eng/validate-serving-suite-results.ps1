@@ -54,37 +54,37 @@ foreach ($workload in @($definition.workloads)) {
             try {
                 $report = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
                 if ([int] $report.concurrency -ne $concurrency) {
-                    $failures.Add("$path: concurrency=$($report.concurrency), expected $concurrency.")
+                    $failures.Add("${path}: concurrency=$($report.concurrency), expected $concurrency.")
                     continue
                 }
                 if ([int] $report.max_tokens -ne $maxTokens) {
-                    $failures.Add("$path: max_tokens=$($report.max_tokens), expected $maxTokens.")
+                    $failures.Add("${path}: max_tokens=$($report.max_tokens), expected $maxTokens.")
                     continue
                 }
                 if ([int] $report.total_requests -ne $requests) {
-                    $failures.Add("$path: total_requests=$($report.total_requests), expected $requests.")
+                    $failures.Add("${path}: total_requests=$($report.total_requests), expected $requests.")
                     continue
                 }
                 if ([int] $report.successful_requests -ne $requests -or
                     [int] $report.failed_requests -ne 0) {
                     $failures.Add(
-                        "$path: successful=$($report.successful_requests), failed=$($report.failed_requests); expected $requests/0.")
+                        "${path}: successful=$($report.successful_requests), failed=$($report.failed_requests); expected $requests/0.")
                     continue
                 }
                 if (-not [bool] $report.all_token_counts_from_usage) {
-                    $failures.Add("$path: token usage accounting is approximate, expected exact usage.")
+                    $failures.Add("${path}: token usage accounting is approximate, expected exact usage.")
                     continue
                 }
                 if (-not [string]::IsNullOrWhiteSpace($Model) -and
                     [string] $report.model -ne $Model) {
-                    $failures.Add("$path: model='$($report.model)', expected '$Model'.")
+                    $failures.Add("${path}: model='$($report.model)', expected '$Model'.")
                     continue
                 }
 
                 $validated++
             }
             catch {
-                $failures.Add("$path: $($_.Exception.Message)")
+                $failures.Add("${path}: $($_.Exception.Message)")
             }
         }
     }
