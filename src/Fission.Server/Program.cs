@@ -65,7 +65,7 @@ if (startupProbe is not null)
 }
 
 OpenAiEndpoints.Map(app, worker, textCodec);
-ServerControlEndpoints.Map(app, builder.Configuration);
+ServerControlEndpoints.Map(app, builder.Configuration, worker, textCodec);
 await app.RunAsync();
 
 static int ReadPositiveInt(string? value, int fallback)
