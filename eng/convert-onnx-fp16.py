@@ -10,6 +10,30 @@ import onnx
 from onnx import TensorProto
 
 
+_OPTIONAL_OUTPUT_PLACEHOLDER_PREFIX = "__fission_optional_output_"
+
+
+def protect_empty_optional_outputs(model: onnx.ModelProto) -> int:
+    """Give empty optional outputs unique names while the converter sorts nodes."""
+    protected = 0
+    for node_index, node in enumerate(model.graph.node):
+        for output_index, output in enumerate(node.output):
+            if output:
+                continue
+            node.output[output_index] = (
+                f"{_OPTIONAL_OUTPUT_PLACEHOLDER_PREFIX}{node_index}_{output_index}"
+            )
+            protected += 1
+    return protected
+
+
+def restore_empty_optional_outputs(model: onnx.ModelProto) -> None:
+    for node in model.graph.node:
+        for output_index, output in enumerate(node.output):
+            if output.startswith(_OPTIONAL_OUTPUT_PLACEHOLDER_PREFIX):
+                node.output[output_index] = ""
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -66,11 +90,13 @@ def main() -> None:
         and value.type.tensor_type.elem_type == TensorProto.FLOAT
     )
 
+    protected_optional_outputs = protect_empty_optional_outputs(model)
     converted = float16.convert_float_to_float16(
         model,
         keep_io_types=False,
         disable_shape_infer=True,
     )
+    restore_empty_optional_outputs(converted)
 
     remaining_float_initializers = [
         initializer.name
@@ -112,7 +138,8 @@ def main() -> None:
         f"Converted {source} -> {destination}; "
         f"float32 initializers before={before_initializers}, "
         f"float32 initializers remaining={len(remaining_float_initializers)}, "
-        f"float32 graph IO converted={before_float_io}."
+        f"float32 graph IO converted={before_float_io}, "
+        f"optional outputs preserved={protected_optional_outputs}."
     )
 
 
