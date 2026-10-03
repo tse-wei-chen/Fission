@@ -19,6 +19,9 @@ on:
       - eng/run-serving-suite.ps1
       - eng/run-nvidia-smoke.ps1
       - eng/run-nvidia-serving-benchmark.ps1
+      - eng/run-nvidia-qualification.ps1
+      - eng/validate-serving-suite-results.ps1
+      - eng/compare-serving-semantic-parity.ps1
       - eng/summarize-ort-profile.ps1
       - eng/add-greedy-argmax-output.py
       - eng/convert-onnx-fp16.py
@@ -41,6 +44,9 @@ on:
       - eng/run-serving-suite.ps1
       - eng/run-nvidia-smoke.ps1
       - eng/run-nvidia-serving-benchmark.ps1
+      - eng/run-nvidia-qualification.ps1
+      - eng/validate-serving-suite-results.ps1
+      - eng/compare-serving-semantic-parity.ps1
       - eng/summarize-ort-profile.ps1
       - eng/add-greedy-argmax-output.py
       - eng/convert-onnx-fp16.py
@@ -74,6 +80,9 @@ jobs:
           foreach ($path in @(
             "./eng/run-nvidia-smoke.ps1",
             "./eng/run-nvidia-serving-benchmark.ps1",
+            "./eng/run-nvidia-qualification.ps1",
+            "./eng/validate-serving-suite-results.ps1",
+            "./eng/compare-serving-semantic-parity.ps1",
             "./eng/summarize-ort-profile.ps1"
           )) {
             $tokens = $null
@@ -169,6 +178,11 @@ jobs:
             }
           }
 
+          $parity = Get-Content ./benchmarks/serving/semantic-parity.json -Raw | ConvertFrom-Json
+          if ($parity.schema_version -ne 1 -or @($parity.cases).Count -lt 4) {
+            throw "Semantic parity corpus must use schema_version 1 and contain at least four cases."
+          }
+
       - name: Build image
         run: docker build --tag fission:ci .
 
@@ -233,6 +247,36 @@ jobs:
           assert payload['usage']['completion_tokens'] == 2, payload
           PY
 
+          unauthorized_generate_status="$(curl --silent --output /tmp/fission-control-generate-unauthorized.json \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --data '{"model":"container-smoke","prompt":"hello","max_tokens":2}' \
+            http://127.0.0.1:18000/internal/control/generate)"
+          if [ "$unauthorized_generate_status" -ne 401 ]; then
+            echo "Expected unauthenticated control generation to return 401, got $unauthorized_generate_status." >&2
+            exit 1
+          fi
+
+          curl --fail --silent --show-error \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --header 'X-Fission-Control-Token: ci-control-token' \
+            --data '{"model":"container-smoke","prompt":"hello","max_tokens":2}' \
+            http://127.0.0.1:18000/internal/control/generate > /tmp/fission-control-generate.json
+
+          python3 - <<'PY'
+          import json
+
+          with open('/tmp/fission-control-generate.json', encoding='utf-8') as handle:
+              payload = json.load(handle)
+
+          assert len(payload['token_ids']) == 2, payload
+          assert payload['completion_tokens'] == 2, payload
+          assert payload['finish_reason'] == 'length', payload
+          assert isinstance(payload['text'], str), payload
+          PY
+
           pwsh ./eng/run-serving-suite.ps1 \
             -Label fission-ci \
             -BaseUrl http://127.0.0.1:18000 \
@@ -240,6 +284,13 @@ jobs:
             -Manifest benchmarks/serving/workloads.ci.json \
             -OutputDirectory artifacts/serving-ci \
             -Configuration Release
+
+          pwsh ./eng/validate-serving-suite-results.ps1 \
+            -ManifestPath benchmarks/serving/workloads.ci.json \
+            -ResultsRoot artifacts/serving-ci \
+            -Label fission-ci \
+            -Repetitions 1 \
+            -Model container-loadgen
 
           dotnet run \
             --project benchmarks/Fission.Serving.Reporter/Fission.Serving.Reporter.csproj \
