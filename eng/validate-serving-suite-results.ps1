@@ -97,8 +97,9 @@ Write-Host "  expected:  $expected"
 Write-Host "  validated: $validated"
 
 if ($failures.Count -gt 0) {
+    Write-Host "  issues:    $($failures.Count)"
     foreach ($failure in $failures) {
-        Write-Error $failure
+        Write-Error -Message $failure -ErrorAction Continue
     }
     throw "Serving suite completeness gate failed: $($failures.Count) issue(s)."
 }
