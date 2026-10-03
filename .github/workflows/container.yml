@@ -144,15 +144,29 @@ jobs:
           python3 -m py_compile ./eng/add-greedy-argmax-output.py
           python3 -m py_compile ./eng/convert-onnx-fp16.py
 
-      - name: Validate GPU serving smoke manifest
+      - name: Validate GPU serving manifests
         shell: pwsh
         run: |
-          $manifest = Get-Content ./benchmarks/serving/workloads.gpu-smoke.json -Raw | ConvertFrom-Json
-          if ($manifest.schema_version -ne 1) {
-            throw "GPU serving smoke manifest must use schema_version 1."
-          }
-          if (@($manifest.workloads).Count -eq 0) {
-            throw "GPU serving smoke manifest must contain workloads."
+          foreach ($manifestPath in @(
+            "./benchmarks/serving/workloads.gpu-smoke.json",
+            "./benchmarks/serving/workloads.gpu-qualification.json"
+          )) {
+            $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+            if ($manifest.schema_version -ne 1) {
+              throw "$manifestPath must use schema_version 1."
+            }
+            if (@($manifest.workloads).Count -eq 0) {
+              throw "$manifestPath must contain workloads."
+            }
+            foreach ($workload in @($manifest.workloads)) {
+              if ([string]::IsNullOrWhiteSpace([string] $workload.prompt_file)) {
+                throw "$manifestPath workload '$($workload.name)' must specify prompt_file."
+              }
+              $promptPath = Join-Path ./benchmarks/serving ([string] $workload.prompt_file)
+              if (-not (Test-Path -LiteralPath $promptPath -PathType Leaf)) {
+                throw "$manifestPath workload '$($workload.name)' references missing prompt '$promptPath'."
+              }
+            }
           }
 
       - name: Build image

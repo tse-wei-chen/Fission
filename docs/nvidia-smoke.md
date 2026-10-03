@@ -1,187 +1,34 @@
-# NVIDIA real-model smoke
+# NVIDIA real-model smoke and performance evidence
 
-This smoke is the first hardware gate for the ONNX Runtime CUDA serving path. It
-runs one real prompt through the same production composition used by
-`Fission.Server` and exits before opening an HTTP listener.
+This document records the real NVIDIA validation path for Fission. Hosted CI remains self-contained and does not claim real GPU validation.
 
-## What it verifies
+## Validated host
 
-The one-shot probe covers:
+The current hardware evidence was collected on:
 
-```text
-tokenizer.json
-  -> Hugging Face prompt encoding
-  -> InferenceWorker
-  -> F# scheduling / C# runtime
-  -> KV reservation and lifecycle
-  -> ONNX Runtime CUDA Execution Provider
-  -> CUDA-resident decoder binding
-  -> generated token history
-  -> request-scoped text decoder
-```
+- NVIDIA GeForce RTX 3060
+- 12,288 MiB VRAM
+- NVIDIA driver 610.74
+- CUDA 13.4 runtime (`cudart64_13.dll`)
+- SmolLM2-135M-Instruct
+- 30 transformer layers
+- 3 KV heads
+- head dimension 64
+- vocabulary size 49,152
+- EOS token id 2
 
-A zero exit code means the configured model generated at least one token, reached
-a terminal inference reason, released its runtime/KV ownership, and returned
-control to the process. It is deliberately stronger than checking that an ONNX
-session can be constructed.
+The one-shot startup probe covers tokenizer -> server worker -> scheduler/runtime/KV -> ONNX Runtime backend -> request decoder and requires at least one generated token plus a terminal reason.
 
-## Host prerequisites
+## Initial FP32 CUDA validation
 
-- .NET 10 SDK.
-- An NVIDIA GPU visible to `nvidia-smi`.
-- NVIDIA CUDA and cuDNN libraries compatible with the
-  `Microsoft.ML.OnnxRuntime.Gpu` version referenced by the repository.
-- A decoder-with-past ONNX graph matching Fission's current Optimum legacy FP32
-  decoder contract.
-- The matching Hugging Face `tokenizer.json`.
-- Correct decoder geometry: hidden-layer count, KV-head count, head dimension,
-  vocabulary size, and model EOS token ids when applicable.
+The first functional CUDA startup probe completed successfully with one prompt token and one generated token. ONNX Runtime reported that 121 Memcpy nodes were inserted into the graph and that some shape/non-preferred nodes executed on CPU. That established functional CUDA execution for this exact host/model stack but did not establish performance qualification.
 
-ONNX Runtime changes its CUDA/cuDNN package matrix over time. Check the official
-CUDA Execution Provider compatibility table for the exact package version in
-`src/Fission.Backends.OnnxRuntime/Fission.Backends.OnnxRuntime.csproj` instead
-of assuming a CUDA major version from the driver alone:
+The first serving benchmark showed that continuous batching was working: output throughput scaled with concurrency instead of degrading into scalar decode. At `gpu-short` concurrency 8 the engine reached roughly 173 output tok/s, while `gpu-decode` concurrency 8 reached roughly 124 output tok/s. This moved the investigation from scheduler batch formation to work inside the batched ORT/CUDA step.
 
-<https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html>
-
-## Run
-
-Build and execute the one-shot probe from the repository root:
-
-```powershell
-pwsh ./eng/run-nvidia-smoke.ps1 `
-  -ModelPath /models/model/decoder_with_past_model.onnx `
-  -TokenizerPath /models/model/tokenizer.json `
-  -ModelId model-smoke `
-  -NumHiddenLayers <layers> `
-  -NumKvHeads <kv-heads> `
-  -HeadDim <head-dim> `
-  -VocabularySize <vocabulary-size> `
-  -EosTokenIds "<comma-separated-token-ids>"
-```
-
-Optional controls include:
-
-- `-CudaDeviceId` (default `0`)
-- `-Prompt` (default `Hello`)
-- `-MaxTokens` (default `1`)
-- `-TimeoutSeconds` (default `120`)
-- `-ChatTemplate none|chatml|qwen2|llama3`
-- `-CudaRuntimeLibraryPath` when the CUDA Runtime cannot be resolved normally. When supplied, its parent directory is also prepended to the child process library search path (`PATH` on Windows, `LD_LIBRARY_PATH` elsewhere).
-- `-NoBuild` when `Fission.Server` is already built
-
-The script never logs generated text. `Fission.Server` logs model id, prompt and
-generated token counts, finish reason, and elapsed time.
-
-## Success criteria
-
-The command must:
-
-1. show the intended NVIDIA device through `nvidia-smi`;
-2. initialize the CUDA Runtime and ONNX Runtime CUDA Execution Provider;
-3. load the configured decoder-with-past model and tokenizer;
-4. complete at least one generated token before the timeout;
-5. log `Startup inference probe succeeded`;
-6. log the one-shot completion message and exit with code `0`.
-
-Any model contract mismatch, missing provider library, tokenizer mismatch,
-scheduler/runtime failure, timeout, or decode failure must leave a non-zero
-process exit.
-
-## CI boundary
-
-Hosted CI does not claim NVIDIA hardware validation. The container workflow runs
-the same one-shot exit path with the deterministic backend so the control-flow
-contract cannot silently regress. Real CUDA validation evidence must come from an
-NVIDIA host using the command above.
-
-## Recorded hardware validation
-
-The first real NVIDIA validation was recorded on 2026-10-02 with this exact
-functional matrix:
-
-| Component | Observed value |
-| --- | --- |
-| GPU | NVIDIA GeForce RTX 3060 |
-| Device memory | 12288 MiB |
-| NVIDIA driver | 610.74 |
-| CUDA toolkit/runtime | CUDA 13.4 with explicit `cudart64_13.dll` |
-| ONNX Runtime GPU package | 1.30.0 |
-| Model | `SmolLM2-135M-Instruct` |
-| ONNX graph | `artifacts/models/SmolLM2-135M-Instruct/onnx/model.onnx` |
-| Tokenizer | matching Hugging Face `tokenizer.json` |
-| Geometry | 30 layers, 3 KV heads, head dim 64, vocabulary 49152 |
-| EOS token ids | `2` |
-| Probe result | promptTokens=1, generatedTokens=1, finishReason=Length |
-| Probe elapsed | 335.1 ms |
-
-This establishes a **functionally validated** CUDA path for that exact
-model/runtime combination. It is not yet a performance qualification.
-
-The same run reported two ONNX Runtime optimization warnings:
-
-- 121 `Memcpy` nodes were inserted for the CUDA execution provider;
-- some graph nodes were assigned outside the preferred execution provider.
-
-Those warnings did not prevent correct inference, but they are performance
-signals. Do not suppress them as noise. First record TTFT, TPOT, throughput, and
-concurrency behavior with the serving benchmark gate; use that evidence to decide
-whether node placement or transfer reduction is worth changing.
-
-## Next gate: real serving benchmark
-
-Run the hardware-controlled serving gate after the one-shot probe succeeds:
-
-```powershell
-pwsh ./eng/run-nvidia-serving-benchmark.ps1 `
-  -ModelPath artifacts/models/SmolLM2-135M-Instruct/onnx/model.onnx `
-  -TokenizerPath artifacts/models/SmolLM2-135M-Instruct/tokenizer.json `
-  -ModelId SmolLM2-135M-Instruct `
-  -NumHiddenLayers 30 `
-  -NumKvHeads 3 `
-  -HeadDim 64 `
-  -VocabularySize 49152 `
-  -EosTokenIds 2
-```
-
-The runner starts `Fission.Server` with the same CUDA/model/tokenizer
-configuration, keeps the startup probe enabled as a pre-serving gate, waits for
-`/healthz`, runs `workloads.gpu-smoke.json`, writes environment metadata and
-server logs beside the benchmark artifacts, then produces Markdown and CSV
-reports.
-
-Use `-Manifest benchmarks/serving/workloads.json` to move from the small gate
-to the full concurrency suite.
-
-
-## First serving baseline
-
-The first RTX 3060 serving benchmark on 2026-10-02 used
-`workloads.gpu-smoke.json` with one repetition and established this baseline:
-
-| Workload | C | Output tok/s | TTFT p50 ms | TPOT p50 ms | E2E p95 ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| gpu-short | 1 | 55.55 | 35.98 | 17.16 | 672.90 |
-| gpu-short | 4 | 94.96 | 100.70 | 39.97 | 1429.17 |
-| gpu-short | 8 | 173.06 | 121.16 | 43.52 | 1522.96 |
-| gpu-decode | 1 | 47.46 | 46.65 | 20.83 | 2800.20 |
-| gpu-decode | 4 | 78.32 | 136.73 | 50.30 | 6608.85 |
-| gpu-decode | 8 | 123.50 | 211.14 | 63.63 | 8319.86 |
-
-All requests succeeded and usage accounting was exact. Output throughput still
-increased through concurrency 8, while TPOT rose by roughly 2.5x for
-`gpu-short` and 3.1x for `gpu-decode` versus concurrency 1. That makes the
-batched CUDA step itself, including host/device transfer and logits handling, the
-next optimization target rather than the scheduler's ability to form a batch.
-
-The CUDA binding currently keeps KV device-resident but leaves decode logits
-host-backed. For vocabulary 49,152, an 8-row FP32 decode batch writes about
-1.5 MiB of logits to host memory per token step. The
 `Fission:CudaPageLockedDecodeLogits` experiment and
 `-PageLockedDecodeLogits` benchmark switch exist to measure whether replacing
 the pageable decode-logits destination with reusable CUDA page-locked memory
 improves TPOT on this host.
-
 
 ## Page-locked logits A/B validation
 
@@ -214,7 +61,6 @@ model and vocabulary, an eight-row FP32 decode step exposes about 1.5 MiB of
 logits to the host path. A graph-side `Gather -> ArgMax` output reduces the
 requested host result to eight int64 token ids while leaving the logits tensor
 inside ONNX Runtime.
-
 
 ## Graph-side greedy A/B result
 
@@ -252,7 +98,6 @@ Use `--skip-check` only when the checker fails on an operator already accepted
 by the target runtime, then require the normal Fission NVIDIA one-shot smoke
 before benchmarking the rewritten model. Skipping the checker is not runtime
 validation.
-
 
 ## ORT profile attribution: FP32 GQA CPU island
 
@@ -308,3 +153,40 @@ It does **not** yet add an FP16 pageable/pinned host-logits sampler. This keeps
 the first experiment narrow enough to answer whether moving GQA off CPU removes
 the measured transfer island. Existing FP32 page-locked serving remains the
 validated default until the FP16 hardware gate passes.
+
+## FP16 GQA unprofiled performance validation
+
+A three-repetition, unprofiled serving run on the same RTX 3060 established a
+large repeatable win for the FP16 GQA path over the previously validated FP32
+page-locked baseline. All 288 measured requests succeeded and all six rows
+reported exact usage for all three repetitions.
+
+| Workload | C | FP32 pinned tok/s | FP16 GQA tok/s | Throughput delta | FP32 TTFT p50 ms | FP16 TTFT p50 ms | TTFT delta | FP32 TPOT p50 ms | FP16 TPOT p50 ms | TPOT delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| gpu-decode | 1 | 51.86 | 135.63 | +161.53% | 42.15 | 15.04 | -64.32% | 19.03 | 7.35 | -61.38% |
+| gpu-decode | 4 | 91.47 | 239.61 | +161.95% | 119.40 | 45.33 | -62.04% | 42.95 | 16.44 | -61.72% |
+| gpu-decode | 8 | 140.51 | 443.44 | +215.59% | 193.13 | 58.99 | -69.46% | 55.80 | 17.75 | -68.19% |
+| gpu-short | 1 | 59.01 | 129.23 | +119.00% | 34.96 | 14.31 | -59.07% | 16.31 | 7.27 | -55.43% |
+| gpu-short | 4 | 111.07 | 237.35 | +113.69% | 86.06 | 38.34 | -55.45% | 34.25 | 15.98 | -53.34% |
+| gpu-short | 8 | 196.23 | 508.62 | +159.20% | 104.56 | 39.03 | -62.67% | 38.72 | 15.28 | -60.54% |
+
+The improvement is too large and too consistent to treat as run-to-run noise.
+It also changes both prefill/first-token and decode behavior, unlike the earlier
+page-locked decode-only experiment. On this host/model stack, FP16 is now the
+**preferred NVIDIA performance candidate**.
+
+This does not yet make FP16 the unconditional production default. Remaining
+qualification gates are:
+
+- rerun the ORT structural gate with `-RequireCudaOp GroupQueryAttention` after
+  the empty-provider StrictMode fix, confirming no observed CPU GQA events;
+- high-concurrency serving beyond C=8;
+- extended 256-token decode under C=8/16/32;
+- a substantially longer prompt/context at C=1/4/8/16;
+- semantic/token-output comparison on a fixed prompt corpus before claiming
+  precision parity or equivalent model quality.
+
+The production qualification workload manifest is
+`benchmarks/serving/workloads.gpu-qualification.json`. Until those gates are
+closed, keep the FP32 page-locked path as the compatibility fallback even though
+FP16 is the preferred performance path for this validated NVIDIA stack.
