@@ -276,8 +276,15 @@ $gateResults = [System.Collections.Generic.List[object]]::new()
 $gateFailures = [System.Collections.Generic.List[string]]::new()
 foreach ($requiredOp in @($RequireCudaOp | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
     $matching = @($allOps | Where-Object { $_.op_name -eq $requiredOp })
-    $cudaEvents = [long] (($matching | Where-Object { $_.provider -eq "CUDAExecutionProvider" } | Measure-Object -Property events -Sum).Sum ?? 0)
-    $nonCudaEvents = [long] (($matching | Where-Object { $_.provider -ne "CUDAExecutionProvider" } | Measure-Object -Property events -Sum).Sum ?? 0)
+    [long] $cudaEvents = 0
+    [long] $nonCudaEvents = 0
+    foreach ($op in $matching) {
+        if ($op.provider -eq "CUDAExecutionProvider") {
+            $cudaEvents += [long] $op.events
+        } else {
+            $nonCudaEvents += [long] $op.events
+        }
+    }
     $passed = $cudaEvents -gt 0 -and $nonCudaEvents -eq 0
     $gateResults.Add([pscustomobject]@{
         op_name = $requiredOp
