@@ -1,3 +1,4 @@
+using System.Buffers;
 using Fission.Abstractions.Execution;
 using Microsoft.ML.OnnxRuntime;
 
@@ -23,6 +24,25 @@ public sealed class OptimumLegacyCudaGqaSafeBinding :
     private readonly OptimumLegacyCudaGatheringBinding _inner;
     private long _continuationSingletonRunCount;
     private int _disposed;
+
+    public OptimumLegacyCudaGqaSafeBinding(
+        OptimumLegacyDecoderProfile profile,
+        CudaDeviceMemoryAllocator allocator,
+        CudaDeviceBoundAsyncCopyEngine copyEngine,
+        IEnumerable<int>? eosTokenIds = null,
+        ArrayPool<float>? scratchFloatPool = null,
+        ArrayPool<long>? scratchLongPool = null,
+        IHostStagingFloatBufferAllocator? decodeLogitsHostAllocator = null)
+        : this(CreateInner(
+            profile,
+            allocator,
+            copyEngine,
+            eosTokenIds,
+            scratchFloatPool,
+            scratchLongPool,
+            decodeLogitsHostAllocator))
+    {
+    }
 
     public OptimumLegacyCudaGqaSafeBinding(
         OptimumLegacyCudaGatheringBinding inner)
@@ -205,6 +225,41 @@ public sealed class OptimumLegacyCudaGqaSafeBinding :
             items,
             priorStates,
             cancellationToken);
+    }
+
+    private static OptimumLegacyCudaGatheringBinding CreateInner(
+        OptimumLegacyDecoderProfile profile,
+        CudaDeviceMemoryAllocator allocator,
+        CudaDeviceBoundAsyncCopyEngine copyEngine,
+        IEnumerable<int>? eosTokenIds,
+        ArrayPool<float>? scratchFloatPool,
+        ArrayPool<long>? scratchLongPool,
+        IHostStagingFloatBufferAllocator? decodeLogitsHostAllocator)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        ArgumentNullException.ThrowIfNull(allocator);
+        ArgumentNullException.ThrowIfNull(copyEngine);
+
+        var decoder = new OptimumLegacyCudaFloatDecoderBinding(
+            profile,
+            allocator,
+            eosTokenIds,
+            scratchFloatPool,
+            scratchLongPool,
+            decodeLogitsHostAllocator: decodeLogitsHostAllocator);
+        try
+        {
+            return new OptimumLegacyCudaGatheringBinding(
+                profile,
+                allocator,
+                copyEngine,
+                decoder);
+        }
+        catch
+        {
+            decoder.Dispose();
+            throw;
+        }
     }
 
     private static void AssignResults(
