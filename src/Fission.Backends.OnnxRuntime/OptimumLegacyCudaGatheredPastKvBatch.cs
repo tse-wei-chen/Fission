@@ -84,10 +84,13 @@ internal sealed class OptimumLegacyCudaGatheredPastKvBatch : IDisposable
 
         var geometry = profile.Geometry;
         var contract = profile.Contract;
-        if (geometry.KvElementType != TensorElementType.Float)
+        if (geometry.KvElementType is not (
+            TensorElementType.Float or
+            TensorElementType.Float16 or
+            TensorElementType.BFloat16))
         {
             throw new ArgumentException(
-                "CUDA gathered past-KV input currently supports FP32 KV tensors only.",
+                $"CUDA gathered past-KV input does not support KV element type {geometry.KvElementType}.",
                 nameof(profile));
         }
 
@@ -114,7 +117,9 @@ internal sealed class OptimumLegacyCudaGatheredPastKvBatch : IDisposable
         var perSequenceShape = geometry.GetPastKvShape(
             batchSize: 1,
             position);
-        var expectedBytes = CheckedTensorByteLength(perSequenceShape);
+        var expectedBytes = CheckedTensorByteLength(
+            perSequenceShape,
+            geometry.KvElementType);
 
         // Resolve all model-contract names before acquiring native ownership.
         var inputNames = new string[checked(geometry.NumHiddenLayers * 2)];
@@ -171,6 +176,7 @@ internal sealed class OptimumLegacyCudaGatheredPastKvBatch : IDisposable
                     allocator.DeviceId,
                     geometry.NumHiddenLayers,
                     perSequenceShape,
+                    geometry.KvElementType,
                     expectedBytes);
             }
 
@@ -179,7 +185,8 @@ internal sealed class OptimumLegacyCudaGatheredPastKvBatch : IDisposable
                 states.Count,
                 geometry.NumHiddenLayers,
                 perSequenceShape,
-                allocator);
+                allocator,
+                geometry.KvElementType);
 
             // Temporary row states/leases give the gather transaction validated
             // raw destination pointers while the arena's builder reference owns
@@ -353,6 +360,7 @@ internal sealed class OptimumLegacyCudaGatheredPastKvBatch : IDisposable
         int deviceId,
         int layerCount,
         IReadOnlyList<long> expectedShape,
+        TensorElementType expectedElementType,
         long expectedBytes)
     {
         if (lease.Position != position ||
@@ -366,8 +374,24 @@ internal sealed class OptimumLegacyCudaGatheredPastKvBatch : IDisposable
         for (var layer = 0; layer < layerCount; layer++)
         {
             var pair = lease.GetLayer(layer);
-            ValidateTensor(pair.Key, row, layer, "key", deviceId, expectedShape, expectedBytes);
-            ValidateTensor(pair.Value, row, layer, "value", deviceId, expectedShape, expectedBytes);
+            ValidateTensor(
+                pair.Key,
+                row,
+                layer,
+                "key",
+                deviceId,
+                expectedShape,
+                expectedElementType,
+                expectedBytes);
+            ValidateTensor(
+                pair.Value,
+                row,
+                layer,
+                "value",
+                deviceId,
+                expectedShape,
+                expectedElementType,
+                expectedBytes);
         }
     }
 
@@ -378,19 +402,22 @@ internal sealed class OptimumLegacyCudaGatheredPastKvBatch : IDisposable
         string slot,
         int deviceId,
         IReadOnlyList<long> expectedShape,
+        TensorElementType expectedElementType,
         long expectedBytes)
     {
         if (tensor.DeviceId != deviceId ||
-            tensor.ElementType != TensorElementType.Float ||
+            tensor.ElementType != expectedElementType ||
             tensor.ByteLength != expectedBytes ||
             !tensor.Shape.SequenceEqual(expectedShape))
         {
             throw new InvalidOperationException(
-                $"CUDA source row {row} layer {layer} {slot} does not match the requested FP32 gather geometry.");
+                $"CUDA source row {row} layer {layer} {slot} does not match the requested {expectedElementType} gather geometry.");
         }
     }
 
-    private static long CheckedTensorByteLength(IReadOnlyList<long> shape)
+    private static long CheckedTensorByteLength(
+        IReadOnlyList<long> shape,
+        TensorElementType elementType)
     {
         var elementCount = 1L;
         foreach (var dimension in shape)
@@ -404,7 +431,17 @@ internal sealed class OptimumLegacyCudaGatheredPastKvBatch : IDisposable
             elementCount = checked(elementCount * dimension);
         }
 
-        return checked(elementCount * sizeof(float));
+        var elementSizeBytes = elementType switch
+        {
+            TensorElementType.Float => sizeof(float),
+            TensorElementType.Float16 => sizeof(ushort),
+            TensorElementType.BFloat16 => sizeof(ushort),
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(elementType),
+                elementType,
+                "CUDA gathered past-KV element type must be Float, Float16, or BFloat16.")
+        };
+        return checked(elementCount * elementSizeBytes);
     }
 
     private void ThrowIfDisposed() =>
