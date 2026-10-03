@@ -1,15 +1,10 @@
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Fission.Backends.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 
 internal static class Fp16GatherSpecs
 {
-    [ModuleInitializer]
-    internal static void Initialize() =>
-        RunAsync().GetAwaiter().GetResult();
-
-    private static async Task RunAsync()
+    internal static async Task RunAsync()
     {
         const int deviceId = 7;
         const string formatId = "gather-spec:fp16:v1";
@@ -309,4 +304,10 @@ internal static class Fp16GatherSpecs
             CudaMemcpyKind Kind,
             nint Stream);
     }
+}
+
+internal partial class Program
+{
+    static Program() =>
+        Fp16GatherSpecs.RunAsync().GetAwaiter().GetResult();
 }
