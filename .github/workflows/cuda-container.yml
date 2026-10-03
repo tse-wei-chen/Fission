@@ -11,6 +11,7 @@ on:
       - Directory.Build.props
       - global.json
       - src/Fission.Backends.OnnxRuntime/Fission.Backends.OnnxRuntime.csproj
+      - src/Fission.Server/**
       - .github/workflows/cuda-container.yml
   workflow_dispatch:
 
@@ -28,6 +29,22 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
+
+      - name: Validate CUDA Compose contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FISSION_MODEL_PRECISION=fp16 \
+          FISSION_SAMPLED_TOKEN_IDS_OUTPUT=fission_sampled_token_ids \
+          FISSION_ORT_PROFILE_OUTPUT_PATH_PREFIX=/artifacts/ort-profile \
+          FISSION_CONTROL_TOKEN=ci-control-token \
+          docker compose --profile cuda config > /tmp/fission-cuda-compose.yaml
+
+          grep -F 'Fission__ModelPrecision: fp16' /tmp/fission-cuda-compose.yaml
+          grep -F 'Fission__SampledTokenIdsOutput: fission_sampled_token_ids' /tmp/fission-cuda-compose.yaml
+          grep -F 'Fission__OrtProfileOutputPathPrefix: /artifacts/ort-profile' /tmp/fission-cuda-compose.yaml
+          grep -F 'Fission__ControlToken: ci-control-token' /tmp/fission-cuda-compose.yaml
 
       - name: Build CUDA image
         uses: docker/build-push-action@v6
@@ -67,6 +84,8 @@ jobs:
             echo "## CUDA image validation"
             echo
             echo "The CUDA image built successfully and the .NET/Fission host started."
+            echo
+            echo "Compose wiring for FP16 precision, graph-side sampling, ORT profiling, and graceful-control token configuration was also validated."
             echo
             echo "This hosted runner has no NVIDIA GPU; CUDA execution remains covered by the dedicated NVIDIA host smoke and serving benchmark paths."
           } >> "$GITHUB_STEP_SUMMARY"

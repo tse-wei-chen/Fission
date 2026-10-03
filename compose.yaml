@@ -12,6 +12,7 @@ x-fission-common-environment: &fission-common-environment
 x-fission-model-environment: &fission-model-environment
   Fission__ModelPath: /models/${FISSION_MODEL_FILE:-decoder_with_past_model.onnx}
   Fission__ModelId: ${FISSION_MODEL_ID:-model}
+  Fission__ModelPrecision: ${FISSION_MODEL_PRECISION:-fp32}
   Fission__NumHiddenLayers: ${FISSION_NUM_HIDDEN_LAYERS:-}
   Fission__NumKvHeads: ${FISSION_NUM_KV_HEADS:-}
   Fission__HeadDim: ${FISSION_HEAD_DIM:-}
@@ -74,6 +75,8 @@ services:
       Fission__CudaPoolMaxRetainedBytes: ${FISSION_CUDA_POOL_MAX_RETAINED_BYTES:-268435456}
       Fission__CudaPoolMaxRetainedBuffersPerSize: ${FISSION_CUDA_POOL_MAX_RETAINED_BUFFERS_PER_SIZE:-8}
       Fission__SampledTokenIdsOutput: ${FISSION_SAMPLED_TOKEN_IDS_OUTPUT:-}
+      Fission__OrtProfileOutputPathPrefix: ${FISSION_ORT_PROFILE_OUTPUT_PATH_PREFIX:-}
+      Fission__ControlToken: ${FISSION_CONTROL_TOKEN:-}
       Fission__Tokenizer: huggingface
       Fission__StartupProbeEnabled: ${FISSION_STARTUP_PROBE_ENABLED:-false}
       Fission__StartupProbeExitAfterSuccess: "false"
@@ -83,4 +86,5 @@ services:
       Fission__StartupProbeTimeoutSeconds: ${FISSION_STARTUP_PROBE_TIMEOUT_SECONDS:-120}
     volumes:
       - ${FISSION_MODEL_DIR:-./models}:/models:ro
+      - ${FISSION_CONTAINER_ARTIFACTS_DIR:-./artifacts/container}:/artifacts
     stop_grace_period: 30s

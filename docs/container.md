@@ -3,7 +3,7 @@
 Fission has two container lanes:
 
 - `Dockerfile`: portable/default image for deterministic serving and ONNX Runtime CPU composition.
-- `Dockerfile.cuda`: NVIDIA CUDA image for the production ONNX Runtime CUDA composition that is now wired through `Fission.Server`.
+- `Dockerfile.cuda`: NVIDIA CUDA image for the production ONNX Runtime CUDA composition wired through `Fission.Server`.
 
 Model files are **not** baked into either image. `models/` is excluded from the Docker build context and Compose mounts the selected model directory read-only at `/models`.
 
@@ -43,7 +43,7 @@ Those values can be changed through `.env`. The same image can host ONNX Runtime
 
 `Dockerfile.cuda` uses an NVIDIA CUDA + cuDNN runtime base and copies the .NET 10 ASP.NET runtime into that Ubuntu 24.04 environment.
 
-The repository currently references `Microsoft.ML.OnnxRuntime.Gpu 1.30.0`. The default NuGet GPU package for ONNX Runtime 1.30 uses CUDA 13.x and cuDNN 9.x. The checked-in CUDA image therefore defaults to:
+The repository currently references `Microsoft.ML.OnnxRuntime.Gpu 1.30.0`. The checked-in CUDA image defaults to:
 
 ```text
 nvidia/cuda:13.4.2-cudnn-runtime-ubuntu24.04
@@ -69,6 +69,7 @@ FISSION_MODEL_DIR=./models
 FISSION_MODEL_FILE=decoder_with_past_model.onnx
 FISSION_TOKENIZER_FILE=tokenizer.json
 FISSION_MODEL_ID=my-model
+FISSION_MODEL_PRECISION=fp32
 FISSION_NUM_HIDDEN_LAYERS=<layers>
 FISSION_NUM_KV_HEADS=<kv-heads>
 FISSION_HEAD_DIM=<head-dim>
@@ -94,18 +95,55 @@ The service requests GPU access through Compose `gpus: all`. `FISSION_CUDA_DEVIC
 
 ## CUDA optimization switches
 
-The Compose CUDA profile exposes the CUDA serving options added by the current mainline work:
+The Compose CUDA profile exposes the CUDA serving options used by the current mainline work:
 
 | `.env` variable | Server configuration | Default |
 | --- | --- | --- |
+| `FISSION_MODEL_PRECISION` | `Fission:ModelPrecision` | `fp32` |
 | `FISSION_CUDA_PAGE_LOCKED_DECODE_LOGITS` | `Fission:CudaPageLockedDecodeLogits` | `false` |
 | `FISSION_CUDA_POOL_MAX_RETAINED_BYTES` | `Fission:CudaPoolMaxRetainedBytes` | `268435456` |
 | `FISSION_CUDA_POOL_MAX_RETAINED_BUFFERS_PER_SIZE` | `Fission:CudaPoolMaxRetainedBuffersPerSize` | `8` |
 | `FISSION_SAMPLED_TOKEN_IDS_OUTPUT` | `Fission:SampledTokenIdsOutput` | empty/off |
+| `FISSION_ORT_PROFILE_OUTPUT_PATH_PREFIX` | `Fission:OrtProfileOutputPathPrefix` | empty/off |
+| `FISSION_CONTROL_TOKEN` | `Fission:ControlToken` | empty/off |
 
 `FISSION_SAMPLED_TOKEN_IDS_OUTPUT` is for a graph that has been rewritten to expose the graph-side greedy token-id output. Do not set it for an unmodified graph.
 
-The pinned-logits and graph-side sampling switches remain opt-in so a model/runtime combination can be validated before making either path the default.
+### FP16 CUDA GQA path
+
+The constrained FP16 CUDA path added by the current mainline requires graph-side sampled token ids and does not use the page-locked full-logits path. A matching Compose configuration looks like:
+
+```dotenv
+FISSION_MODEL_FILE=model.fp16.fission-greedy.onnx
+FISSION_MODEL_PRECISION=fp16
+FISSION_SAMPLED_TOKEN_IDS_OUTPUT=fission_sampled_token_ids
+FISSION_CUDA_PAGE_LOCKED_DECODE_LOGITS=false
+```
+
+Use the repository's FP16 conversion and graph-rewrite tools to produce the graph, then run the normal NVIDIA one-shot hardware gate before treating it as a serving configuration. FP32 remains the default container configuration.
+
+### ONNX Runtime profiling
+
+ORT profiling is diagnostic and adds overhead. Keep it disabled for throughput comparisons.
+
+The CUDA service mounts `FISSION_CONTAINER_ARTIFACTS_DIR` (default `./artifacts/container`) at `/artifacts`. To persist a profile outside the container:
+
+```dotenv
+FISSION_CONTAINER_ARTIFACTS_DIR=./artifacts/container
+FISSION_ORT_PROFILE_OUTPUT_PATH_PREFIX=/artifacts/ort-profile
+FISSION_CONTROL_TOKEN=<strong-ephemeral-token>
+```
+
+ONNX Runtime writes the profile when the session is disposed. Use the token-gated graceful shutdown route rather than killing the container if a profile must be flushed:
+
+```bash
+curl --fail \
+  -X POST \
+  -H 'X-Fission-Control-Token: <strong-ephemeral-token>' \
+  http://localhost:8001/internal/control/shutdown
+```
+
+When `FISSION_CONTROL_TOKEN` is empty, the internal control route is not mapped.
 
 ## Startup inference gate
 
@@ -146,8 +184,8 @@ The same rule applies to NPU providers: OpenVINO/QNN/Vitis AI container profiles
 
 ## CI validation
 
-The portable container workflow still performs deterministic health/OpenAI/load-generator smoke tests.
+The portable container workflow performs deterministic health/OpenAI/load-generator smoke tests.
 
-CUDA packaging has a separate CI path that builds `Dockerfile.cuda` on a CPU runner and verifies that the resulting image can start the .NET host. Hosted CI does **not** claim GPU inference coverage; real CUDA correctness remains the responsibility of the NVIDIA host smoke/benchmark path.
+CUDA packaging has a separate CI path that builds `Dockerfile.cuda` on a CPU runner, verifies that the resulting image can start the .NET host, and validates Compose wiring for model precision, graph-side sampling, ORT profiling, and the graceful-control token. Hosted CI does **not** claim GPU inference coverage; real CUDA correctness remains the responsibility of the NVIDIA host smoke/benchmark path.
 
 See [accelerator architecture](accelerators.md), [serving benchmark](serving-benchmark.md), and [releases and container publication](releases.md).
