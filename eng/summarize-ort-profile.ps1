@@ -216,7 +216,7 @@ try {
             $multiLineDepth = 0
         }
 
-        [void] $multiLineBuffer.AppendLine($trimmed.TrimEnd(','))
+        [void] $multiLineBuffer.AppendLine($trimmed)
         $multiLineDepth += Get-MultiLineBraceDelta -Text $trimmed
         if ($multiLineDepth -eq 0 -and $multiLineBuffer.Length -gt 0) {
             $jsonText = $multiLineBuffer.ToString().Trim().TrimEnd(',')
