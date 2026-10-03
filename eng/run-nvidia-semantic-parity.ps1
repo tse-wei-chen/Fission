@@ -302,10 +302,9 @@ try {
         $compareArgs["RequireExactTokens"] = $true
     }
 
+    # PowerShell script invocation does not guarantee that $LASTEXITCODE is set.
+    # Terminating comparator failures propagate because ErrorActionPreference is Stop.
     & $comparator @compareArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "Semantic parity comparator failed with exit code $LASTEXITCODE."
-    }
 
     $metadata["status"] = "passed"
     $metadata["completed_at_utc"] = [DateTimeOffset]::UtcNow.ToString("O")
