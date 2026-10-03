@@ -1,7 +1,8 @@
 # NVIDIA FP16 qualification evidence — 2026-10-03
 
 This note records the RTX 3060 + SmolLM2-135M-Instruct FP16 CUDA/GQA
-qualification sequence. The final qualification and memory gates both passed.
+qualification sequence. The serving qualification, memory gate, and observed
+structural CUDA-placement gate all passed.
 
 ## Final qualification status
 
@@ -79,6 +80,35 @@ The telemetry run used one repetition per row and is evidence for memory and
 utilization headroom, not a replacement for the three-repetition performance
 qualification.
 
+## Structural CUDA gate
+
+A dedicated FP16 ORT-profiled run required `GroupQueryAttention` to appear only
+on `CUDAExecutionProvider` in the observed trace. The gate passed:
+
+```text
+GroupQueryAttention | CUDAExecutionProvider | 95847 | 0 | PASS
+```
+
+Observed profile evidence:
+
+- CUDA `GroupQueryAttention` events: 95,847;
+- non-CUDA `GroupQueryAttention` events: 0;
+- Memcpy execution events: 0;
+- Memcpy share of summed node duration: 0.00%, down from 18.57% in the FP32
+  partial trace;
+- CUDA provider share: 99.76%;
+- CPU provider share: 0.24%.
+
+The trace reached ONNX Runtime's event limit and is therefore explicitly marked
+partial. This proves that every observed GQA event was CUDA-resident, but does
+not claim coverage of events omitted after the trace limit. That scope is the
+intended meaning of the `-PartialTrace` structural gate.
+
+The FP16 profile also changes the optimization picture: CUDA MatMul accounts
+for approximately 49.97% of observed summed node duration and CUDA
+GroupQueryAttention approximately 21.72%. Host/device Memcpy is no longer the
+observed hot-path bottleneck.
+
 ## Earlier partial evidence
 
 Before the GQA continuation-prefill and FP16 gathered-KV fixes, the first
@@ -87,15 +117,13 @@ C=1 long-context row. That partial result was intentionally not accepted as a
 qualification pass. The completeness validator correctly reported 21/30 rows
 and forced the missing C=4/8/16 long-context cases to be fixed and rerun.
 
-## Remaining promotion gates
+## Remaining promotion gate
 
-The high-concurrency/long-context completeness gate and the memory-headroom
-gate are now closed for this hardware/model/runtime tuple. Two promotion gates
-remain:
-
-1. complete the CUDA-only `GroupQueryAttention` structural profile assertion;
-2. compare FP32 and FP16 deterministic generations with the checked-in semantic
-   parity corpus using raw generated token IDs and decoded text.
+The high-concurrency/long-context completeness gate, memory-headroom gate, and
+observed structural CUDA-placement gate are now closed for this
+hardware/model/runtime tuple. The remaining promotion gate is semantic review:
+compare FP32 and FP16 deterministic generations with the checked-in semantic
+parity corpus using raw generated token IDs and decoded text.
 
 Keep the FP32 page-locked path selectable as a compatibility fallback. New GPU
 models, ORT/CUDA versions, model families, and precision formats remain separate
