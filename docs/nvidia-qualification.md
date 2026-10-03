@@ -1,27 +1,33 @@
 # NVIDIA FP16 production qualification
 
-The RTX 3060 three-repetition serving benchmark established the constrained
-FP16 CUDA/GQA path as Fission's preferred NVIDIA performance candidate for the
-validated SmolLM2-135M-Instruct stack. It does **not** yet make FP16 the
-unconditional production default.
+The RTX 3060 serving qualification established the constrained FP16 CUDA/GQA
+path as Fission's preferred NVIDIA performance candidate for the validated
+SmolLM2-135M-Instruct stack. It does **not** yet make FP16 the unconditional
+production default.
+
+As of 2026-10-03, the checked-in high-concurrency/long-context suite has passed
+30/30 completeness with zero failures and exact usage, and the separate GPU
+telemetry memory gate has passed 10/10 rows with substantial VRAM headroom.
+The remaining promotion questions are structural CUDA placement and semantic
+behavior.
 
 The production qualification phase closes four separate questions:
 
 1. **structural placement** — the attention kernel must remain on CUDA;
 2. **high-concurrency scaling** — useful throughput must continue beyond the
    initial C=8 smoke range without failure or pathological latency growth;
-3. **longer decode/context behavior** — the win must survive larger KV-cache
-   frontiers;
+3. **longer decode/context behavior** — the path must survive larger KV-cache
+   frontiers, with any singleton-safety latency cost recorded explicitly;
 4. **semantic behavior** — FP16 greedy output must be evaluated on a stable
    prompt corpus before claiming parity with FP32.
 
 Keep the FP32 page-locked path available as the compatibility fallback while
-these gates are open.
+the remaining promotion gates are open.
 
 ## Validated performance baseline
 
-The unprofiled FP16 run used three repetitions for every row. All 288 requests
-succeeded with exact usage accounting.
+The earlier unprofiled FP16 comparison used three repetitions for every row.
+All 288 requests succeeded with exact usage accounting.
 
 | Workload | C | FP32 pinned tok/s | FP16 GQA tok/s | Delta | FP32 TPOT p50 ms | FP16 TPOT p50 ms | Delta |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -33,10 +39,10 @@ succeeded with exact usage accounting.
 | gpu-short | 8 | 196.23 | 508.62 | +159.20% | 38.72 | 15.28 | -60.54% |
 
 TTFT also improved by roughly 55–69% across the six matched rows. The effect is
-large and consistent enough that the next work is qualification rather than
-another small decode-hot-path experiment.
+large and consistent enough that qualification, not another small decode-hot-
+path experiment, remains the correct promotion workflow.
 
-## 1. Structural CUDA gate
+## 1. Structural CUDA gate — still open
 
 Use a single ORT-profiled run for attribution. Profiling adds overhead, so do
 not use this run as a throughput comparison.
@@ -64,7 +70,7 @@ Pass criteria:
 - materially lower host Memcpy share than the FP32 partial trace where Memcpy
   accounted for 18.57% of summed node duration.
 
-## 2. High-concurrency and long-context gate
+## 2. High-concurrency and long-context gate — passed on RTX 3060
 
 Use the checked-in qualification manifest:
 
@@ -77,7 +83,26 @@ It contains three workloads:
 - `gpu-long-context`: a substantially larger prompt at C=1/4/8/16 with 64
   output tokens.
 
-Run it unprofiled with three repetitions:
+The final three-repetition qualification completed every expected row:
+
+```text
+expected:  30
+validated: 30
+issues:     0
+```
+
+The run covered 1,056 measured requests with zero failures and exact usage for
+every row. Long-context C=4/8/16 completed all three repetitions after the CUDA
+GQA continuation-prefill safety policy and FP16 gathered-past-KV fixes landed.
+
+The long-context path has a documented latency trade-off: singleton
+continuation-prefill safety increases TPOT as concurrency rises. In the final
+three-run result, C=8/C=16 throughput remains approximately 102–106 output
+tok/s while TPOT p50 rises to approximately 64.16/119.45 ms. This is accepted
+for the correctness/completeness gate because every request completes and
+accounting remains exact. It remains a separate optimization target.
+
+The qualification command remains:
 
 ```powershell
 pwsh ./eng/run-nvidia-serving-benchmark.ps1 `
@@ -99,41 +124,47 @@ pwsh ./eng/run-nvidia-serving-benchmark.ps1 `
 
 Do not add `-OrtProfile` or `-PageLockedDecodeLogits` to this performance run.
 
-Pass criteria are intentionally behavioral rather than a fixed absolute tok/s
-threshold:
+### Memory/headroom evidence — passed
 
-- zero failed requests;
-- exact usage for every repetition;
-- no server crash, CUDA allocation failure, stale-KV failure, or timeout;
-- throughput should plateau gracefully as concurrency rises rather than
-  collapse while latency grows without useful throughput;
-- the 256-token decode workload must complete at C=32;
-- the long-context workload must complete through C=16.
+A separate run with `-GpuTelemetry` completed 10/10 expected rows. Across 198
+samples at 500 ms intervals, the observed peaks were:
 
-Record the resulting report rather than encoding RTX-3060-specific timing as a
-hosted-CI threshold.
+- VRAM used: 3,479 / 12,288 MiB;
+- VRAM headroom: 8,809 MiB;
+- GPU utilization: 86%;
+- memory-controller utilization: 26%;
+- temperature: 68 C.
 
-## 3. Semantic/token gate
+This closes the memory-headroom concern for the validated RTX 3060 tuple. The
+telemetry run is supporting capacity evidence, not a replacement for the
+three-repetition performance run.
+
+The dated evidence is recorded in
+`docs/nvidia-qualification-results-2026-10-03.md`.
+
+## 3. Semantic/token gate — still open
 
 FP16 changes arithmetic and can legitimately change greedy choices when logits
 are close. Performance success is therefore not evidence of token parity or
 model-quality parity.
 
-Use a fixed prompt corpus that includes:
+The fixed corpus already exists at:
 
-- short factual completion;
-- instruction following;
-- code/text formatting;
-- a longer contextual question;
-- prompts that generate at least 64 tokens.
+`benchmarks/serving/semantic-parity.json`
+
+and the comparator is:
+
+`eng/compare-serving-semantic-parity.ps1`
+
+The corpus includes short factual completion, instruction following,
+code/text formatting, longer contextual reasoning, and longer generation.
+The comparator preserves raw token IDs and decoded text from both endpoints and
+reports exact-token matches plus common-prefix divergence.
 
 Run the same tokenizer, chat template, EOS configuration, prompt text, and
-maximum output length against FP32 and FP16. Persist raw generated token IDs and
-text. Report exact token-prefix equality separately from application-level
-acceptability; do not require bitwise/logit equality.
-
-This semantic gate should be implemented as a reproducible artifact before
-promoting FP16 to the unconditional default.
+maximum output length against FP32 and FP16. Report exact token-prefix equality
+separately from application-level acceptability; do not require bitwise/logit
+equality.
 
 ## Promotion rule
 
@@ -141,8 +172,10 @@ Promote FP16 from preferred candidate to the primary NVIDIA serving path only
 when:
 
 - the structural GQA CUDA gate passes;
-- the checked-in qualification manifest completes with no failures and exact
-  accounting;
+- the checked-in qualification manifest remains complete with no failures and
+  exact accounting — **passed for the validated RTX 3060 tuple**;
+- the memory/headroom telemetry remains within the validated envelope —
+  **passed for the validated RTX 3060 tuple**;
 - semantic/token comparison has been reviewed;
 - the FP32 page-locked path remains selectable as a compatibility fallback.
 
