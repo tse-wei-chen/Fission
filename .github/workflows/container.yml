@@ -20,6 +20,7 @@ on:
       - eng/run-nvidia-smoke.ps1
       - eng/run-nvidia-serving-benchmark.ps1
       - eng/run-nvidia-qualification.ps1
+      - eng/run-nvidia-semantic-parity.ps1
       - eng/validate-serving-suite-results.ps1
       - eng/compare-serving-semantic-parity.ps1
       - eng/summarize-ort-profile.ps1
@@ -45,6 +46,7 @@ on:
       - eng/run-nvidia-smoke.ps1
       - eng/run-nvidia-serving-benchmark.ps1
       - eng/run-nvidia-qualification.ps1
+      - eng/run-nvidia-semantic-parity.ps1
       - eng/validate-serving-suite-results.ps1
       - eng/compare-serving-semantic-parity.ps1
       - eng/summarize-ort-profile.ps1
@@ -81,6 +83,7 @@ jobs:
             "./eng/run-nvidia-smoke.ps1",
             "./eng/run-nvidia-serving-benchmark.ps1",
             "./eng/run-nvidia-qualification.ps1",
+            "./eng/run-nvidia-semantic-parity.ps1",
             "./eng/validate-serving-suite-results.ps1",
             "./eng/compare-serving-semantic-parity.ps1",
             "./eng/summarize-ort-profile.ps1"
@@ -302,13 +305,13 @@ jobs:
           cat artifacts/serving-ci/report.md
           cat artifacts/serving-ci/report.csv
 
-          unauthorized_status="$(curl --silent --output /tmp/fission-control-unauthorized.json             --write-out '%{http_code}'             --request POST             http://127.0.0.1:18000/internal/control/shutdown)"
+          unauthorized_status="$(curl --silent --output /tmp/fission-control-unauthorized.json --write-out '%{http_code}' --request POST http://127.0.0.1:18000/internal/control/shutdown)"
           if [ "$unauthorized_status" -ne 401 ]; then
             echo "Expected unauthenticated shutdown to return 401, got $unauthorized_status." >&2
             exit 1
           fi
 
-          shutdown_status="$(curl --silent --output /tmp/fission-control-shutdown.json             --write-out '%{http_code}'             --request POST             --header 'X-Fission-Control-Token: ci-control-token'             http://127.0.0.1:18000/internal/control/shutdown)"
+          shutdown_status="$(curl --silent --output /tmp/fission-control-shutdown.json --write-out '%{http_code}' --request POST --header 'X-Fission-Control-Token: ci-control-token' http://127.0.0.1:18000/internal/control/shutdown)"
           if [ "$shutdown_status" -ne 202 ]; then
             echo "Expected authenticated shutdown to return 202, got $shutdown_status." >&2
             cat /tmp/fission-control-shutdown.json >&2 || true
