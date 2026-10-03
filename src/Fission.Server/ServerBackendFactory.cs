@@ -227,23 +227,18 @@ public static class ServerBackendFactory
                         });
             }
 
-            var innerBinding = new OptimumLegacyCudaFloatDecoderBinding(
-                profile,
-                pool,
-                eosTokenIds,
-                decodeLogitsHostAllocator: decodeLogitsHostAllocator);
             copyEngine = new CudaDeviceBoundAsyncCopyEngine(
                 cudaDeviceId,
                 new CudaAsyncCopyEngineOptions
                 {
                     RuntimeLibraryPath = runtimeLibraryPath
                 });
-            var gatheringBinding = new OptimumLegacyCudaGatheringBinding(
+            binding = new OptimumLegacyCudaGqaSafeBinding(
                 profile,
                 pool,
                 copyEngine,
-                innerBinding);
-            binding = new OptimumLegacyCudaGqaSafeBinding(gatheringBinding);
+                eosTokenIds,
+                decodeLogitsHostAllocator: decodeLogitsHostAllocator);
             adapter = new DecoderOnlyOnnxExecutionAdapter(binding);
             ownedResources = new CudaOnnxOwnedResources(copyEngine, pool);
 
