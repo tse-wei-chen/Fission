@@ -202,6 +202,9 @@ public static class ServerBackendFactory
             });
 
         DecoderOnlyOnnxExecutionAdapter? adapter = null;
+        OptimumLegacyCudaGqaSafeBinding? binding = null;
+        CudaDeviceBoundAsyncCopyEngine? copyEngine = null;
+        CudaOnnxOwnedResources? ownedResources = null;
         try
         {
             var poolController = new CudaDeviceMemoryPoolController(pool);
@@ -224,12 +227,20 @@ public static class ServerBackendFactory
                         });
             }
 
-            var binding = new OptimumLegacyCudaFloatDecoderBinding(
+            copyEngine = new CudaDeviceBoundAsyncCopyEngine(
+                cudaDeviceId,
+                new CudaAsyncCopyEngineOptions
+                {
+                    RuntimeLibraryPath = runtimeLibraryPath
+                });
+            binding = new OptimumLegacyCudaGqaSafeBinding(
                 profile,
                 pool,
+                copyEngine,
                 eosTokenIds,
                 decodeLogitsHostAllocator: decodeLogitsHostAllocator);
             adapter = new DecoderOnlyOnnxExecutionAdapter(binding);
+            ownedResources = new CudaOnnxOwnedResources(copyEngine, pool);
 
             return new OnnxRuntimeBackend(
                 new OnnxRuntimeBackendOptions(
@@ -243,12 +254,30 @@ public static class ServerBackendFactory
                 OnnxRuntimeSessionOptions.Cuda(
                     cudaDeviceId,
                     ortProfileOutputPathPrefix),
-                ownedResource: pool);
+                ownedResource: ownedResources);
         }
         catch
         {
             adapter?.Dispose();
-            pool.Dispose();
+            if (adapter is null)
+            {
+                binding?.Dispose();
+            }
+
+            if (ownedResources is not null)
+            {
+                ownedResources.Dispose();
+            }
+            else
+            {
+                if (copyEngine is not null)
+                {
+                    copyEngine.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                }
+
+                pool.Dispose();
+            }
+
             throw;
         }
     }

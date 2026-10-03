@@ -21,11 +21,64 @@ param(
     [ValidateNotNullOrEmpty()]
     [string] $Configuration = "Release",
 
+    [ValidateRange(1, 300)]
+    [int] $ProcessTimeoutGraceSeconds = 30,
+
     [switch] $NoBuild
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+function Invoke-LoadGenerator {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]] $Arguments,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(1, 86400)]
+        [int] $HardTimeoutSeconds,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Description
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = "dotnet"
+    $startInfo.UseShellExecute = $false
+    foreach ($argument in $Arguments) {
+        [void] $startInfo.ArgumentList.Add([string] $argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "Failed to start serving load generator for $Description."
+        }
+
+        $timeoutMilliseconds = $HardTimeoutSeconds * 1000
+        if (-not $process.WaitForExit($timeoutMilliseconds)) {
+            try {
+                $process.Kill($true)
+            }
+            catch {
+                if (-not $process.HasExited) {
+                    $process.Kill()
+                }
+            }
+            $process.WaitForExit()
+            throw "Serving load generator exceeded hard process timeout of $HardTimeoutSeconds second(s) for $Description. The process tree was terminated."
+        }
+
+        if ($process.ExitCode -ne 0) {
+            throw "Serving benchmark failed for $Description with exit code $($process.ExitCode)."
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
 
 if ($Label -notmatch '^[A-Za-z0-9._-]+$') {
     throw "Label '$Label' may contain only letters, digits, '.', '_' and '-'."
@@ -155,10 +208,14 @@ foreach ($workload in $workloads) {
                 "--output", $outputPath
             )
 
-            & dotnet @arguments
-            if ($LASTEXITCODE -ne 0) {
-                throw "Serving benchmark failed for '$name' at concurrency $concurrency, repetition $repetition."
-            }
+            $phaseCount = if ($warmup -gt 0) { 2 } else { 1 }
+            $hardTimeoutSeconds =
+                $timeoutSeconds * $phaseCount + $ProcessTimeoutGraceSeconds
+            $description = "'$name' at concurrency $concurrency, repetition $repetition"
+            Invoke-LoadGenerator `
+                -Arguments $arguments `
+                -HardTimeoutSeconds $hardTimeoutSeconds `
+                -Description $description
         }
     }
 }
