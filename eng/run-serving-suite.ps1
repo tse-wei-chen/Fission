@@ -57,7 +57,7 @@ function Invoke-LoadGenerator {
             throw "Failed to start serving load generator for $Description."
         }
 
-        $timeoutMilliseconds = checked($HardTimeoutSeconds * 1000)
+        $timeoutMilliseconds = $HardTimeoutSeconds * 1000
         if (-not $process.WaitForExit($timeoutMilliseconds)) {
             try {
                 $process.Kill($true)
@@ -209,8 +209,8 @@ foreach ($workload in $workloads) {
             )
 
             $phaseCount = if ($warmup -gt 0) { 2 } else { 1 }
-            $hardTimeoutSeconds = checked(
-                $timeoutSeconds * $phaseCount + $ProcessTimeoutGraceSeconds)
+            $hardTimeoutSeconds =
+                $timeoutSeconds * $phaseCount + $ProcessTimeoutGraceSeconds
             $description = "'$name' at concurrency $concurrency, repetition $repetition"
             Invoke-LoadGenerator `
                 -Arguments $arguments `
