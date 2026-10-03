@@ -4,32 +4,38 @@
     {
       "name": "short-factual",
       "prompt": "Complete this sentence with a concise factual answer: Water freezes at",
-      "max_tokens": 24
+      "max_tokens": 24,
+      "min_generated_tokens": 1
     },
     {
       "name": "instruction-following",
       "prompt": "Give exactly three short bullet points explaining why continuous batching improves LLM serving throughput.",
-      "max_tokens": 64
+      "max_tokens": 64,
+      "min_generated_tokens": 1
     },
     {
       "name": "code-formatting",
-      "prompt": "Write a C# method named Clamp that accepts three int parameters value, min, max and returns value clamped to the inclusive range. Return only the method.",
-      "max_tokens": 96
+      "prompt": "Continue the following C# method from the exact prefix below. Emit only the remaining C# code needed to finish the method.\n\npublic static int Clamp(int value, int min, int max)\n{\n    return",
+      "max_tokens": 96,
+      "min_generated_tokens": 1
     },
     {
       "name": "structured-text",
       "prompt": "Return a compact JSON object with keys name, purpose, and properties describing a KV cache used during autoregressive transformer inference.",
-      "max_tokens": 96
+      "max_tokens": 96,
+      "min_generated_tokens": 1
     },
     {
       "name": "long-context-reasoning",
-      "prompt": "A serving engine performs prefill for newly admitted prompts, stores per-sequence KV cache state, interleaves decode tokens from active requests, applies backpressure when admission is saturated, and can cancel a request while preserving unrelated sequences. Explain how these mechanisms interact under continuous batching, why throughput can increase while per-token latency also increases, and identify two correctness hazards that a scheduler must avoid.",
-      "max_tokens": 128
+      "prompt": "Continue the technical answer after the unfinished final phrase. A serving engine performs prefill for newly admitted prompts, stores per-sequence KV cache state, interleaves decode tokens from active requests, applies backpressure when admission is saturated, and can cancel a request while preserving unrelated sequences. Explain how these mechanisms interact under continuous batching, why throughput can increase while per-token latency also increases, and identify two correctness hazards that a scheduler must avoid.\n\nAnswer: Continuous batching coordinates these mechanisms by",
+      "max_tokens": 128,
+      "min_generated_tokens": 1
     },
     {
       "name": "long-generation",
-      "prompt": "Explain the lifecycle of one autoregressive inference request from tokenization through prefill, KV-cache creation, repeated decode scheduling, streaming output, and terminal cleanup. Include enough detail to produce at least several paragraphs.",
-      "max_tokens": 160
+      "prompt": "Continue this technical article for at least four paragraphs. Cover tokenization, prefill, KV-cache creation, repeated decode scheduling, streaming output, cancellation or backpressure, and terminal cleanup. Do not stop after the heading or opening phrase.\n\nLifecycle of an autoregressive inference request\n\nThe request begins when",
+      "max_tokens": 160,
+      "min_generated_tokens": 64
     }
   ]
 }
