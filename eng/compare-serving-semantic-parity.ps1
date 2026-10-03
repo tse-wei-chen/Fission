@@ -162,7 +162,7 @@ foreach ($case in $cases) {
         common_prefix_ratio = $prefixRatio
         first_divergence_index = $firstDivergence
         exact_tokens = $exactTokens
-        exact_text = [string] $baseline.text -eq [string] $candidate.text
+        exact_text = ([string] $baseline.text) -eq ([string] $candidate.text)
         baseline_finish_reason = [string] $baseline.finish_reason
         candidate_finish_reason = [string] $candidate.finish_reason
         baseline_token_ids = $baselineTokens
@@ -202,7 +202,7 @@ $report | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $jsonFullPath -Enc
 $lines = [System.Collections.Generic.List[string]]::new()
 $lines.Add("# Serving semantic parity report")
 $lines.Add("")
-$lines.Add("Model: `$ModelId`")
+$lines.Add(("Model: {0}{1}{0}" -f [char]96, $ModelId))
 $lines.Add("")
 $lines.Add("- Cases: $($results.Count)")
 $lines.Add("- Exact token cases: $exactTokenCases/$($results.Count)")
