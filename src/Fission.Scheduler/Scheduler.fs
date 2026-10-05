@@ -122,16 +122,24 @@ module Scheduler =
         let afterPosition = int64 sequence.Position + int64 tokenGrant
         let after = pagesForTokens sequence.TokensPerKvPage afterPosition
         let pageDelta = after - before
-        if pageDelta > int64 Int32.MaxValue then
+        let writeOverhead =
+            if tokenGrant > 0 then int64 sequence.KvPageWriteOverhead else 0L
+        let totalPages = pageDelta + writeOverhead
+        if totalPages > int64 Int32.MaxValue then
             invalidOp "KV page grant exceeds Int32 capacity."
-        int pageDelta
+        int totalPages
 
     let private tokensWritableWithKvPages (sequence: ReadySequence) availablePages =
-        let currentPages = pagesForTokens sequence.TokensPerKvPage (int64 sequence.Position)
-        let capacityPages = currentPages + int64 availablePages
-        let capacityTokens = capacityPages * int64 sequence.TokensPerKvPage
-        let writable = max 0L (capacityTokens - int64 sequence.Position)
-        if writable > int64 Int32.MaxValue then Int32.MaxValue else int writable
+        let availableAfterWriteOverhead =
+            availablePages - sequence.KvPageWriteOverhead
+        if availableAfterWriteOverhead < 0 then
+            0
+        else
+            let currentPages = pagesForTokens sequence.TokensPerKvPage (int64 sequence.Position)
+            let capacityPages = currentPages + int64 availableAfterWriteOverhead
+            let capacityTokens = capacityPages * int64 sequence.TokensPerKvPage
+            let writable = max 0L (capacityTokens - int64 sequence.Position)
+            if writable > int64 Int32.MaxValue then Int32.MaxValue else int writable
 
     // Retained KV accounting only charges the incremental tokens that survive the
     // step after the immutable prior state is released.
@@ -265,6 +273,8 @@ module Scheduler =
             RejectedAdmission { Sequence = sequence; Reason = InvalidPosition }
         elif sequence.TokensPerKvPage <= 0 then
             RejectedAdmission { Sequence = sequence; Reason = InvalidKvPageSize }
+        elif sequence.KvPageWriteOverhead < 0 then
+            RejectedAdmission { Sequence = sequence; Reason = InvalidKvPageDemand }
         elif sequence.KvBytesPerToken < 0L then
             RejectedAdmission { Sequence = sequence; Reason = InvalidKvBytesPerToken }
         elif sequence.Phase = Decoding && sequence.TokenDemand <> 1 then
