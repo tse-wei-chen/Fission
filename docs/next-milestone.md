@@ -1,3 +1,3 @@
 # Next milestone
 
-Plan compiler -> execution plan -> runtime executor, plus KV snapshot/fork verification.
+Make scheduler admission copy-on-write aware: surface shared partial-tail KV state in scheduling candidates, charge the one-page COW surcharge in F#, and validate scheduled page grants against sequence-aware runtime demand before backend dispatch.

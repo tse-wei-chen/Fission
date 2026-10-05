@@ -51,6 +51,20 @@ public sealed class KvPageTable : IDisposable
         }
     }
 
+    internal int AdditionalPagesForTokenRange(int position, int tokenCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(position);
+        ArgumentOutOfRangeException.ThrowIfNegative(tokenCount);
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            var appendedPages = _pool.IncrementalPagesFor(position, tokenCount);
+            var copyOnWritePages = RequiresTailCopyOnWrite(position, tokenCount) ? 1 : 0;
+            return checked(appendedPages + copyOnWritePages);
+        }
+    }
+
     internal int AppendForTokenRange(int position, int tokenCount)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(position);
@@ -59,14 +73,34 @@ public sealed class KvPageTable : IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            var requiredPages = _pool.IncrementalPagesFor(position, tokenCount);
+
+            var copyTail = RequiresTailCopyOnWrite(position, tokenCount);
+            var appendedPages = _pool.IncrementalPagesFor(position, tokenCount);
+            var requiredPages = checked(appendedPages + (copyTail ? 1 : 0));
             if (requiredPages == 0)
             {
                 return 0;
             }
 
+            // Ensure List<T> cannot allocate after pool capacity has been reserved.
+            // Once Rent succeeds the mutation below is allocation-free and the old
+            // shared tail is released only after its replacement is installed.
+            _pages.EnsureCapacity(checked(_pages.Count + appendedPages));
             var rented = _pool.Rent(requiredPages);
-            _pages.AddRange(rented);
+            var rentedIndex = 0;
+
+            if (copyTail)
+            {
+                var sharedTail = _pages[^1];
+                _pages[^1] = rented[rentedIndex++];
+                sharedTail.Release();
+            }
+
+            while (rentedIndex < rented.Count)
+            {
+                _pages.Add(rented[rentedIndex++]);
+            }
+
             return requiredPages;
         }
     }
@@ -110,6 +144,19 @@ public sealed class KvPageTable : IDisposable
 
             _pages = [];
         }
+    }
+
+    private bool RequiresTailCopyOnWrite(int position, int tokenCount)
+    {
+        if (tokenCount == 0 ||
+            position == 0 ||
+            position % _pool.TokensPerPage == 0 ||
+            _pages.Count == 0)
+        {
+            return false;
+        }
+
+        return _pages[^1].ReferenceCount > 1;
     }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
