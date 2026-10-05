@@ -1,5 +1,6 @@
 using Fission.Abstractions;
 using Fission.Abstractions.Execution;
+using Fission.Abstractions.Scheduling;
 using Fission.Runtime.Backends;
 using Fission.Runtime.Execution;
 using Fission.Runtime.Kv;
@@ -31,6 +32,9 @@ static ExecutionBindings Bind(SequenceId sequenceId, params int[] tokens) =>
 
 static ExecutionBindings EmptyBindings() =>
     new(new Dictionary<SequenceId, ReadOnlyMemory<int>>());
+
+static ScheduledExecutionBindings EmptyScheduledBindings() =>
+    new(new Dictionary<SequenceId, ScheduledPrefillBinding>());
 
 static async Task VerifyPartialForkCopyOnWriteAsync()
 {
@@ -185,7 +189,95 @@ static async Task VerifyPartialSnapshotCopyOnWriteAsync()
         "Runtime disposal must release partial snapshot page leases.");
 }
 
+static async Task VerifyScheduledCopyOnWriteGrantValidationAsync()
+{
+    var model = new ModelId("kv-cow-model");
+    var device = new DeviceId("cpu:kv-cow-scheduled");
+    var pool = new KvPagePool(capacity: 8, tokensPerPage: 4);
+
+    await using var deviceExecutor = await ContinuousBatchExecutor.CreateAsync(
+        new DeterministicBackend(device),
+        capacity: 16,
+        maxBatchSize: 4);
+
+    using (var runtime = new ExecutionPlanExecutor(deviceExecutor, kvPagePool: pool))
+    {
+        var parentId = SequenceId.New();
+        var setup = await runtime.ExecuteAsync(
+            new CompiledExecutionPlan(
+                Guid.NewGuid(),
+                32,
+                new ExecutionStep[]
+                {
+                    new PrefillExecutionStep(parentId, model, 2, CompletesPrefill: true),
+                    new ForkKvExecutionStep(parentId, 1)
+                }),
+            Bind(parentId, 30, 31));
+
+        var branchId = setup.Forks.Single().Branches.Single();
+        var branch = GetSequence(runtime, branchId);
+        var scheduled = new ScheduledBatchExecutor(runtime);
+        var bindings = EmptyScheduledBindings();
+
+        var staleBatch = new ScheduledBatch(
+            Guid.NewGuid(),
+            new[]
+            {
+                new ScheduledWorkItem(
+                    branchId,
+                    ScheduledWorkKind.Decode,
+                    TokenGrant: 1,
+                    KvPageGrant: 0,
+                    Priority: 0,
+                    CompletesPrefill: false)
+            },
+            ConsumedTokens: 1,
+            ConsumedKvPages: 0);
+
+        var rejected = false;
+        try
+        {
+            await scheduled.ExecuteAsync(staleBatch, bindings);
+        }
+        catch (InvalidOperationException)
+        {
+            rejected = true;
+        }
+
+        Require(rejected,
+            "Scheduled preflight must reject a stale grant that omits shared-tail COW demand.");
+        Require(branch.Position == 2 && pool.AllocatedPages == 1,
+            "Rejected COW grants must not dispatch backend work or mutate runtime KV state.");
+
+        var validBatch = new ScheduledBatch(
+            Guid.NewGuid(),
+            new[]
+            {
+                new ScheduledWorkItem(
+                    branchId,
+                    ScheduledWorkKind.Decode,
+                    TokenGrant: 1,
+                    KvPageGrant: 1,
+                    Priority: 0,
+                    CompletesPrefill: false)
+            },
+            ConsumedTokens: 1,
+            ConsumedKvPages: 1);
+
+        await scheduled.ExecuteAsync(validBatch, bindings);
+
+        Require(branch.Position == 3,
+            "A COW-aware scheduled grant must advance the branch by one decode token.");
+        Require(pool.AllocatedPages == 2,
+            "A valid scheduled shared-tail write must consume exactly one COW page.");
+    }
+
+    Require(pool.AllocatedPages == 0,
+        "Scheduled COW validation must not leak page leases after runtime disposal.");
+}
+
 await VerifyPartialForkCopyOnWriteAsync();
 await VerifyPartialSnapshotCopyOnWriteAsync();
+await VerifyScheduledCopyOnWriteGrantValidationAsync();
 
-Console.WriteLine("Fission KV specs passed: partial-tail fork/snapshot copy-on-write is isolated and reclaimable.");
+Console.WriteLine("Fission KV specs passed: partial-tail COW is isolated, scheduler grants are revalidated, and pages are reclaimable.");
