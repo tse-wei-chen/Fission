@@ -1,34 +1,32 @@
-# Container development
+# Container usage
 
-Fission has two container lanes:
+Fission ships separate user-facing Compose files for portable and NVIDIA CUDA serving.
 
-- `Dockerfile`: portable/default image for deterministic serving and ONNX Runtime CPU composition.
-- `Dockerfile.cuda`: NVIDIA CUDA image for the production ONNX Runtime CUDA composition wired through `Fission.Server`.
+| Use case | Compose file | Env template | Image Dockerfile |
+| --- | --- | --- | --- |
+| Portable / deterministic / ONNX CPU | `compose.yaml` | `.env.example` | `Dockerfile` |
+| NVIDIA CUDA / ONNX Runtime GPU | `compose.cuda.yaml` | `.env.cuda.example` | `Dockerfile.cuda` |
 
-Model files are **not** baked into either image. `models/` is excluded from the Docker build context and Compose mounts the selected model directory read-only at `/models`.
+The files are intentionally standalone. Users do not need Compose profiles or multiple `-f` overlays to select an accelerator lane.
 
-## Portable/default image
+Model files are **not** baked into either image. `models/` is excluded from the Docker build context and is mounted read-only at `/models`.
 
-Build:
+## Portable/default serving
 
-```bash
-docker build -t fission:dev .
-```
-
-Run the self-contained deterministic default:
-
-```bash
-docker run --rm -p 8000:8000 fission:dev
-```
-
-Or with Compose:
+Start with the portable configuration:
 
 ```bash
 cp .env.example .env
-docker compose up --build -d server
+docker compose up --build -d
 ```
 
-The portable service defaults to:
+Health check:
+
+```bash
+curl --fail http://localhost:8000/healthz
+```
+
+The default composition is self-contained:
 
 ```text
 Backend=deterministic
@@ -37,32 +35,26 @@ Tokenizer=deterministic
 Device=cpu:0
 ```
 
-Those values can be changed through `.env`. The same image can host ONNX Runtime CPU serving when a compatible model/tokenizer is mounted and the required model geometry is configured.
+To use ONNX Runtime CPU serving instead, configure the model/tokenizer geometry in `.env` and set the backend/provider/tokenizer values accordingly.
 
-## NVIDIA CUDA image
+## NVIDIA CUDA serving
 
-`Dockerfile.cuda` uses an NVIDIA CUDA + cuDNN runtime base and copies the .NET 10 ASP.NET runtime into that Ubuntu 24.04 environment.
+The CUDA configuration is separate from the portable file so users who only need CPU/default serving do not need to understand NVIDIA-specific settings.
 
-The repository currently references `Microsoft.ML.OnnxRuntime.Gpu 1.30.0`. The checked-in CUDA image defaults to:
+Requirements:
 
-```text
-nvidia/cuda:13.4.2-cudnn-runtime-ubuntu24.04
-```
+- compatible NVIDIA driver;
+- NVIDIA Container Toolkit;
+- a compatible decoder-with-past ONNX model and tokenizer;
+- the model geometry required by `Fission.Server`.
 
-The CUDA runtime image is a build argument and may be overridden for a validated environment:
+Create the CUDA env file:
 
 ```bash
-docker build \
-  -f Dockerfile.cuda \
-  --build-arg CUDA_RUNTIME_IMAGE=nvidia/cuda:13.4.2-cudnn-runtime-ubuntu24.04 \
-  -t fission:cuda-dev .
+cp .env.cuda.example .env.cuda
 ```
 
-The host still requires a compatible NVIDIA driver and NVIDIA Container Toolkit.
-
-### Compose CUDA profile
-
-Put the decoder-with-past ONNX graph and matching `tokenizer.json` under the directory configured by `FISSION_MODEL_DIR` (default `./models`), then fill in the model geometry in `.env`:
+Fill in at least the model-specific fields in `.env.cuda`:
 
 ```dotenv
 FISSION_MODEL_DIR=./models
@@ -77,27 +69,38 @@ FISSION_VOCABULARY_SIZE=<vocabulary-size>
 FISSION_EOS_TOKEN_IDS=<comma-separated-eos-ids>
 ```
 
-Start only the CUDA service:
+Start CUDA serving:
 
 ```bash
-docker compose --profile cuda up --build -d server-cuda
+docker compose \
+  --env-file .env.cuda \
+  -f compose.cuda.yaml \
+  up --build -d
 ```
 
-It listens on host port `8001` by default so it can coexist with the portable service. Override with `FISSION_CUDA_PORT`.
-
-Check health:
+Health check:
 
 ```bash
-curl --fail http://localhost:8001/healthz
+curl --fail http://localhost:8000/healthz
 ```
 
-The service requests GPU access through Compose `gpus: all`. `FISSION_CUDA_DEVICE_ID` selects the CUDA ordinal visible inside the container; `FISSION_CUDA_DEVICE` is the Fission runtime identity and defaults to `cuda:0`.
+The CUDA Compose file requests GPU access with `gpus: all`. `FISSION_CUDA_DEVICE_ID` selects the CUDA ordinal visible inside the container, while `FISSION_DEVICE` is the Fission runtime identity and defaults to `cuda:0`.
 
-## CUDA optimization switches
+## CUDA image
 
-The Compose CUDA profile exposes the CUDA serving options used by the current mainline work:
+`Dockerfile.cuda` uses an NVIDIA CUDA + cuDNN runtime base and copies the .NET 10 ASP.NET runtime into that environment. The current default base is:
 
-| `.env` variable | Server configuration | Default |
+```text
+nvidia/cuda:13.4.2-cudnn-runtime-ubuntu24.04
+```
+
+Override `FISSION_CUDA_RUNTIME_IMAGE` in `.env.cuda` when validating a different compatible environment.
+
+## CUDA serving options
+
+The dedicated CUDA env template exposes accelerator-specific switches without polluting the portable user configuration:
+
+| `.env.cuda` variable | Server configuration | Default |
 | --- | --- | --- |
 | `FISSION_MODEL_PRECISION` | `Fission:ModelPrecision` | `fp32` |
 | `FISSION_CUDA_PAGE_LOCKED_DECODE_LOGITS` | `Fission:CudaPageLockedDecodeLogits` | `false` |
@@ -107,11 +110,9 @@ The Compose CUDA profile exposes the CUDA serving options used by the current ma
 | `FISSION_ORT_PROFILE_OUTPUT_PATH_PREFIX` | `Fission:OrtProfileOutputPathPrefix` | empty/off |
 | `FISSION_CONTROL_TOKEN` | `Fission:ControlToken` | empty/off |
 
-`FISSION_SAMPLED_TOKEN_IDS_OUTPUT` is for a graph that has been rewritten to expose the graph-side greedy token-id output. Do not set it for an unmodified graph.
-
 ### FP16 CUDA GQA path
 
-The constrained FP16 CUDA path added by the current mainline requires graph-side sampled token ids and does not use the page-locked full-logits path. A matching Compose configuration looks like:
+The constrained FP16 CUDA path requires graph-side sampled token IDs and does not use the page-locked full-logits path:
 
 ```dotenv
 FISSION_MODEL_FILE=model.fp16.fission-greedy.onnx
@@ -120,34 +121,34 @@ FISSION_SAMPLED_TOKEN_IDS_OUTPUT=fission_sampled_token_ids
 FISSION_CUDA_PAGE_LOCKED_DECODE_LOGITS=false
 ```
 
-Use the repository's FP16 conversion and graph-rewrite tools to produce the graph, then run the normal NVIDIA one-shot hardware gate before treating it as a serving configuration. FP32 remains the default container configuration.
+Run the repository's NVIDIA one-shot hardware gate before treating a converted graph as a serving configuration.
 
 ### ONNX Runtime profiling
 
 ORT profiling is diagnostic and adds overhead. Keep it disabled for throughput comparisons.
 
-The CUDA service mounts `FISSION_CONTAINER_ARTIFACTS_DIR` (default `./artifacts/container`) at `/artifacts`. To persist a profile outside the container:
+The CUDA Compose file mounts `FISSION_ARTIFACTS_DIR` at `/artifacts`. To persist a profile:
 
 ```dotenv
-FISSION_CONTAINER_ARTIFACTS_DIR=./artifacts/container
+FISSION_ARTIFACTS_DIR=./artifacts/container
 FISSION_ORT_PROFILE_OUTPUT_PATH_PREFIX=/artifacts/ort-profile
 FISSION_CONTROL_TOKEN=<strong-ephemeral-token>
 ```
 
-ONNX Runtime writes the profile when the session is disposed. Use the token-gated graceful shutdown route rather than killing the container if a profile must be flushed:
+Use graceful shutdown so ONNX Runtime can dispose the session and flush the profile:
 
 ```bash
 curl --fail \
   -X POST \
   -H 'X-Fission-Control-Token: <strong-ephemeral-token>' \
-  http://localhost:8001/internal/control/shutdown
+  http://localhost:8000/internal/control/shutdown
 ```
 
 When `FISSION_CONTROL_TOKEN` is empty, the internal control route is not mapped.
 
 ## Startup inference gate
 
-The CUDA Compose profile also exposes the full-stack startup probe:
+Both Compose files expose the startup probe settings. For CUDA, set them in `.env.cuda`:
 
 ```dotenv
 FISSION_STARTUP_PROBE_ENABLED=true
@@ -157,35 +158,18 @@ FISSION_STARTUP_PROBE_MAX_TOKENS=1
 FISSION_STARTUP_PROBE_TIMEOUT_SECONDS=120
 ```
 
-When enabled, HTTP serving starts only after the configured tokenizer -> scheduler/runtime -> ONNX Runtime CUDA path successfully generates a token.
+When enabled, HTTP serving starts only after the configured tokenizer -> runtime -> backend path successfully generates a token.
 
-For dedicated host validation outside Docker, see [NVIDIA real-model smoke](nvidia-smoke.md) and the serving benchmark runner.
+## Why there is no MPS Compose file
 
-## Common scheduler/runtime configuration
+MPS is an Apple/Metal host-native execution lane rather than a Linux container runtime. Fission models MPS separately in the accelerator catalog but does not present a non-functional Docker configuration for it.
 
-Both Compose services share:
-
-| `.env` variable | Server configuration | Default |
-| --- | --- | ---: |
-| `FISSION_KV_PAGES` | `Fission:KvPages` | `16384` |
-| `FISSION_TOKENS_PER_KV_PAGE` | `Fission:TokensPerKvPage` | `16` |
-| `FISSION_MAX_BATCH_TOKENS` | `Fission:MaxBatchTokens` | `2048` |
-| `FISSION_MAX_BATCH_SEQUENCES` | `Fission:MaxBatchSequences` | `128` |
-| `FISSION_MAX_PREFILL_CHUNK_TOKENS` | `Fission:MaxPrefillChunkTokens` | `512` |
-| `FISSION_ADMISSION_CAPACITY` | `Fission:AdmissionCapacity` | `1024` |
-
-ASP.NET Core converts double underscores in environment names such as `Fission__KvPages` into configuration sections such as `Fission:KvPages`.
-
-## Why there is no MPS container profile
-
-MPS is an Apple/Metal host execution lane, not a Linux/NVIDIA container runtime. The accelerator catalog therefore models `mps` separately, but Docker Compose does not pretend that a Linux container can provide Metal/MPS acceleration.
-
-The same rule applies to NPU providers: OpenVINO/QNN/Vitis AI container profiles should be added only when their actual host devices, native runtimes, and container pass-through requirements are implemented and tested.
+The same rule applies to NPU integrations: OpenVINO/QNN/Vitis AI Compose files should be introduced only with a concrete runtime, device pass-through story, and validation path.
 
 ## CI validation
 
-The portable container workflow performs deterministic health/OpenAI/load-generator smoke tests.
+CI validates `compose.yaml` and `compose.cuda.yaml` independently. The portable workflow performs deterministic health/OpenAI/load-generator smoke tests. CUDA packaging builds `Dockerfile.cuda`, validates the standalone CUDA Compose contract, and verifies that the .NET/Fission host starts on a CPU runner without claiming real GPU inference coverage.
 
-CUDA packaging has a separate CI path that builds `Dockerfile.cuda` on a CPU runner, verifies that the resulting image can start the .NET host, and validates Compose wiring for model precision, graph-side sampling, ORT profiling, and the graceful-control token. Hosted CI does **not** claim GPU inference coverage; real CUDA correctness remains the responsibility of the NVIDIA host smoke/benchmark path.
+Real CUDA correctness remains covered by the dedicated NVIDIA smoke, qualification, semantic-parity, and serving benchmark paths.
 
 See [accelerator architecture](accelerators.md), [serving benchmark](serving-benchmark.md), and [releases and container publication](releases.md).
