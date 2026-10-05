@@ -68,7 +68,7 @@ public sealed partial class InferenceEngine
             var execution = await _runtime.ExecuteAsync(
                     new CompiledExecutionPlan(
                         Guid.NewGuid(),
-                        TokenBudget: 0,
+                        Priority: 0,
                         Steps: new ExecutionStep[]
                         {
                             new ForkKvExecutionStep(parentSequenceId, branches)
