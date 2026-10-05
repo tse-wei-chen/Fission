@@ -5,17 +5,21 @@ namespace Fission.Abstractions.Execution;
 /// committed for the sequence before Tokens begin. A null Position lets a
 /// stateful backend infer the continuation point from its current immutable state;
 /// stateless backends may ignore it.
+/// KvWrite is non-default only when runtime logical KV requires a physical
+/// copy-on-write materialization before this chunk mutates a shared partial tail.
 /// </summary>
 public readonly record struct PrefillItem(
     SequenceId SequenceId,
     ModelId ModelId,
     ReadOnlyMemory<int> Tokens,
-    int? Position = null);
+    int? Position = null,
+    InferenceKvWriteIntent KvWrite = default);
 
 public readonly record struct DecodeItem(
     SequenceId SequenceId,
     ModelId ModelId,
-    int Position);
+    int Position,
+    InferenceKvWriteIntent KvWrite = default);
 
 public sealed record PrefillBatch(IReadOnlyList<PrefillItem> Items);
 public sealed record DecodeBatch(IReadOnlyList<DecodeItem> Items);
