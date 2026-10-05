@@ -140,7 +140,7 @@ static async Task RunForkLifecycleAsync()
             branchSequence.Position == 3,
             "Forked runtime branch must inherit parent decoding state and position.");
         Require(
-            branchSequence.KvPageWriteOverhead == 1,
+            branchSequence!.KvPageWriteOverhead == 1,
             "Each branch must expose shared partial-tail COW pressure before its first write.");
     }
 
