@@ -20,7 +20,8 @@ public readonly record struct SchedulingCandidate(
     int TokensPerKvPage,
     int Priority,
     long KvBytesPerToken = 0,
-    DeviceId? ExecutionDevice = null);
+    DeviceId? ExecutionDevice = null,
+    int KvPageWriteOverhead = 0);
 
 /// <summary>
 /// Physical device-memory headroom available for additional transient allocations
