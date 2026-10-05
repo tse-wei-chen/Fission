@@ -14,6 +14,7 @@
   <Project Path="samples/Fission.PlanDemo/Fission.PlanDemo.fsproj" />
   <Project Path="tests/Fission.Accelerators.Specs/Fission.Accelerators.Specs.csproj" />
   <Project Path="tests/Fission.Runtime.Specs/Fission.Runtime.Specs.csproj" />
+  <Project Path="tests/Fission.Kv.Specs/Fission.Kv.Specs.csproj" />
   <Project Path="tests/Fission.DeviceActor.Specs/Fission.DeviceActor.Specs.csproj" />
   <Project Path="tests/Fission.DeviceActor.Identity.Specs/Fission.DeviceActor.Identity.Specs.csproj" />
   <Project Path="tests/Fission.DeviceCancellation.Specs/Fission.DeviceCancellation.Specs.csproj" />
