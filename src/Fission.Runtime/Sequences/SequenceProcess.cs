@@ -49,6 +49,18 @@ public sealed class SequenceProcess : IDisposable
     public KvPageTable Kv { get; private set; }
     public int KvTokensPerPage => Kv.TokensPerPage;
 
+    public int KvPageWriteOverhead
+    {
+        get
+        {
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+                return Kv.WriteOverheadForTokenRange(Position, 1);
+            }
+        }
+    }
+
     internal static SequenceProcess Create(
         SequenceId id,
         ModelId model,
@@ -102,6 +114,17 @@ public sealed class SequenceProcess : IDisposable
             Kv = restored;
             Position = snapshot.Position;
             Version = Math.Max(Version, snapshot.Version) + 1;
+        }
+    }
+
+    internal int AdditionalKvPagesFor(int tokenCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(tokenCount);
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            return Kv.AdditionalPagesForTokenRange(Position, tokenCount);
         }
     }
 
