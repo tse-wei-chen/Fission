@@ -568,7 +568,9 @@ public sealed class ScheduledBatchExecutor
 
                 var hasExistingSequence = _runtime.TryGetSequence(item.SequenceId, out var existingSequence);
                 var position = existingSequence?.Position ?? 0;
-                var expectedKvPages = _runtime.KvPages.IncrementalPagesFor(position, item.TokenGrant);
+                var expectedKvPages = existingSequence is null
+                    ? _runtime.KvPages.IncrementalPagesFor(position, item.TokenGrant)
+                    : existingSequence.AdditionalKvPagesFor(item.TokenGrant);
                 if (expectedKvPages != item.KvPageGrant)
                 {
                     throw new InvalidOperationException(
