@@ -14,16 +14,28 @@ The long-term direction is an inference operating system with first-class suppor
 
 ## Container quick start
 
-Build and start the current `Fission.Server` composition with Docker Compose:
+Portable/default serving uses the standard Compose file:
 
 ```bash
+cp .env.example .env
 docker compose up --build -d
 curl --fail http://localhost:8000/healthz
 ```
 
-The default container uses the deterministic backend/token codec so CI remains self-contained. The server composition root can also select ONNX Runtime CPU or CUDA plus a Hugging Face tokenizer; real GPU serving remains a separate hardware-controlled path.
+The default container uses the deterministic backend/token codec so CI remains self-contained. The same portable image can be configured for ONNX Runtime CPU serving.
 
-See [`docs/container.md`](docs/container.md) for configuration, smoke tests, and the planned GPU-container boundary.
+NVIDIA CUDA serving has a separate user-facing Compose file and env template:
+
+```bash
+cp .env.cuda.example .env.cuda
+# Fill in model/tokenizer geometry in .env.cuda first.
+docker compose --env-file .env.cuda -f compose.cuda.yaml up --build -d
+curl --fail http://localhost:8000/healthz
+```
+
+Keeping the CUDA configuration separate avoids exposing NVIDIA-only runtime, profiling, and memory-pool options to portable users.
+
+See [`docs/container.md`](docs/container.md) for model configuration, CUDA requirements, startup probes, profiling, and accelerator-specific guidance.
 
 ## Serving benchmark
 
@@ -71,4 +83,3 @@ pwsh ./eng/run-nvidia-serving-benchmark.ps1 -ModelPath <model.onnx> -TokenizerPa
 The checked-in GPU smoke manifest is deliberately small. Pass the full
 `benchmarks/serving/workloads.json` manifest only after this hardware gate is
 stable.
-
