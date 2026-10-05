@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using Fission.Abstractions;
 using Fission.Abstractions.Execution;
 using Fission.Runtime.Sequences;
@@ -68,7 +69,7 @@ public sealed partial class InferenceEngine
                     new CompiledExecutionPlan(
                         Guid.NewGuid(),
                         TokenBudget: 0,
-                        new ExecutionStep[]
+                        Steps: new ExecutionStep[]
                         {
                             new ForkKvExecutionStep(parentSequenceId, branches)
                         }),
@@ -115,6 +116,21 @@ public sealed partial class InferenceEngine
         RequestState parent,
         IReadOnlyList<SequenceId> branchIds)
     {
+        var branchRequests = new RequestState[branchIds.Count];
+        for (var index = 0; index < branchIds.Count; index++)
+        {
+            var branch = new RequestState(
+                branchIds[index],
+                parent.ModelId,
+                parent.PromptTokens,
+                parent.MaxNewTokens,
+                parent.Priority,
+                parent.Deadline,
+                parent.EnqueuedAt);
+            branch.GeneratedTokens.AddRange(parent.GeneratedTokens);
+            branchRequests[index] = branch;
+        }
+
         lock (_gate)
         {
             var nextActiveCount = checked(_activeRequestCount + branchIds.Count);
@@ -129,18 +145,23 @@ public sealed partial class InferenceEngine
                 }
             }
 
-            for (var index = 0; index < branchIds.Count; index++)
+            var added = 0;
+            try
             {
-                var branch = new RequestState(
-                    branchIds[index],
-                    parent.ModelId,
-                    parent.PromptTokens,
-                    parent.MaxNewTokens,
-                    parent.Priority,
-                    parent.Deadline,
-                    parent.EnqueuedAt);
-                branch.GeneratedTokens.AddRange(parent.GeneratedTokens);
-                _requests.Add(branch.SequenceId, branch);
+                for (; added < branchRequests.Length; added++)
+                {
+                    var branch = branchRequests[added];
+                    _requests.Add(branch.SequenceId, branch);
+                }
+            }
+            catch
+            {
+                for (var index = 0; index < added; index++)
+                {
+                    _requests.Remove(branchRequests[index].SequenceId);
+                }
+
+                throw;
             }
 
             _activeRequestCount = nextActiveCount;
