@@ -176,9 +176,16 @@ public sealed partial class ExecutionPlanExecutor
                 $"Cannot prefill sequence {step.SequenceId} while it is {sequence.Status}.");
         }
 
+        var position = sequence.Position;
+        var kvWrite = sequence.KvWriteIntentFor(step.TokenCount);
         var device = _devices.ResolvePlacement(sequence.Device);
         var result = await device.SubmitPrefillAsync(
-                new PrefillItem(step.SequenceId, step.ModelId, tokens),
+                new PrefillItem(
+                    step.SequenceId,
+                    step.ModelId,
+                    tokens,
+                    Position: position,
+                    KvWrite: kvWrite),
                 submission,
                 slot,
                 cancellationToken)
@@ -217,9 +224,15 @@ public sealed partial class ExecutionPlanExecutor
                 $"Cannot decode sequence {step.SequenceId} while it is {sequence.Status}.");
         }
 
+        var position = sequence.Position;
+        var kvWrite = sequence.KvWriteIntentFor(1);
         var device = _devices.ResolvePlacement(sequence.Device);
         var result = await device.SubmitDecodeAsync(
-                new DecodeItem(sequence.Id, sequence.Model, sequence.Position),
+                new DecodeItem(
+                    sequence.Id,
+                    sequence.Model,
+                    position,
+                    KvWrite: kvWrite),
                 submission,
                 slot,
                 cancellationToken)

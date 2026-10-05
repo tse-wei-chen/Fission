@@ -276,8 +276,204 @@ static async Task VerifyScheduledCopyOnWriteGrantValidationAsync()
         "Scheduled COW validation must not leak page leases after runtime disposal.");
 }
 
+static async Task VerifyBackendCowWriteIntentAsync()
+{
+    var model = new ModelId("kv-cow-intent-model");
+    var device = new DeviceId("cpu:kv-cow-intent");
+    var pool = new KvPagePool(capacity: 12, tokensPerPage: 4);
+    var backend = new KvWriteIntentBackend(device);
+
+    await using var deviceExecutor = await ContinuousBatchExecutor.CreateAsync(
+        backend,
+        capacity: 16,
+        maxBatchSize: 4);
+
+    using (var runtime = new ExecutionPlanExecutor(deviceExecutor, kvPagePool: pool))
+    {
+        var parentId = SequenceId.New();
+        var setup = await runtime.ExecuteAsync(
+            new CompiledExecutionPlan(
+                Guid.NewGuid(),
+                32,
+                new ExecutionStep[]
+                {
+                    new PrefillExecutionStep(parentId, model, 2, CompletesPrefill: true),
+                    new ForkKvExecutionStep(parentId, 1)
+                }),
+            Bind(parentId, 40, 41));
+
+        Require(backend.Prefills.Count == 1,
+            "Setup prefill must reach the tracking backend exactly once.");
+        Require(!backend.Prefills[0].KvWrite.RequiresMaterialization,
+            "Initial private prefill must not report a COW materialization intent.");
+        Require(backend.Prefills[0].Position == 0,
+            "Runtime must carry the explicit committed position on generic prefill items.");
+
+        var branchId = setup.Forks.Single().Branches.Single();
+        var branch = GetSequence(runtime, branchId);
+        Require(branch.Position == 2 && pool.AllocatedPages == 1,
+            "Fork setup must leave one shared partial tail at position two.");
+
+        await runtime.ExecuteAsync(
+            new CompiledExecutionPlan(
+                Guid.NewGuid(),
+                8,
+                new ExecutionStep[] { new DecodeExecutionStep(branchId, 1) }),
+            EmptyBindings());
+
+        Require(backend.Decodes.Count == 1,
+            "First branch decode must reach the tracking backend exactly once.");
+        var firstDecode = backend.Decodes[0];
+        Require(firstDecode.SequenceId == branchId && firstDecode.Position == 2,
+            "Backend COW intent must be attached to the exact divergent branch position.");
+        Require(firstDecode.KvWrite.RequiresMaterialization,
+            "First write into a shared partial tail must require backend materialization.");
+        Require(firstDecode.KvWrite.CopyOnWritePages == 1,
+            "Backend contract must report the one physical COW page charged by admission.");
+        Require(firstDecode.KvWrite.TokensPerPage == 4,
+            "Backend contract must preserve runtime KV token-block geometry.");
+        Require(firstDecode.KvWrite.TailTokenCount == 2,
+            "Backend contract must identify how much of the shared tail is already committed.");
+        Require(branch.Position == 3 && pool.AllocatedPages == 2,
+            "Successful divergent decode must commit one private runtime COW page.");
+
+        await runtime.ExecuteAsync(
+            new CompiledExecutionPlan(
+                Guid.NewGuid(),
+                8,
+                new ExecutionStep[] { new DecodeExecutionStep(branchId, 1) }),
+            EmptyBindings());
+
+        Require(backend.Decodes.Count == 2,
+            "Second branch decode must reach the backend.");
+        Require(!backend.Decodes[1].KvWrite.RequiresMaterialization,
+            "Once the branch owns a private tail, later writes into its slack must not repeat COW materialization.");
+        Require(branch.Position == 4 && pool.AllocatedPages == 2,
+            "Filling the private tail must not allocate another physical page.");
+    }
+
+    Require(pool.AllocatedPages == 0,
+        "Backend write-intent decode coverage must release all runtime page leases.");
+
+    var prefillPool = new KvPagePool(capacity: 12, tokensPerPage: 4);
+    var prefillBackend = new KvWriteIntentBackend(new DeviceId("cpu:kv-cow-intent-prefill"));
+    await using var prefillDevice = await ContinuousBatchExecutor.CreateAsync(
+        prefillBackend,
+        capacity: 16,
+        maxBatchSize: 4);
+
+    using (var runtime = new ExecutionPlanExecutor(prefillDevice, kvPagePool: prefillPool))
+    {
+        var parentId = SequenceId.New();
+        var setup = await runtime.ExecuteAsync(
+            new CompiledExecutionPlan(
+                Guid.NewGuid(),
+                32,
+                new ExecutionStep[]
+                {
+                    new PrefillExecutionStep(parentId, model, 2, CompletesPrefill: false),
+                    new ForkKvExecutionStep(parentId, 1)
+                }),
+            Bind(parentId, 50, 51));
+
+        var branchId = setup.Forks.Single().Branches.Single();
+        var branch = GetSequence(runtime, branchId);
+        var scheduled = new ScheduledBatchExecutor(runtime);
+        var bindings = new ScheduledExecutionBindings(
+            new Dictionary<SequenceId, ScheduledPrefillBinding>
+            {
+                [branchId] = new(model, new[] { 50, 51, 52, 53 })
+            });
+        var batch = new ScheduledBatch(
+            Guid.NewGuid(),
+            new[]
+            {
+                new ScheduledWorkItem(
+                    branchId,
+                    ScheduledWorkKind.Prefill,
+                    TokenGrant: 1,
+                    KvPageGrant: 1,
+                    Priority: 0,
+                    CompletesPrefill: false)
+            },
+            ConsumedTokens: 1,
+            ConsumedKvPages: 1);
+
+        await scheduled.ExecuteAsync(batch, bindings);
+
+        Require(prefillBackend.Prefills.Count == 2,
+            "Tracking backend must observe initial and fork-continuation prefill calls.");
+        var continuation = prefillBackend.Prefills[1];
+        Require(continuation.SequenceId == branchId && continuation.Position == 2,
+            "Scheduled prefill continuation must carry the branch's live committed position.");
+        Require(continuation.Tokens.Span.SequenceEqual(new[] { 52 }),
+            "Scheduled prefill must preserve the exact granted prompt slice.");
+        Require(continuation.KvWrite.RequiresMaterialization,
+            "Partial-prefill branch divergence must carry the same physical COW contract as decode.");
+        Require(
+            continuation.KvWrite.CopyOnWritePages == 1 &&
+            continuation.KvWrite.TokensPerPage == 4 &&
+            continuation.KvWrite.TailTokenCount == 2,
+            "Scheduled prefill COW intent must match runtime page geometry and admission cost.");
+        Require(branch.Position == 3 && prefillPool.AllocatedPages == 2,
+            "Scheduled prefill continuation must commit its private logical tail after backend success.");
+    }
+
+    Require(prefillPool.AllocatedPages == 0,
+        "Backend write-intent prefill coverage must release all runtime page leases.");
+}
+
 await VerifyPartialForkCopyOnWriteAsync();
 await VerifyPartialSnapshotCopyOnWriteAsync();
 await VerifyScheduledCopyOnWriteGrantValidationAsync();
+await VerifyBackendCowWriteIntentAsync();
 
-Console.WriteLine("Fission KV specs passed: partial-tail COW is isolated, scheduler grants are revalidated, and pages are reclaimable.");
+Console.WriteLine("Fission KV specs passed: partial-tail COW is isolated, backend write intent is explicit, scheduler grants are revalidated, and pages are reclaimable.");
+
+sealed class KvWriteIntentBackend(DeviceId device) : IInferenceBackend
+{
+    public string Name => "kv-write-intent";
+    public DeviceId Device { get; } = device;
+    public List<PrefillItem> Prefills { get; } = [];
+    public List<DecodeItem> Decodes { get; } = [];
+
+    public ValueTask InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.CompletedTask;
+    }
+
+    public ValueTask<IReadOnlyList<BackendStepResult>> PrefillAsync(
+        PrefillBatch batch,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var results = new BackendStepResult[batch.Items.Count];
+        for (var index = 0; index < batch.Items.Count; index++)
+        {
+            var item = batch.Items[index];
+            Prefills.Add(item);
+            results[index] = new BackendStepResult(item.SequenceId, 1000 + item.Tokens.Length);
+        }
+
+        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(results);
+    }
+
+    public ValueTask<IReadOnlyList<BackendStepResult>> DecodeAsync(
+        DecodeBatch batch,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var results = new BackendStepResult[batch.Items.Count];
+        for (var index = 0; index < batch.Items.Count; index++)
+        {
+            var item = batch.Items[index];
+            Decodes.Add(item);
+            results[index] = new BackendStepResult(item.SequenceId, 2000 + item.Position);
+        }
+
+        return ValueTask.FromResult<IReadOnlyList<BackendStepResult>>(results);
+    }
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
