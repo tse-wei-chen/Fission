@@ -1,4 +1,5 @@
 using Fission.Abstractions;
+using Fission.Abstractions.Execution;
 using Fission.Runtime.Kv;
 
 namespace Fission.Runtime.Sequences;
@@ -125,6 +126,34 @@ public sealed class SequenceProcess : IDisposable
         {
             ThrowIfDisposed();
             return Kv.AdditionalPagesForTokenRange(Position, tokenCount);
+        }
+    }
+
+    internal InferenceKvWriteIntent KvWriteIntentFor(int tokenCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tokenCount);
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            var copyOnWritePages = Kv.WriteOverheadForTokenRange(Position, tokenCount);
+            if (copyOnWritePages == 0)
+            {
+                return default;
+            }
+
+            var tokensPerPage = Kv.TokensPerPage;
+            var tailTokenCount = Position % tokensPerPage;
+            if (tailTokenCount == 0)
+            {
+                throw new InvalidOperationException(
+                    "KV write overhead reported copy-on-write at a page boundary.");
+            }
+
+            return new InferenceKvWriteIntent(
+                copyOnWritePages,
+                tokensPerPage,
+                tailTokenCount);
         }
     }
 
