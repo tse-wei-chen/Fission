@@ -626,7 +626,8 @@ public sealed partial class InferenceEngine : IDisposable
                 tokensPerKvPage,
                 request.Priority,
                 kvBytesPerToken,
-                executionDevice),
+                executionDevice,
+                sequence.KvPageWriteOverhead),
 
             SequenceStatus.Decoding => new SchedulingCandidate(
                 request.SequenceId,
@@ -638,7 +639,8 @@ public sealed partial class InferenceEngine : IDisposable
                 tokensPerKvPage,
                 request.Priority,
                 kvBytesPerToken,
-                executionDevice),
+                executionDevice,
+                sequence.KvPageWriteOverhead),
 
             SequenceStatus.Suspended => throw new InvalidOperationException(
                 $"Engine-owned request {request.SequenceId} is suspended without a resume phase."),
