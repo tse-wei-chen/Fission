@@ -3,6 +3,7 @@ using Fission.Abstractions.Execution;
 using Fission.Runtime.Backends;
 using Fission.Runtime.Execution;
 using Fission.Runtime.Kv;
+using Fission.Runtime.Sequences;
 
 static void Require(bool condition, string message)
 {
@@ -10,6 +11,16 @@ static void Require(bool condition, string message)
     {
         throw new InvalidOperationException(message);
     }
+}
+
+static SequenceProcess GetSequence(ExecutionPlanExecutor runtime, SequenceId sequenceId)
+{
+    if (!runtime.TryGetSequence(sequenceId, out var sequence) || sequence is null)
+    {
+        throw new InvalidOperationException($"Sequence {sequenceId} is missing.");
+    }
+
+    return sequence;
 }
 
 static ExecutionBindings Bind(SequenceId sequenceId, params int[] tokens) =>
@@ -51,11 +62,9 @@ static async Task VerifyPartialForkCopyOnWriteAsync()
         Require(pool.AllocatedPages == 1,
             "Forking a two-token partial page must keep one physical shared page.");
 
-        Require(runtime.TryGetSequence(parentId, out var parent) && parent is not null,
-            "Parent sequence must exist.");
+        var parent = GetSequence(runtime, parentId);
         var branchId = setup.Forks[0].Branches[0];
-        Require(runtime.TryGetSequence(branchId, out var branch) && branch is not null,
-            "Forked branch must exist.");
+        var branch = GetSequence(runtime, branchId);
 
         var sharedPageId = parent.Kv.PageIds.Single();
         Require(branch.Kv.PageIds.SequenceEqual(new[] { sharedPageId }),
@@ -135,8 +144,7 @@ static async Task VerifyPartialSnapshotCopyOnWriteAsync()
             Bind(sequenceId, 20, 21, 22));
 
         Require(setup.Snapshots.Count == 1, "Expected one KV snapshot.");
-        Require(runtime.TryGetSequence(sequenceId, out var sequence) && sequence is not null,
-            "Snapshot source sequence must exist.");
+        var sequence = GetSequence(runtime, sequenceId);
 
         var snapshotId = setup.Snapshots[0];
         var snapshotPageId = sequence.Kv.PageIds.Single();
