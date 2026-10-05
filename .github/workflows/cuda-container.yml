@@ -5,9 +5,9 @@ on:
     branches: [ develop ]
     paths:
       - Dockerfile.cuda
-      - compose.yaml
+      - compose.cuda.yaml
       - .dockerignore
-      - .env.example
+      - .env.cuda.example
       - Directory.Build.props
       - global.json
       - src/Fission.Backends.OnnxRuntime/Fission.Backends.OnnxRuntime.csproj
@@ -39,7 +39,7 @@ jobs:
           FISSION_SAMPLED_TOKEN_IDS_OUTPUT=fission_sampled_token_ids \
           FISSION_ORT_PROFILE_OUTPUT_PATH_PREFIX=/artifacts/ort-profile \
           FISSION_CONTROL_TOKEN=ci-control-token \
-          docker compose --profile cuda config > /tmp/fission-cuda-compose.yaml
+          docker compose -f compose.cuda.yaml config > /tmp/fission-cuda-compose.yaml
 
           grep -F 'Fission__ModelPrecision: fp16' /tmp/fission-cuda-compose.yaml
           grep -F 'Fission__SampledTokenIdsOutput: fission_sampled_token_ids' /tmp/fission-cuda-compose.yaml
@@ -83,7 +83,7 @@ jobs:
           {
             echo "## CUDA image validation"
             echo
-            echo "The CUDA image built successfully and the .NET/Fission host started."
+            echo "The standalone CUDA Compose file resolved successfully, the CUDA image built, and the .NET/Fission host started."
             echo
             echo "Compose wiring for FP16 precision, graph-side sampling, ORT profiling, and graceful-control token configuration was also validated."
             echo
