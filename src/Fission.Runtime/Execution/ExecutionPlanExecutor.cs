@@ -625,9 +625,16 @@ public sealed partial class ExecutionPlanExecutor : IDisposable
         }
 
         var tokens = bindings.ResolvePrefill(step.SequenceId, step.TokenCount);
+        var position = sequence.Position;
+        var kvWrite = sequence.KvWriteIntentFor(step.TokenCount);
         var device = _devices.ResolvePlacement(sequence.Device);
         var result = await device.SubmitPrefillAsync(
-            new PrefillItem(step.SequenceId, step.ModelId, tokens),
+            new PrefillItem(
+                step.SequenceId,
+                step.ModelId,
+                tokens,
+                Position: position,
+                KvWrite: kvWrite),
             cancellationToken).ConfigureAwait(false);
 
         sequence.RecordPrefill(step.TokenCount);
@@ -661,8 +668,14 @@ public sealed partial class ExecutionPlanExecutor : IDisposable
         var device = _devices.ResolvePlacement(sequence.Device);
         for (var index = 0; index < step.MaxTokens; index++)
         {
+            var position = sequence.Position;
+            var kvWrite = sequence.KvWriteIntentFor(1);
             var result = await device.SubmitDecodeAsync(
-                new DecodeItem(sequence.Id, sequence.Model, sequence.Position),
+                new DecodeItem(
+                    sequence.Id,
+                    sequence.Model,
+                    position,
+                    KvWrite: kvWrite),
                 cancellationToken).ConfigureAwait(false);
 
             sequence.RecordDecode();
