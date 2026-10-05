@@ -93,7 +93,8 @@ type SchedulingKernel() =
             if candidate.ExecutionDevice.HasValue then
                 ValueSome candidate.ExecutionDevice.Value
             else
-                ValueNone }
+                ValueNone
+          KvPageWriteOverhead = candidate.KvPageWriteOverhead }
 
     let toDeferralReason reason =
         match reason with

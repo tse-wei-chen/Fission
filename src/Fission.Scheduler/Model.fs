@@ -21,7 +21,8 @@ type ReadySequence =
       TokensPerKvPage: int
       Priority: int
       KvBytesPerToken: int64
-      ExecutionDevice: DeviceId voption }
+      ExecutionDevice: DeviceId voption
+      KvPageWriteOverhead: int }
 
 [<Struct>]
 type ResourceBudget =

@@ -51,6 +51,18 @@ public sealed class KvPageTable : IDisposable
         }
     }
 
+    internal int WriteOverheadForTokenRange(int position, int tokenCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(position);
+        ArgumentOutOfRangeException.ThrowIfNegative(tokenCount);
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            return RequiresTailCopyOnWrite(position, tokenCount) ? 1 : 0;
+        }
+    }
+
     internal int AdditionalPagesForTokenRange(int position, int tokenCount)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(position);
