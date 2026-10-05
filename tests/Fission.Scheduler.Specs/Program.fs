@@ -26,7 +26,8 @@ let mk sequenceId phase priority (deadline: DateTimeOffset option) (enqueuedAt: 
       TokensPerKvPage = tokensPerKvPage
       Priority = priority
       KvBytesPerToken = 0L
-      ExecutionDevice = ValueNone }
+      ExecutionDevice = ValueNone
+      KvPageWriteOverhead = 0 }
 
 let policy =
     { DecodeTokenReserve = 2
@@ -146,6 +147,10 @@ let invalidByteCost =
     { mk (sid "00000000-0000-0000-0000-000000000019") Prefilling 0 None now 1 0 blockSize with
         KvBytesPerToken = -1L }
 
+let invalidPageWriteOverhead =
+    { mk (sid "00000000-0000-0000-0000-000000000026") Prefilling 0 None now 1 0 blockSize with
+        KvPageWriteOverhead = -1 }
+
 let waiting =
     mk (sid "00000000-0000-0000-0000-000000000014") Waiting 0 None now 1 0 blockSize
 
@@ -154,15 +159,18 @@ let admissionDecision =
         now
         budget
         admissionPolicy
-        [ invalidToken; invalidPosition; invalidPageSize; invalidDecodeQuantum; invalidByteCost; waiting ]
+        [ invalidToken; invalidPosition; invalidPageSize; invalidDecodeQuantum; invalidByteCost; invalidPageWriteOverhead; waiting ]
 
 require admissionDecision.Selected.IsEmpty "Invalid/non-runnable work must not be selected."
-require (admissionDecision.Rejected.Length = 5) "Expected five admission rejections."
+require (admissionDecision.Rejected.Length = 6) "Expected six admission rejections."
 require (admissionDecision.Deferred.Length = 1) "Expected one non-runnable deferral."
 require (admissionDecision.Deferred.Head.Reason = NotRunnable) "Waiting work must be deferred as non-runnable."
 require
     (admissionDecision.Rejected |> List.exists (fun item -> item.Reason = InvalidKvBytesPerToken))
     "Negative physical KV byte cost must be rejected."
+require
+    (admissionDecision.Rejected |> List.exists (fun item -> item.Reason = InvalidKvPageDemand))
+    "Negative fixed KV page write overhead must be rejected."
 
 let longPrefill =
     mk (sid "00000000-0000-0000-0000-000000000015") Prefilling 0 None now 100 0 blockSize
@@ -192,6 +200,48 @@ let pressureDecision =
 
 require (pressureDecision.Selected.Head.TokenGrant = 4) "KV pressure must shrink a large prefill chunk to one writable page."
 require (pressureDecision.Selected.Head.KvPageGrant = 1) "KV-pressure-limited chunk must account for one page."
+
+let cowDecode =
+    { mk (sid "00000000-0000-0000-0000-000000000027") Decoding 0 None now 1 2 blockSize with
+        KvPageWriteOverhead = 1 }
+
+let cowBlockedDecision =
+    Scheduler.scheduleAt
+        now
+        { pressureBudget with MaxBatchTokens = 1; AvailableKvPages = 0 }
+        admissionPolicy
+        [ cowDecode ]
+
+require
+    (cowBlockedDecision.Selected.IsEmpty
+     && cowBlockedDecision.Deferred.Head.Reason = KvBudget)
+    "A shared partial tail must defer when no page is available for copy-on-write."
+
+let cowPrefill =
+    { mk (sid "00000000-0000-0000-0000-000000000028") Prefilling 0 None now 6 2 blockSize with
+        KvPageWriteOverhead = 1 }
+
+let cowOnePageDecision =
+    Scheduler.scheduleAt now pressureBudget pressurePolicy [ cowPrefill ]
+
+require
+    (cowOnePageDecision.Selected.Head.TokenGrant = 2
+     && cowOnePageDecision.Selected.Head.KvPageGrant = 1
+     && cowOnePageDecision.ConsumedKvPages = 1)
+    "One free page must pay the COW surcharge and only use the existing logical tail slack."
+
+let cowTwoPageDecision =
+    Scheduler.scheduleAt
+        now
+        { pressureBudget with AvailableKvPages = 2 }
+        pressurePolicy
+        [ cowPrefill ]
+
+require
+    (cowTwoPageDecision.Selected.Head.TokenGrant = 6
+     && cowTwoPageDecision.Selected.Head.KvPageGrant = 2
+     && cowTwoPageDecision.ConsumedKvPages = 2)
+    "Two free pages must cover one COW replacement plus one page-boundary growth page."
 
 let bytePressurePrefill =
     { mk (sid "00000000-0000-0000-0000-000000000023") Prefilling 0 None now 16 0 blockSize with
@@ -423,14 +473,15 @@ require
     "A second item for a saturated device must defer with DeviceSequenceBudget while another device retains capacity."
 
 printfn
-    "Fission scheduler specs passed: selected=%d tokens=%d kvPages=%d kvBytes=%d transientKvBytes=%d rejected=%d bytePressureGrant=%d deviceBudget=%d/%d deviceSequence=%d"
+    "Fission scheduler specs passed: selected=%d tokens=%d kvPages=%d kvBytes=%d transientKvBytes=%d rejected=%d cowOnePage=%d cowTwoPages=%d deviceBudget=%d/%d deviceSequence=%d"
     mixedDecision.Selected.Length
     mixedDecision.ConsumedTokens
     mixedDecision.ConsumedKvPages
     bytePressureDecision.ConsumedKvBytes
     transientFitsDecision.ConsumedTransientKvBytes
     admissionDecision.Rejected.Length
-    bytePressureDecision.Selected.Head.TokenGrant
+    cowOnePageDecision.Selected.Head.TokenGrant
+    cowTwoPageDecision.Selected.Head.TokenGrant
     splitDeviceDecision.Selected.Length
     sameDeviceDecision.Selected.Length
     deviceSequenceDecision.Selected.Length
